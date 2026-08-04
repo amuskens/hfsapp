@@ -27,6 +27,11 @@ struct ContentView: View {
         } message: { message in
             Text(message)
         }
+        .onReceive(NotificationCenter.default.publisher(for: .didCreateDiagnosticsFile)) { note in
+            if let url = note.object as? URL {
+                NSWorkspace.shared.open(url)
+            }
+        }
     }
 
     private var header: some View {
@@ -62,6 +67,27 @@ struct ContentView: View {
                 manager.refresh()
             }
             .disabled(!manager.isMounted)
+
+            Button("Diagnostics") {
+                // Run diagnostics on current image if loaded, otherwise let user choose
+                if let image = manager.imageURL {
+                    if let _ = manager.runDiagnostics(on: image) {
+                        // notification opens the file
+                    }
+                } else {
+                    let panel = NSOpenPanel()
+                    panel.allowedContentTypes = [UTType(filenameExtension: "dsk"), UTType(filenameExtension: "img")].compactMap { $0 }
+                    panel.canChooseFiles = true
+                    panel.canChooseDirectories = false
+                    panel.allowsMultipleSelection = false
+                    panel.title = "Choose image for diagnostics"
+                    if panel.runModal() == .OK, let url = panel.url {
+                        if let _ = manager.runDiagnostics(on: url) {
+                            // notification opens the file
+                        }
+                    }
+                }
+            }
 
             Button("Eject") {
                 manager.ejectImage()
