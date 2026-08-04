@@ -425,17 +425,109 @@ final class DiskImageManager: ObservableObject {
         return Array(Set(devices))
     }
 
+    private var tempImageCopyURL: URL? = nil
+    @Published var confirmBeforeDetach: Bool = true
+
     private func prepareForHFSUtils(imagePath: String) throws {
         let attached = findAttachedDevices(for: imagePath)
-        for dev in attached {
-            do {
-                try runHdiutilDetach(device: dev)
-                print("Detached \(dev) for image \(imagePath)")
-            } catch {
-                print("Failed to detach \(dev): \(error)")
-                // continue trying others
+        if !attached.isEmpty {
+            if confirmBeforeDetach {
+                // Ask user for confirmation before detaching
+                let alert = NSAlert()
+                alert.messageText = "Detach device(s) for image?"
+                alert.informativeText = "The image appears to be attached as raw device(s): \(attached.joined(separator: ", ")).\nDetaching them is required to allow exclusive access for HFS operations. Detaching is safe but will unmount the raw device. Proceed?"
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "Detach")
+                alert.addButton(withTitle: "Use Temporary Copy")
+                alert.addButton(withTitle: "Cancel")
+
+                let resp = alert.runModal()
+                if resp == .alertFirstButtonReturn {
+                    // user chose Detach: proceed
+                    for dev in attached {
+                        do {
+                            try runHdiutilDetach(device: dev)
+                            print("Detached \(dev) for image \(imagePath)")
+                        } catch {
+                            print("Failed to detach \(dev): \(error)")
+                            // continue trying others
+                        }
+                    }
+                } else if resp == .alertSecondButtonReturn {
+                    // Use temporary copy instead of detaching
+                    try createTempCopyAndUse(imagePath: imagePath)
+                    return
+                } else {
+                    // Cancel: throw to abort the hfsutils operation
+                    throw NSError(domain: "HFSApp", code: 1, userInfo: [NSLocalizedDescriptionKey: "User cancelled detaching devices"]) as Error
+                }
+            } else {
+                // Auto-detach behavior (existing behavior)
+                for dev in attached {
+                    do {
+                        try runHdiutilDetach(device: dev)
+                        print("Detached \(dev) for image \(imagePath)")
+                    } catch {
+                        print("Failed to detach \(dev): \(error)")
+                        // continue trying others
+                    }
+                }
             }
         }
+
+        // Wait until the file is no longer held open by any process. If it remains locked, fall back to operating on a temporary copy.
+        if try !isFileUnlocked(path: imagePath, timeout: 2.0) {
+            // Create a temporary copy and operate on it to avoid locks
+            try createTempCopyAndUse(imagePath: imagePath)
+        }
+    }
+
+    private func createTempCopyAndUse(imagePath: String) throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hfsapp-temp-\(UUID().uuidString).img")
+        do {
+            try fileManager.copyItem(atPath: imagePath, toPath: tmp.path)
+            tempImageCopyURL = tmp
+            statusMessage = "Using temporary copy for image operations"
+            print("Created temp copy at \(tmp.path) due to lock on original image")
+        } catch {
+            print("Failed to create temp copy: \(error)")
+            throw error
+        }
+    }
+
+    private func imagePathToUse(original: String) -> String {
+        if let tmp = tempImageCopyURL { return tmp.path }
+        return original
+    }
+
+    private func cleanupTempCopyIfAny() {
+        if let tmp = tempImageCopyURL {
+            try? fileManager.removeItem(at: tmp)
+            tempImageCopyURL = nil
+            statusMessage = "Removed temporary copy"
+        }
+    }
+
+    private func isFileUnlocked(path: String, timeout: TimeInterval) throws -> Bool {
+        // Poll lsof to check whether any process holds the file open
+        let interval: TimeInterval = 0.2
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let (out, err, code) = runCommand(["/usr/sbin/lsof", path])
+            if code != 0 {
+                // If lsof returns non-zero and no output, assume no process holds it
+                if out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && err.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return true
+                }
+            } else {
+                // code == 0; if output empty, unlocked
+                if out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return true
+                }
+            }
+            Thread.sleep(forTimeInterval: interval)
+        }
+        return false
     }
 
     func detachImageIfMounted() {
@@ -779,7 +871,8 @@ final class DiskImageManager: ObservableObject {
         let hfsPath = pathForEntry(selectedEntry)
         // Build command: hmount image && hcopy ":<hfsPath>" "<destination>" && humount
         let humount = humountPath ?? hmount
-        let cmd = "\(hmount) \"\(image.path)\" && \(hcopy) \"\(hfsPath)\" \"\(destination.path)\" && \(humount)"
+        let usePath = imagePathToUse(original: image.path)
+        let cmd = "\(hmount) \"\(usePath)\" && \(hcopy) \"\(hfsPath)\" \"\(destination.path)\" && \(humount)"
         let (out, err, code) = runCommand(["/bin/sh", "-c", cmd])
         if code == 0 {
             statusMessage = "Exported \(selectedEntry.name)"
@@ -819,7 +912,8 @@ final class DiskImageManager: ObservableObject {
             // Build command: hmount image && hcopy "hostfile" ":<dest>" && humount
             let hfsDest = destPath.hasSuffix(":" ) ? "\(destPath)\(source.lastPathComponent)" : "\(destPath)/\(source.lastPathComponent)"
             let humount = humountPath ?? hmount
-            let cmd = "\(hmount) \"\(image.path)\" && \(hcopy) \"\(source.path)\" \"\(hfsDest)\" && \(humount)"
+            let usePath = imagePathToUse(original: image.path)
+            let cmd = "\(hmount) \"\(usePath)\" && \(hcopy) \"\(source.path)\" \"\(hfsDest)\" && \(humount)"
             let (out, err, code) = runCommand(["/bin/sh", "-c", cmd])
             if code != 0 {
                 self.errorMessage = DiskImageError.importFailed(source, NSError(domain: "hfsutils", code: Int(code), userInfo: [NSLocalizedDescriptionKey: err.isEmpty ? out : err])).localizedDescription
@@ -853,7 +947,8 @@ final class DiskImageManager: ObservableObject {
         var query = path
         if query == ":" { query = ":" }
         let humount = humountPath ?? hmount
-        let script = "\(hmount) \"\(imagePath)\" && \(hls) \"\(query)\" && \(humount)"
+        let usePath = imagePathToUse(original: imagePath)
+        let script = "\(hmount) \"\(usePath)\" && \(hls) \"\(query)\" && \(humount)"
         let (out, err, code) = runHFSCommand(script)
         guard code == 0 else {
             self.errorMessage = "hls failed: \(err.isEmpty ? out : err)"
