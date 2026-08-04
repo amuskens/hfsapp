@@ -5,26 +5,6 @@
             "request": "launch",
             "args": [],
             "cwd": "${workspaceFolder:hfsapp}",
-            "name": "Debug HFSApp",
-            "target": "HFSApp",
-            "configuration": "debug",
-            "preLaunchTask": "swift: Build Debug HFSApp"
-        },
-        {
-            "type": "swift",
-            "request": "launch",
-            "args": [],
-            "cwd": "${workspaceFolder:hfsapp}",
-            "name": "Release HFSApp",
-            "target": "HFSApp",
-            "configuration": "release",
-            "preLaunchTask": "swift: Build Release HFSApp"
-        },
-        {
-            "type": "swift",
-            "request": "launch",
-            "args": [],
-            "cwd": "${workspaceFolder:hfsapp}",
             "name": "Debug FloppyFox",
             "target": "FloppyFox",
             "configuration": "debug",

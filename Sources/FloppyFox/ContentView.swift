@@ -13,7 +13,7 @@ struct ContentView: View {
 
             Divider()
 
-            if manager.isMounted {
+            if manager.isMounted || manager.usingHFSUtils {
                 mountedContent
             } else {
                 placeholderView
@@ -44,7 +44,7 @@ struct ContentView: View {
             Button("Add Files") {
                 manager.addFiles()
             }
-            .disabled(!manager.isMounted)
+            .disabled(!manager.isMounted && !manager.usingHFSUtils)
 
             Button("Copy") {
                 manager.copySelected()
@@ -54,7 +54,7 @@ struct ContentView: View {
             Button("Paste") {
                 manager.paste()
             }
-            .disabled(!manager.isMounted)
+            .disabled(!manager.isMounted && !manager.usingHFSUtils)
 
             Button("Export") {
                 manager.exportSelected()
@@ -66,7 +66,7 @@ struct ContentView: View {
             Button("Refresh") {
                 manager.refresh()
             }
-            .disabled(!manager.isMounted)
+            .disabled(!manager.isMounted && !manager.usingHFSUtils)
 
             Toggle("Confirm detach", isOn: $manager.confirmBeforeDetach)
                 .toggleStyle(.switch)
@@ -96,7 +96,7 @@ struct ContentView: View {
             Button("Eject") {
                 manager.ejectImage()
             }
-            .disabled(!manager.isMounted)
+            .disabled(!manager.isMounted && !manager.usingHFSUtils)
         }
     }
 
@@ -119,13 +119,18 @@ struct ContentView: View {
     private var fileBrowser: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 6) {
-                Text(manager.mountPoint?.lastPathComponent ?? "Mounted Volume")
+                Text(manager.mountPoint?.lastPathComponent ?? manager.imageURL?.lastPathComponent ?? "Mounted Volume")
                     .font(.title2.bold())
                 Text(manager.statusMessage)
                     .font(.footnote)
                     .foregroundColor(.secondary)
                 if let directory = manager.currentDirectory {
                     Text(directory.path)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                } else if manager.usingHFSUtils, let hfsPath = manager.currentHFSPath {
+                    Text(hfsPath)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(1)

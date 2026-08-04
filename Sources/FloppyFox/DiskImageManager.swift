@@ -43,11 +43,29 @@ struct FileEntry: Identifiable, Hashable {
     let size: Int?
 
     var name: String {
-        url.lastPathComponent
+        // hfsutils-backed entries use a synthetic hfs://localhost/<image-path>?path=<hfs-path>
+        // URL, so the real name has to be pulled out of the query string rather than
+        // url.lastPathComponent (which would just return the disk image's own filename).
+        if url.scheme == "hfs",
+           let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let hfsPath = comps.queryItems?.first(where: { $0.name == "path" })?.value {
+            let separators = CharacterSet(charactersIn: ":/")
+            let trimmed = hfsPath.trimmingCharacters(in: separators)
+            let lastComponent = trimmed.components(separatedBy: separators).last ?? trimmed
+            return lastComponent.isEmpty ? trimmed : lastComponent
+        }
+        return url.lastPathComponent
     }
 
     var icon: NSImage? {
         let workspace = NSWorkspace.shared
+        if url.scheme == "hfs" {
+            let ext = (name as NSString).pathExtension
+            if !ext.isEmpty, let type = UTType(filenameExtension: ext) {
+                return workspace.icon(for: type)
+            }
+            return workspace.icon(for: isDirectory ? .folder : .data)
+        }
         return workspace.icon(forFile: url.path)
     }
 }
@@ -140,8 +158,13 @@ final class DiskImageManager: ObservableObject {
     }
 
     var canGoBack: Bool {
-        guard let currentDirectory, let mountPoint else { return false }
-        return currentDirectory.path != mountPoint.path
+        if let currentDirectory, let mountPoint {
+            return currentDirectory.path != mountPoint.path
+        }
+        if usingHFSUtils, let currentHFSPath {
+            return currentHFSPath != ":"
+        }
+        return false
     }
 
     func openImage() {
@@ -171,6 +194,35 @@ final class DiskImageManager: ObservableObject {
             self.errorMessage = nil
             try loadDirectory(at: mountPoint)
         } catch {
+            // macOS's Disk Arbitration/hdiutil stack cannot mount classic HFS Standard
+            // volumes at all (common for real floppy images, which also usually lack a
+            // partition table). Fall back to the userspace hfsutils backend, which reads
+            // the raw image bytes directly and doesn't depend on kernel filesystem support.
+            attachImageUsingHFSUtilsFallback(imageURL, hdiutilError: error)
+        }
+    }
+
+    private func attachImageUsingHFSUtilsFallback(_ imageURL: URL, hdiutilError: Error) {
+        self.mountPoint = nil
+        self.mountedDevice = nil
+        self.currentDirectory = nil
+
+        guard hfsutilsAvailable else {
+            self.imageURL = nil
+            self.errorMessage = hdiutilError.localizedDescription
+            self.statusMessage = "Failed to mount image"
+            return
+        }
+
+        self.imageURL = imageURL
+        self.currentHFSPath = ":"
+        do {
+            try loadDirectory(at: URL(fileURLWithPath: "/"))
+            self.statusMessage = "Opened via hfsutils (macOS could not mount this volume directly)"
+            self.errorMessage = nil
+        } catch {
+            self.imageURL = nil
+            self.currentHFSPath = ":"
             self.errorMessage = error.localizedDescription
             self.statusMessage = "Failed to mount image"
         }
@@ -555,19 +607,31 @@ final class DiskImageManager: ObservableObject {
     }
 
     func ejectImage() {
-        guard let device = mountedDevice else { return }
-        do {
-            try runHdiutilDetach(device: device)
-            mountPoint = nil
-            mountedDevice = nil
-            currentDirectory = nil
+        if let device = mountedDevice {
+            do {
+                try runHdiutilDetach(device: device)
+                mountPoint = nil
+                mountedDevice = nil
+                currentDirectory = nil
+                entries = []
+                selectedEntry = nil
+                statusMessage = "Image ejected"
+                errorMessage = nil
+            } catch {
+                self.errorMessage = error.localizedDescription
+                statusMessage = "Failed to eject image"
+            }
+            return
+        }
+
+        if usingHFSUtils {
+            cleanupTempCopyIfAny()
+            imageURL = nil
             entries = []
             selectedEntry = nil
-            statusMessage = "Image ejected"
+            currentHFSPath = ":"
+            statusMessage = "Image closed"
             errorMessage = nil
-        } catch {
-            self.errorMessage = error.localizedDescription
-            statusMessage = "Failed to eject image"
         }
     }
 
@@ -647,18 +711,25 @@ final class DiskImageManager: ObservableObject {
         }
 
         let hfsPath = currentHFSPath ?? ":"
-        let list = hfsList(path: hfsPath, imagePath: image.path)
+        let list = try hfsList(path: hfsPath, imagePath: image.path)
         self.entries = list
         self.currentDirectory = nil
         self.errorMessage = nil
     }
 
     func refresh() {
-        guard let currentDirectory else { return }
-        do {
-            try loadDirectory(at: currentDirectory)
-        } catch {
-            self.errorMessage = DiskImageError.loadDirectoryFailed(currentDirectory, error).localizedDescription
+        if let currentDirectory {
+            do {
+                try loadDirectory(at: currentDirectory)
+            } catch {
+                self.errorMessage = DiskImageError.loadDirectoryFailed(currentDirectory, error).localizedDescription
+            }
+        } else if usingHFSUtils {
+            do {
+                try loadDirectory(at: URL(fileURLWithPath: "/"))
+            } catch {
+                self.errorMessage = DiskImageError.loadDirectoryFailed(URL(fileURLWithPath: "/"), error).localizedDescription
+            }
         }
     }
 
@@ -671,7 +742,7 @@ final class DiskImageManager: ObservableObject {
                 // update currentHFSPath and load via hfsutils
                 if let current = currentHFSPath {
                     // append entry name to path
-                    let newPath = current.hasSuffix(":" ) ? "\(current)\(entry.name)" : "\(current)/\(entry.name)"
+                    let newPath = current.hasSuffix(":" ) ? "\(current)\(entry.name)" : "\(current):\(entry.name)"
                     currentHFSPath = newPath
                 } else {
                     currentHFSPath = ":\(entry.name)"
@@ -785,7 +856,7 @@ final class DiskImageManager: ObservableObject {
     }
 
     func paste() {
-        guard let target = currentDirectory ?? mountPoint else { return }
+        guard let target = currentDirectory ?? mountPoint ?? (usingHFSUtils ? URL(fileURLWithPath: "/") : nil) else { return }
         let pasteboard = NSPasteboard.general
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
             importFiles(urls: urls, destination: target)
@@ -798,7 +869,7 @@ final class DiskImageManager: ObservableObject {
     }
 
     func addFiles() {
-        guard let target = currentDirectory ?? mountPoint else { return }
+        guard let target = currentDirectory ?? mountPoint ?? (usingHFSUtils ? URL(fileURLWithPath: "/") : nil) else { return }
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = true
@@ -830,6 +901,19 @@ final class DiskImageManager: ObservableObject {
             if !out.isEmpty { combined += "STDOUT:\n\(out)\n" }
             if !err.isEmpty { combined += "STDERR:\n\(err)\n" }
             combined += "---\n\n"
+
+            // `attach` (including -nomount) leaves the device attached even when no
+            // filesystem is mountable. Detach it again immediately so diagnostics doesn't
+            // leak raw devices, and so the hfsutils probe below isn't blocked by the lock.
+            if code == 0, cmd.contains("attach"), let device = extractDeviceEntry(from: out) {
+                _ = runCommand(["/usr/bin/hdiutil", "detach", device])
+            }
+        }
+
+        // Also clean up any devices left attached by earlier (e.g. pre-fix) diagnostics
+        // runs or failed attach attempts, so the hfsutils probe below has exclusive access.
+        for device in findAttachedDevices(for: imageURL.path) {
+            _ = runCommand(["/usr/bin/hdiutil", "detach", device])
         }
 
         // If hfsutils installed, try a quick hfsutils probe (hmount+hls)
@@ -856,6 +940,16 @@ final class DiskImageManager: ObservableObject {
             self.errorMessage = "Could not write diagnostics: \(error.localizedDescription)"
             return nil
         }
+    }
+
+    private func extractDeviceEntry(from plistOutput: String) -> String? {
+        guard let data = plistOutput.data(using: .utf8),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+              let entities = plist["system-entities"] as? [[String: Any]] else { return nil }
+        for entity in entities {
+            if let dev = entity["dev-entry"] as? String { return dev }
+        }
+        return nil
     }
 
     private func runCommand(_ cmd: [String]) -> (String, String, Int32) {
@@ -970,11 +1064,7 @@ final class DiskImageManager: ObservableObject {
 
     // MARK: - hfsutils integration helpers
 
-    private func runHFSCommand(_ script: String) -> (String, String, Int32) {
-        return runCommand(["/bin/sh", "-c", script])
-    }
-
-    private func hfsList(path: String, imagePath: String) -> [FileEntry] {
+    private func hfsList(path: String, imagePath: String) throws -> [FileEntry] {
         guard let hmount = hmountPath, let hls = hlsPath else { return [] }
         // Ensure exclusive access: detach any hdiutil-attached devices for this image to avoid lock errors
         do { try prepareForHFSUtils(imagePath: imagePath) } catch {
@@ -986,11 +1076,19 @@ final class DiskImageManager: ObservableObject {
         if query == ":" { query = ":" }
         let humount = humountPath ?? hmount
         let usePath = imagePathToUse(original: imagePath)
-        let script = "\(hmount) \"\(usePath)\" && \(hls) \"\(query)\" && \(humount)"
-        let (out, err, code) = runHFSCommand(script)
+
+        // Run hmount, hls, and humount as separate processes (rather than one shell one-liner)
+        // so we only capture hls's own stdout. hmount persists the current volume across
+        // process invocations via ~/.hcwd, and hmount's own banner text ("Volume name is...")
+        // would otherwise get parsed as bogus file entries if captured together with hls's output.
+        let (mountOut, mountErr, mountCode) = runCommand([hmount, usePath])
+        guard mountCode == 0 else {
+            throw NSError(domain: "hfsutils", code: Int(mountCode), userInfo: [NSLocalizedDescriptionKey: "hmount failed: \(mountErr.isEmpty ? mountOut : mountErr)"])
+        }
+        let (out, err, code) = runCommand([hls, query])
+        _ = runCommand([humount])
         guard code == 0 else {
-            self.errorMessage = "hls failed: \(err.isEmpty ? out : err)"
-            return []
+            throw NSError(domain: "hfsutils", code: Int(code), userInfo: [NSLocalizedDescriptionKey: "hls failed: \(err.isEmpty ? out : err)"])
         }
         var results: [FileEntry] = []
         // Parse output line-by-line. hls typically prints names; we'll take last token as filename.
@@ -1018,7 +1116,7 @@ final class DiskImageManager: ObservableObject {
             } else if query.hasSuffix(":" ) {
                 hfsFullPath = "\(query)\(name)"
             } else {
-                hfsFullPath = "\(query)/\(name)"
+                hfsFullPath = "\(query):\(name)"
             }
             let pseudo = URL(string: "hfs://localhost\(imagePath)?path=\(hfsFullPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? hfsFullPath)")!
             let entry = FileEntry(url: pseudo, isDirectory: isDir, size: nil)
@@ -1050,7 +1148,7 @@ final class DiskImageManager: ObservableObject {
     }
 
     func handleDroppedFiles(providers: [NSItemProvider]) -> Bool {
-        guard let _ = currentDirectory ?? mountPoint else { return false }
+        guard currentDirectory != nil || mountPoint != nil || usingHFSUtils else { return false }
         let collector = URLCollector()
         let group = DispatchGroup()
 
