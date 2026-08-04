@@ -37,7 +37,11 @@ enum ClipboardOperation {
 }
 
 struct FileEntry: Identifiable, Hashable {
-    let id = UUID()
+    // Identity must be stable across repeated listings of the same directory (the entries
+    // array is rebuilt from scratch on every refresh), or List's selection tracking breaks.
+    // The URL already uniquely identifies a given file/folder, so use it directly rather
+    // than a fresh random UUID per instance.
+    var id: URL { url }
     let url: URL
     let isDirectory: Bool
     let size: Int?
@@ -995,21 +999,57 @@ final class DiskImageManager: ObservableObject {
         }
 
         // hfsutils backend
-        guard usingHFSUtils, let image = imageURL, let hcopy = hcopyPath, let hmount = hmountPath else {
+        guard usingHFSUtils else {
             self.errorMessage = "Export not supported for this backend"
             return
         }
+        do {
+            try exportHFSEntry(selectedEntry, to: destination)
+            statusMessage = "Exported \(selectedEntry.name)"
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
 
-        let hfsPath = pathForEntry(selectedEntry)
+    /// Copies an hfsutils-backed entry out to a real file at `destination`, using its actual
+    /// HFS name/extension. Shared by the Export button and drag-out-to-Finder.
+    private func exportHFSEntry(_ entry: FileEntry, to destination: URL) throws {
+        guard let hcopy = hcopyPath, let hmount = hmountPath, let image = imageURL else {
+            throw NSError(domain: "hfsutils", code: 0, userInfo: [NSLocalizedDescriptionKey: "hfsutils backend unavailable"])
+        }
+        let hfsPath = pathForEntry(entry)
         // Build command: hmount image && hcopy ":<hfsPath>" "<destination>" && humount
         let humount = humountPath ?? hmount
         let usePath = imagePathToUse(original: image.path)
         let cmd = "\(hmount) \"\(usePath)\" && \(hcopy) \"\(hfsPath)\" \"\(destination.path)\" && \(humount)"
         let (out, err, code) = runCommand(["/bin/sh", "-c", cmd])
-        if code == 0 {
-            statusMessage = "Exported \(selectedEntry.name)"
-        } else {
-            errorMessage = "hcopy failed: \(err.isEmpty ? out : err)"
+        guard code == 0, fileManager.fileExists(atPath: destination.path) else {
+            throw NSError(domain: "hfsutils", code: Int(code), userInfo: [NSLocalizedDescriptionKey: "hcopy failed: \(err.isEmpty ? out : err)"])
+        }
+    }
+
+    /// Returns a URL to a real file on disk suitable for dragging out (e.g. to Finder or
+    /// another app). Mounted volumes already expose real files at `entry.url`. The hfsutils
+    /// backend's entries are synthetic hfs://localhost/<image-path>?path=<hfs-path> pseudo-URLs
+    /// with no bytes on the host filesystem, so the file has to be copied out to a temporary
+    /// location first, named after its real HFS name (including extension) rather than the
+    /// pseudo-URL (which would otherwise show up in Finder as an unnamed "localhost" item).
+    func materializedURLForDrag(_ entry: FileEntry) -> URL? {
+        if isMounted {
+            return entry.url
+        }
+        guard usingHFSUtils, !entry.isDirectory, let image = imageURL else { return nil }
+        try? prepareForHFSUtils(imagePath: image.path)
+
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hfsapp-drag-\(UUID().uuidString)", isDirectory: true)
+        guard (try? fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)) != nil else { return nil }
+        let destination = tempDir.appendingPathComponent(entry.name)
+
+        do {
+            try exportHFSEntry(entry, to: destination)
+            return destination
+        } catch {
+            return nil
         }
     }
 

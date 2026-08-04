@@ -201,7 +201,10 @@ struct ContentView: View {
             manager.navigate(into: entry)
         }
         .onDrag {
-            NSItemProvider(object: entry.url as NSURL)
+            guard let url = manager.materializedURLForDrag(entry) else {
+                return NSItemProvider()
+            }
+            return NSItemProvider(object: url as NSURL)
         }
     }
 
