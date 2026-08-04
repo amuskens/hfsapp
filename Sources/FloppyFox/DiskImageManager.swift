@@ -41,29 +41,37 @@ struct FileEntry: Identifiable, Hashable {
     // array is rebuilt from scratch on every refresh), or List's selection tracking breaks.
     // The URL already uniquely identifies a given file/folder, so use it directly rather
     // than a fresh random UUID per instance.
-    var id: URL { url }
+    var id: String { url.absoluteString }
     let url: URL
     let isDirectory: Bool
     let size: Int?
+    // For hfsutils-backed entries: the exact colon-separated HFS path (e.g. ":Lorem Ipsum.doc"),
+    // taken verbatim from hls output. This is kept as a plain string rather than being
+    // round-tripped through the pseudo-URL's query string, because HFS filenames may contain
+    // characters (&, =, +) that are legal unencoded in a URL query component but corrupt
+    // parsing when decoded back out via URLComponents. nil for entries on a normally-mounted
+    // (real file://) volume, where url.lastPathComponent is already reliable.
+    let hfsPath: String?
+
+    init(url: URL, isDirectory: Bool, size: Int?, hfsPath: String? = nil) {
+        self.url = url
+        self.isDirectory = isDirectory
+        self.size = size
+        self.hfsPath = hfsPath
+    }
 
     var name: String {
-        // hfsutils-backed entries use a synthetic hfs://localhost/<image-path>?path=<hfs-path>
-        // URL, so the real name has to be pulled out of the query string rather than
-        // url.lastPathComponent (which would just return the disk image's own filename).
-        if url.scheme == "hfs",
-           let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-           let hfsPath = comps.queryItems?.first(where: { $0.name == "path" })?.value {
-            let separators = CharacterSet(charactersIn: ":/")
-            let trimmed = hfsPath.trimmingCharacters(in: separators)
-            let lastComponent = trimmed.components(separatedBy: separators).last ?? trimmed
-            return lastComponent.isEmpty ? trimmed : lastComponent
+        guard let hfsPath else { return url.lastPathComponent }
+        let trimmed = hfsPath.hasSuffix(":") ? String(hfsPath.dropLast()) : hfsPath
+        if let lastColon = trimmed.range(of: ":", options: .backwards) {
+            return String(trimmed[trimmed.index(after: lastColon.lowerBound)...])
         }
-        return url.lastPathComponent
+        return trimmed.hasPrefix(":") ? String(trimmed.dropFirst()) : trimmed
     }
 
     var icon: NSImage? {
         let workspace = NSWorkspace.shared
-        if url.scheme == "hfs" {
+        if hfsPath != nil {
             let ext = (name as NSString).pathExtension
             if !ext.isEmpty, let type = UTType(filenameExtension: ext) {
                 return workspace.icon(for: type)
@@ -71,6 +79,15 @@ struct FileEntry: Identifiable, Hashable {
             return workspace.icon(for: isDirectory ? .folder : .data)
         }
         return workspace.icon(forFile: url.path)
+    }
+
+    // Make identity & hash based only on URL so selection remains stable across reloads
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(url.absoluteString)
+    }
+
+    static func == (lhs: FileEntry, rhs: FileEntry) -> Bool {
+        return lhs.url == rhs.url
     }
 }
 
@@ -981,6 +998,10 @@ final class DiskImageManager: ObservableObject {
             try? prepareForHFSUtils(imagePath: image.path)
         }
         guard let selectedEntry else { return }
+        if !isMounted && selectedEntry.isDirectory {
+            self.errorMessage = "Exporting folders isn't supported yet; only individual files can be exported."
+            return
+        }
         let panel = NSSavePanel()
         panel.nameFieldStringValue = selectedEntry.name
         panel.canCreateDirectories = true
@@ -1126,30 +1147,22 @@ final class DiskImageManager: ObservableObject {
             throw NSError(domain: "hfsutils", code: Int(mountCode), userInfo: [NSLocalizedDescriptionKey: "hmount failed: \(mountErr.isEmpty ? mountOut : mountErr)"])
         }
         let (out, err, code) = runCommand([hls, query])
-        _ = runCommand([humount])
         guard code == 0 else {
+            _ = runCommand([humount])
             throw NSError(domain: "hfsutils", code: Int(code), userInfo: [NSLocalizedDescriptionKey: "hls failed: \(err.isEmpty ? out : err)"])
         }
         var results: [FileEntry] = []
-        // Parse output line-by-line. hls typically prints names; we'll take last token as filename.
+        // Plain `hls` prints exactly one full entry name per line (spaces and all) with no
+        // other decoration and no directory marker at all — unlike some ls-alikes, it does
+        // NOT append a trailing ':' or '/' for folders. Taking the last whitespace-separated
+        // "token" here (as this used to) silently truncates every multi-word name (e.g.
+        // "Lorem Ipsum.doc" -> "Ipsum.doc"), which is why exports of such files failed with
+        // "no such file or directory": hcopy was asked for a name that doesn't actually exist.
         let lines = out.split(whereSeparator: { $0 == "\n" || $0 == "\r" }).map { String($0) }
         for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { continue }
-            // Try to parse directory markers: if line ends with ':' or '/' or '<DIR>' we'll mark as directory
-            var isDir = false
-            var name = trimmed
-            if trimmed.hasSuffix(":" ) || trimmed.hasSuffix("/") {
-                isDir = true
-                name = String(trimmed.dropLast())
-            } else {
-                // Otherwise, take last whitespace-separated token
-                let parts = trimmed.split(separator: " ")
-                if let last = parts.last {
-                    name = String(last)
-                }
-            }
-            // construct pseudo-URL for HFS path
+            let name = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if name.isEmpty { continue }
+
             let hfsFullPath: String
             if query == ":" {
                 hfsFullPath = ":\(name)"
@@ -1158,10 +1171,21 @@ final class DiskImageManager: ObservableObject {
             } else {
                 hfsFullPath = "\(query):\(name)"
             }
+
+            // Plain `hls` gives us no way to tell files from folders, so ask about this
+            // specific entry individually (`-d` lists the entry itself instead of descending
+            // into it, `-l` adds the leading 'd'/'f' type marker) while the volume is still
+            // mounted. Passed as separate process arguments (no shell), so spaces/quotes in
+            // the name can't cause any escaping issues here.
+            let (dlOut, _, dlCode) = runCommand([hls, "-dl", hfsFullPath])
+            let isDir = dlCode == 0 && dlOut.hasPrefix("d")
+
             let pseudo = URL(string: "hfs://localhost\(imagePath)?path=\(hfsFullPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? hfsFullPath)")!
-            let entry = FileEntry(url: pseudo, isDirectory: isDir, size: nil)
+            let entry = FileEntry(url: pseudo, isDirectory: isDir, size: nil, hfsPath: hfsFullPath)
             results.append(entry)
         }
+        _ = runCommand([humount])
+
         // Sort directories first
         results.sort { a, b in
             if a.isDirectory == b.isDirectory { return a.name.lowercased() < b.name.lowercased() }
@@ -1171,13 +1195,9 @@ final class DiskImageManager: ObservableObject {
     }
 
     private func pathForEntry(_ entry: FileEntry) -> String {
-        // Before returning a path that will be used with hfsutils, ensure it's in the colon-style form hfsutils expects
-        // If entry.url is a pseudo hfs:// URL, extract the query param
-        // If entry.url is a pseudo hfs:// URL, extract the query param
-        if let scheme = entry.url.scheme, scheme == "hfs" {
-            if let comps = URLComponents(url: entry.url, resolvingAgainstBaseURL: false), let q = comps.queryItems?.first(where: { $0.name == "path" })?.value {
-                return q
-            }
+        // hfsutils-backed entries already carry their exact colon-separated HFS path.
+        if let hfsPath = entry.hfsPath {
+            return hfsPath
         }
         // If it's a real file URL inside a mountpoint, return path relative to volume root
         if let mount = mountPoint {

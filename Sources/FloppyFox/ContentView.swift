@@ -197,9 +197,12 @@ struct ContentView: View {
             Spacer()
         }
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) {
+        // `.simultaneousGesture` (rather than `.onTapGesture`/`.gesture`) so this doesn't
+        // consume the click List needs for its own single-click row selection on macOS —
+        // attaching a plain tap gesture here made selection unreliable.
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
             manager.navigate(into: entry)
-        }
+        })
         .onDrag {
             guard let url = manager.materializedURLForDrag(entry) else {
                 return NSItemProvider()
