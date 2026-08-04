@@ -1,7 +1,7 @@
 import XCTest
-@testable import HFSApp
+@testable import FloppyFox
 
-final class HFSAppTests: XCTestCase {
+final class FloppyFoxTests: XCTestCase {
     func testExample() throws {
         XCTAssertTrue(true)
     }

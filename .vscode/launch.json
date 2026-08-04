@@ -19,6 +19,26 @@
             "target": "HFSApp",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release HFSApp"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:hfsapp}",
+            "name": "Debug FloppyFox",
+            "target": "FloppyFox",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug FloppyFox"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:hfsapp}",
+            "name": "Release FloppyFox",
+            "target": "FloppyFox",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release FloppyFox"
         }
     ]
 }

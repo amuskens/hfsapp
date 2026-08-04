@@ -4,24 +4,24 @@
 import PackageDescription
 
 let package = Package(
-    name: "HFSApp",
+    name: "FloppyFox",
     platforms: [
         .macOS(.v13)
     ],
     products: [
         .executable(
-            name: "HFSApp",
-            targets: ["HFSApp"]
+            name: "FloppyFox",
+            targets: ["FloppyFox"]
         )
     ],
     targets: [
         .executableTarget(
-            name: "HFSApp",
-            path: "Sources/HFSApp"
+            name: "FloppyFox",
+            path: "Sources/FloppyFox"
         ),
         .testTarget(
-            name: "HFSAppTests",
-            dependencies: ["HFSApp"]
+            name: "FloppyFoxTests",
+            dependencies: ["FloppyFox"]
         )
     ],
     swiftLanguageModes: [.v6]

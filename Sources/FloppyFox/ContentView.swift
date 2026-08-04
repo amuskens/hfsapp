@@ -68,6 +68,10 @@ struct ContentView: View {
             }
             .disabled(!manager.isMounted)
 
+            Toggle("Confirm detach", isOn: $manager.confirmBeforeDetach)
+                .toggleStyle(.switch)
+                .frame(width: 200)
+
             Button("Diagnostics") {
                 // Run diagnostics on current image if loaded, otherwise let user choose
                 if let image = manager.imageURL {

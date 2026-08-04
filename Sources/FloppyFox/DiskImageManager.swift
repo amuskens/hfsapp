@@ -426,7 +426,16 @@ final class DiskImageManager: ObservableObject {
     }
 
     private var tempImageCopyURL: URL? = nil
-    @Published var confirmBeforeDetach: Bool = true
+    @Published var confirmBeforeDetach: Bool = false {
+        didSet {
+            UserDefaults.standard.set(confirmBeforeDetach, forKey: "confirmBeforeDetach")
+        }
+    }
+
+    init() {
+        // Load persisted preference
+        self.confirmBeforeDetach = UserDefaults.standard.bool(forKey: "confirmBeforeDetach")
+    }
 
     private func prepareForHFSUtils(imagePath: String) throws {
         let attached = findAttachedDevices(for: imagePath)
@@ -476,7 +485,7 @@ final class DiskImageManager: ObservableObject {
         }
 
         // Wait until the file is no longer held open by any process. If it remains locked, fall back to operating on a temporary copy.
-        if try !isFileUnlocked(path: imagePath, timeout: 2.0) {
+        if try !isFileUnlocked(path: imagePath, timeout: 5.0) {
             // Create a temporary copy and operate on it to avoid locks
             try createTempCopyAndUse(imagePath: imagePath)
         }
@@ -563,19 +572,48 @@ final class DiskImageManager: ObservableObject {
     }
 
     private func runHdiutilDetach(device: String) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
-        process.arguments = ["detach", device]
-        let errorPipe = Pipe()
-        process.standardError = errorPipe
-        try process.run()
-        process.waitUntilExit()
-
-        guard process.terminationStatus == 0 else {
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            let errorString = String(data: errorData, encoding: .utf8) ?? "Unknown detach error"
-            throw DiskImageError.detachmentFailed(errorString.trimmingCharacters(in: .whitespacesAndNewlines))
+        // Try a normal detach, then fall back to force detach and diskutil if necessary
+        func runDetach(args: [String]) -> (String, Int32) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+            p.arguments = args
+            let errPipe = Pipe()
+            p.standardError = errPipe
+            do {
+                try p.run()
+                p.waitUntilExit()
+                let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                return (err, p.terminationStatus)
+            } catch {
+                return ("\(error)", -1)
+            }
         }
+
+        // 1) normal detach
+        let (normalErr, normalCode) = runDetach(args: ["detach", device])
+        if normalCode == 0 { return }
+
+        // 2) try force detach
+        let (forceErr, forceCode) = runDetach(args: ["detach", "-force", device])
+        if forceCode == 0 { return }
+
+        // 3) try diskutil unmountDisk force <device>
+        let diskutil = Process()
+        diskutil.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+        diskutil.arguments = ["unmountDisk", "force", device]
+        let diskErrPipe = Pipe()
+        diskutil.standardError = diskErrPipe
+        do {
+            try diskutil.run()
+            diskutil.waitUntilExit()
+            if diskutil.terminationStatus == 0 { return }
+        } catch {
+            // continue to throw below
+        }
+
+        // If all attempts failed, surface the last error message
+        let lastErr = forceErr.isEmpty ? normalErr : forceErr
+        throw DiskImageError.detachmentFailed(lastErr.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     func loadDirectory(at url: URL) throws {

@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct HFSAppApp: App {
+struct FloppyFoxApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
