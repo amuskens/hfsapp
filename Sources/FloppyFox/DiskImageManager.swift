@@ -118,6 +118,9 @@ final class DiskImageManager: ObservableObject {
     @Published var errorMessage: String?
     @Published var statusMessage: String = "No image loaded"
     @Published var pasteboardContents: [URL] = []
+    // True while a background hdiutil/hfsutils/Finder operation is in flight, so the UI can
+    // show a lightweight progress indicator instead of the whole app looking frozen.
+    @Published var isBusy: Bool = false
 
     // For hfsutils-based backend when the image cannot be mounted
     @Published var currentHFSPath: String? = ":" // ':' denotes root for hfsutils
@@ -125,6 +128,7 @@ final class DiskImageManager: ObservableObject {
     private let fileManager = FileManager.default
     private var internalClipboardURL: URL?
     private var internalClipboardOperation: ClipboardOperation = .copy
+    private var busyDepth = 0
 
     var isMounted: Bool {
         mountPoint != nil
@@ -141,6 +145,21 @@ final class DiskImageManager: ObservableObject {
     private var hdelPath: String? = nil
     private var hmkdirPath: String? = nil
     private var humountPath: String? = nil
+
+    // Once we've confirmed (for the currently-open image) that no hdiutil device is attached
+    // and the file isn't locked, there's no need to re-run that hdiutil-info/lsof check before
+    // every single hls/hcopy/hdel call — that redundant work was the main reason every click
+    // felt sluggish. Reset whenever a new image is opened or the current one is closed.
+    private var hfsUtilsPrepared = false
+
+    // Bumped every time an image is opened, ejected, or detached. Long-running background
+    // operations (a directory listing, say) capture the value that was current when they
+    // started and check it again before writing their result into @Published state — if it's
+    // stale (e.g. the user ejected while the listing was still in flight), the result is
+    // silently discarded instead of resurrecting a browser view for an image that's no longer
+    // open. Without this, a slow operation finishing after Eject could make Eject look like it
+    // didn't work.
+    private var sessionID = UUID()
 
     private var hfsutilsAvailable: Bool {
         if hmountPath != nil { return true }
@@ -188,6 +207,22 @@ final class DiskImageManager: ObservableObject {
         return false
     }
 
+    /// Marks `isBusy` for the duration of `work`. Reentrant (tracked via a depth counter) so
+    /// nested calls (e.g. `exportSelected` awaiting `prepareForHFSUtils`) don't cause the
+    /// indicator to flicker off before the outermost operation actually finishes.
+    private func withBusy<T>(_ work: () async throws -> T) async rethrows -> T {
+        busyDepth += 1
+        isBusy = true
+        defer {
+            busyDepth -= 1
+            if busyDepth <= 0 {
+                busyDepth = 0
+                isBusy = false
+            }
+        }
+        return try await work()
+    }
+
     func openImage() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [UTType(filenameExtension: "dsk"), UTType(filenameExtension: "img")].compactMap { $0 }
@@ -197,33 +232,36 @@ final class DiskImageManager: ObservableObject {
         panel.message = "Choose a .dsk or .img file formatted with the Apple HFS filesystem."
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        attachImage(imageURL: url)
+        Task { await attachImage(imageURL: url) }
     }
 
-    func attachImage(imageURL: URL) {
-        detachImageIfMounted()
-        do {
-            let result = try attachImageUsingHdiutil(imageURL)
-            guard let mountPoint = result.mountPoint else {
-                throw DiskImageError.missingMountPoint
+    func attachImage(imageURL: URL) async {
+        await withBusy {
+            await detachImageIfMounted()
+            hfsUtilsPrepared = false
+            do {
+                let result = try await attachImageUsingHdiutil(imageURL)
+                guard let mountPoint = result.mountPoint else {
+                    throw DiskImageError.missingMountPoint
+                }
+                self.imageURL = imageURL
+                self.mountPoint = mountPoint
+                self.mountedDevice = result.device
+                self.currentDirectory = mountPoint
+                self.statusMessage = "Mounted at \(mountPoint.path)"
+                self.errorMessage = nil
+                try await loadDirectory(at: mountPoint)
+            } catch {
+                // macOS's Disk Arbitration/hdiutil stack cannot mount classic HFS Standard
+                // volumes at all (common for real floppy images, which also usually lack a
+                // partition table). Fall back to the userspace hfsutils backend, which reads
+                // the raw image bytes directly and doesn't depend on kernel filesystem support.
+                await attachImageUsingHFSUtilsFallback(imageURL, hdiutilError: error)
             }
-            self.imageURL = imageURL
-            self.mountPoint = mountPoint
-            self.mountedDevice = result.device
-            self.currentDirectory = mountPoint
-            self.statusMessage = "Mounted at \(mountPoint.path)"
-            self.errorMessage = nil
-            try loadDirectory(at: mountPoint)
-        } catch {
-            // macOS's Disk Arbitration/hdiutil stack cannot mount classic HFS Standard
-            // volumes at all (common for real floppy images, which also usually lack a
-            // partition table). Fall back to the userspace hfsutils backend, which reads
-            // the raw image bytes directly and doesn't depend on kernel filesystem support.
-            attachImageUsingHFSUtilsFallback(imageURL, hdiutilError: error)
         }
     }
 
-    private func attachImageUsingHFSUtilsFallback(_ imageURL: URL, hdiutilError: Error) {
+    private func attachImageUsingHFSUtilsFallback(_ imageURL: URL, hdiutilError: Error) async {
         self.mountPoint = nil
         self.mountedDevice = nil
         self.currentDirectory = nil
@@ -238,7 +276,7 @@ final class DiskImageManager: ObservableObject {
         self.imageURL = imageURL
         self.currentHFSPath = ":"
         do {
-            try loadDirectory(at: URL(fileURLWithPath: "/"))
+            try await loadDirectory(at: URL(fileURLWithPath: "/"))
             self.statusMessage = "Opened via hfsutils (macOS could not mount this volume directly)"
             self.errorMessage = nil
         } catch {
@@ -249,15 +287,15 @@ final class DiskImageManager: ObservableObject {
         }
     }
 
-    private func attachImageUsingHdiutil(_ imageURL: URL) throws -> (mountPoint: URL?, device: String?) {
+    private func attachImageUsingHdiutil(_ imageURL: URL) async throws -> (mountPoint: URL?, device: String?) {
         // First try the normal attach that auto-detects filesystem and mounts.
         let options = ["attach", "-readwrite", "-noverify", "-nobrowse", "-noautoopen", "-plist", imageURL.path]
         do {
-            let res = try runHdiutil(arguments: options)
+            let res = try await runHdiutil(arguments: options)
             if res.mountPoint != nil { return res }
             // If no mount point but a device was returned, continue to try mounting partitions below.
             if let device = res.device {
-                if let mp = try tryMountPartitions(of: device) {
+                if let mp = try await tryMountPartitions(of: device) {
                     return (mp, device)
                 }
             }
@@ -268,10 +306,10 @@ final class DiskImageManager: ObservableObject {
         // Some raw disk images need the raw disk image class; try attaching that way.
         let rawOptions = ["attach", "-readwrite", "-noverify", "-nobrowse", "-noautoopen", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path]
         do {
-            let res = try runHdiutil(arguments: rawOptions)
+            let res = try await runHdiutil(arguments: rawOptions)
             if res.mountPoint != nil { return res }
             if let device = res.device {
-                if let mp = try tryMountPartitions(of: device) {
+                if let mp = try await tryMountPartitions(of: device) {
                     return (mp, device)
                 }
             }
@@ -281,64 +319,71 @@ final class DiskImageManager: ObservableObject {
 
         // Try attach nomount + mount HFS partitions explicitly as a final fallback.
         let nomountOptions = ["attach", "-nomount", "-readwrite", "-noverify", "-nobrowse", "-noautoopen", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path]
-        let nomountRes = try runHdiutil(arguments: nomountOptions)
+        let nomountRes = try await runHdiutil(arguments: nomountOptions)
         if let device = nomountRes.device {
-            if let mp = try tryMountPartitions(of: device) {
+            if let mp = try await tryMountPartitions(of: device) {
                 return (mp, device)
             }
             // If we couldn't mount partitions, detach the raw device and fail.
-            try? runHdiutil(arguments: ["detach", device])
+            _ = try? await runHdiutil(arguments: ["detach", device])
         }
 
         throw DiskImageError.attachmentFailed("hdiutil could not find a mountable HFS partition in the image.")
     }
 
+    /// Runs `executable` with `arguments` on a background thread so callers never block the
+    /// main run loop (the actual per-call latency is usually small, but doing this synchronously
+    /// on the main thread is what made every click feel like a beachball).
+    private nonisolated func runProcess(_ executable: String, _ arguments: [String]) async -> (String, String, Int32) {
+        await Task.detached(priority: .userInitiated) {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: executable)
+            proc.arguments = arguments
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            proc.standardOutput = outPipe
+            proc.standardError = errPipe
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+                let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                return (out, err, proc.terminationStatus)
+            } catch {
+                return ("", "\(error)", Int32(-1))
+            }
+        }.value
+    }
+
+    private nonisolated func runCommand(_ cmd: [String]) async -> (String, String, Int32) {
+        await runProcess(cmd[0], Array(cmd.dropFirst()))
+    }
+
     /// Try to find HFS partitions on the attached device using `diskutil` and mount the first mountable HFS partition.
-    private func tryMountPartitions(of device: String) throws -> URL? {
+    private nonisolated func tryMountPartitions(of device: String) async throws -> URL? {
         // Normalize device to device identifier (e.g., /dev/disk2 -> disk2)
         let deviceIdentifier = URL(fileURLWithPath: device).lastPathComponent
 
-        // Run `diskutil list -plist` and parse partitions
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-        proc.arguments = ["list", "-plist", deviceIdentifier]
-        let out = Pipe()
-        let err = Pipe()
-        proc.standardOutput = out
-        proc.standardError = err
-        try proc.run()
-        proc.waitUntilExit()
-
-        guard proc.terminationStatus == 0 else {
-            // If diskutil fails, give up on this method.
-            return nil
-        }
-
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        guard let plist = try PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
+        let (out, _, code) = await runProcess("/usr/sbin/diskutil", ["list", "-plist", deviceIdentifier])
+        guard code == 0, let data = out.data(using: .utf8),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
             return nil
         }
 
         // The structure has 'AllDisksAndPartitions' with entries that include 'DeviceIdentifier' and 'Partitions'
-        guard let all = plist["AllDisksAndPartitions"] as? [[String: Any]] else { return nil }
-        var targetEntry: [String: Any]? = nil
-        for entry in all {
-            if let id = entry["DeviceIdentifier"] as? String, id == deviceIdentifier {
-                targetEntry = entry
-                break
-            }
+        guard let all = plist["AllDisksAndPartitions"] as? [[String: Any]],
+              let target = all.first(where: { ($0["DeviceIdentifier"] as? String) == deviceIdentifier }) else {
+            return nil
         }
-        guard let target = targetEntry else { return nil }
 
         // Search partitions for Apple_HFS content
         if let partitions = target["Partitions"] as? [[String: Any]] {
             for part in partitions {
                 if let content = part["Content"] as? String, content.contains("Apple_HFS") || content.contains("Apple_HFSX") {
                     if let pdid = part["DeviceIdentifier"] as? String {
-                        let partDevice = "/dev/\(pdid)"
-                        // Try to mount this partition
-                        let mountRes = try mountPartition(partDevice)
-                        if mountRes != nil { return mountRes }
+                        if let mountRes = try await mountPartition("/dev/\(pdid)") {
+                            return mountRes
+                        }
                     }
                 }
             }
@@ -347,65 +392,30 @@ final class DiskImageManager: ObservableObject {
         return nil
     }
 
-    private func mountPartition(_ devicePath: String) throws -> URL? {
-        // Attempt to mount the partition using diskutil mount
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-        proc.arguments = ["mount", devicePath]
-        let out = Pipe()
-        let err = Pipe()
-        proc.standardOutput = out
-        proc.standardError = err
-        try proc.run()
-        proc.waitUntilExit()
+    private nonisolated func mountPartition(_ devicePath: String) async throws -> URL? {
+        let (_, _, mountCode) = await runProcess("/usr/sbin/diskutil", ["mount", devicePath])
+        guard mountCode == 0 else { return nil }
 
-        guard proc.terminationStatus == 0 else {
+        let (infoOut, _, infoCode) = await runProcess("/usr/sbin/diskutil", ["info", "-plist", devicePath])
+        guard infoCode == 0, let data = infoOut.data(using: .utf8),
+              let infoPlist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+              let mp = infoPlist["MountPoint"] as? String else {
             return nil
         }
-
-        // After mounting, query diskutil info -plist to get MountPoint
-        let infoProc = Process()
-        infoProc.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-        infoProc.arguments = ["info", "-plist", devicePath]
-        let infoOut = Pipe()
-        infoProc.standardOutput = infoOut
-        try infoProc.run()
-        infoProc.waitUntilExit()
-
-        guard infoProc.terminationStatus == 0 else { return nil }
-        let infoData = infoOut.fileHandleForReading.readDataToEndOfFile()
-        if let infoPlist = try PropertyListSerialization.propertyList(from: infoData, options: [], format: nil) as? [String: Any], let mp = infoPlist["MountPoint"] as? String {
-            return URL(fileURLWithPath: mp)
-        }
-
-        return nil
+        return URL(fileURLWithPath: mp)
     }
 
-    private func runHdiutil(arguments: [String]) throws -> (mountPoint: URL?, device: String?) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
-        process.arguments = arguments
+    private nonisolated func runHdiutil(arguments: [String]) async throws -> (mountPoint: URL?, device: String?) {
+        let (outputText, errorText, code) = await runProcess("/usr/bin/hdiutil", arguments)
 
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-
-        try process.run()
-        process.waitUntilExit()
-
-        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-
-        guard process.terminationStatus == 0 else {
-            let errorString = String(data: errorData, encoding: .utf8) ?? "Unknown hdiutil error"
-            throw DiskImageError.attachmentFailed(errorString.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard code == 0 else {
+            throw DiskImageError.attachmentFailed(errorText.trimmingCharacters(in: .whitespacesAndNewlines))
         }
 
         // Try parse plist output safely - sometimes hdiutil returns non-plist or empty output
         var plistAny: Any?
-        if !outputData.isEmpty {
-            plistAny = try? PropertyListSerialization.propertyList(from: outputData, options: [], format: nil)
+        if let data = outputText.data(using: .utf8), !data.isEmpty {
+            plistAny = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)
         }
 
         var mountPointURL: URL?
@@ -424,11 +434,9 @@ final class DiskImageManager: ObservableObject {
             }
         } else {
             // If no plist parsed, try to scan stdout text for /dev/diskN
-            if let text = String(data: outputData, encoding: .utf8) {
-                let regex = try? NSRegularExpression(pattern: "/dev/disk\\\\d+", options: [])
-                if let matches = regex?.matches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count)), let m = matches.first, let range = Range(m.range, in: text) {
-                    device = String(text[range])
-                }
+            let regex = try? NSRegularExpression(pattern: "/dev/disk\\\\d+", options: [])
+            if let matches = regex?.matches(in: outputText, options: [], range: NSRange(location: 0, length: outputText.utf16.count)), let m = matches.first, let range = Range(m.range, in: outputText) {
+                device = String(outputText[range])
             }
         }
 
@@ -436,64 +444,55 @@ final class DiskImageManager: ObservableObject {
     }
 
     // Find attachments for an image path by querying hdiutil info -plist and parsing for devices referencing the image
-    private func findAttachedDevices(for imagePath: String) -> [String] {
+    private nonisolated func findAttachedDevices(for imagePath: String) async -> [String] {
+        let (out, _, code) = await runProcess("/usr/bin/hdiutil", ["info", "-plist"])
+        guard code == 0 else { return [] }
+
         var devices: [String] = []
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
-        proc.arguments = ["info", "-plist"]
-        let out = Pipe()
-        proc.standardOutput = out
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            let data = out.fileHandleForReading.readDataToEndOfFile()
-            if let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) {
-                // Recursively walk plist to find dicts that contain our image path and collect their dev-entry values
-                func walk(_ any: Any) {
-                    if let dict = any as? [String: Any] {
-                        // If this dict seems to reference our image path
-                        for (_, v) in dict {
-                            if let s = v as? String, s == imagePath || s.contains(imagePath) {
-                                // look for dev-entry or device
-                                if let dev = dict["dev-entry"] as? String {
-                                    devices.append(dev)
-                                }
-                                if let sysEnt = dict["system-entities"] as? [[String: Any]] {
-                                    for e in sysEnt {
-                                        if let dev = e["dev-entry"] as? String { devices.append(dev) }
-                                    }
+        if let data = out.data(using: .utf8), let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) {
+            // Recursively walk plist to find dicts that contain our image path and collect their dev-entry values
+            func walk(_ any: Any) {
+                if let dict = any as? [String: Any] {
+                    // If this dict seems to reference our image path
+                    for (_, v) in dict {
+                        if let s = v as? String, s == imagePath || s.contains(imagePath) {
+                            // look for dev-entry or device
+                            if let dev = dict["dev-entry"] as? String {
+                                devices.append(dev)
+                            }
+                            if let sysEnt = dict["system-entities"] as? [[String: Any]] {
+                                for e in sysEnt {
+                                    if let dev = e["dev-entry"] as? String { devices.append(dev) }
                                 }
                             }
                         }
-                        // continue walking
-                        for (_, v) in dict { walk(v) }
-                    } else if let arr = any as? [Any] {
-                        for item in arr { walk(item) }
                     }
+                    // continue walking
+                    for (_, v) in dict { walk(v) }
+                } else if let arr = any as? [Any] {
+                    for item in arr { walk(item) }
                 }
-                walk(plist)
-            } else if let text = String(data: data, encoding: .utf8) {
-                // fallback: find lines where image path appears and search nearby for /dev/diskN
-                let lines = text.split(separator: "\n").map { String($0) }
-                for (i, line) in lines.enumerated() {
-                    if line.contains(imagePath) {
-                        let start = max(0, i-6)
-                        let end = min(lines.count-1, i+1)
-                        let window = lines[start...end].joined(separator: "\n")
-                        let regex = try? NSRegularExpression(pattern: "/dev/disk\\\\d+", options: [])
-                        if let matches = regex?.matches(in: window, options: [], range: NSRange(location: 0, length: window.utf16.count)) {
-                            for m in matches {
-                                if let range = Range(m.range, in: window) {
-                                    let dev = String(window[range])
-                                    devices.append(dev)
-                                }
+            }
+            walk(plist)
+        } else {
+            // fallback: find lines where image path appears and search nearby for /dev/diskN
+            let lines = out.split(separator: "\n").map { String($0) }
+            for (i, line) in lines.enumerated() {
+                if line.contains(imagePath) {
+                    let start = max(0, i-6)
+                    let end = min(lines.count-1, i+1)
+                    let window = lines[start...end].joined(separator: "\n")
+                    let regex = try? NSRegularExpression(pattern: "/dev/disk\\\\d+", options: [])
+                    if let matches = regex?.matches(in: window, options: [], range: NSRange(location: 0, length: window.utf16.count)) {
+                        for m in matches {
+                            if let range = Range(m.range, in: window) {
+                                let dev = String(window[range])
+                                devices.append(dev)
                             }
                         }
                     }
                 }
             }
-        } catch {
-            return []
         }
         return Array(Set(devices))
     }
@@ -510,8 +509,10 @@ final class DiskImageManager: ObservableObject {
         self.confirmBeforeDetach = UserDefaults.standard.bool(forKey: "confirmBeforeDetach")
     }
 
-    private func prepareForHFSUtils(imagePath: String) throws {
-        let attached = findAttachedDevices(for: imagePath)
+    private func prepareForHFSUtils(imagePath: String) async throws {
+        if hfsUtilsPrepared { return }
+
+        let attached = await findAttachedDevices(for: imagePath)
         if !attached.isEmpty {
             if confirmBeforeDetach {
                 // Ask user for confirmation before detaching
@@ -528,7 +529,7 @@ final class DiskImageManager: ObservableObject {
                     // user chose Detach: proceed
                     for dev in attached {
                         do {
-                            try runHdiutilDetach(device: dev)
+                            try await runHdiutilDetach(device: dev)
                             print("Detached \(dev) for image \(imagePath)")
                         } catch {
                             print("Failed to detach \(dev): \(error)")
@@ -537,7 +538,8 @@ final class DiskImageManager: ObservableObject {
                     }
                 } else if resp == .alertSecondButtonReturn {
                     // Use temporary copy instead of detaching
-                    try createTempCopyAndUse(imagePath: imagePath)
+                    try await createTempCopyAndUse(imagePath: imagePath)
+                    hfsUtilsPrepared = true
                     return
                 } else {
                     // Cancel: throw to abort the hfsutils operation
@@ -547,7 +549,7 @@ final class DiskImageManager: ObservableObject {
                 // Auto-detach behavior (existing behavior)
                 for dev in attached {
                     do {
-                        try runHdiutilDetach(device: dev)
+                        try await runHdiutilDetach(device: dev)
                         print("Detached \(dev) for image \(imagePath)")
                     } catch {
                         print("Failed to detach \(dev): \(error)")
@@ -558,16 +560,19 @@ final class DiskImageManager: ObservableObject {
         }
 
         // Wait until the file is no longer held open by any process. If it remains locked, fall back to operating on a temporary copy.
-        if try !isFileUnlocked(path: imagePath, timeout: 5.0) {
+        if await !isFileUnlocked(path: imagePath, timeout: 5.0) {
             // Create a temporary copy and operate on it to avoid locks
-            try createTempCopyAndUse(imagePath: imagePath)
+            try await createTempCopyAndUse(imagePath: imagePath)
         }
+        hfsUtilsPrepared = true
     }
 
-    private func createTempCopyAndUse(imagePath: String) throws {
+    private func createTempCopyAndUse(imagePath: String) async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hfsapp-temp-\(UUID().uuidString).img")
         do {
-            try fileManager.copyItem(atPath: imagePath, toPath: tmp.path)
+            try await Task.detached(priority: .userInitiated) {
+                try FileManager.default.copyItem(atPath: imagePath, toPath: tmp.path)
+            }.value
             tempImageCopyURL = tmp
             statusMessage = "Using temporary copy for image operations"
             print("Created temp copy at \(tmp.path) due to lock on original image")
@@ -590,12 +595,12 @@ final class DiskImageManager: ObservableObject {
         }
     }
 
-    private func isFileUnlocked(path: String, timeout: TimeInterval) throws -> Bool {
+    private nonisolated func isFileUnlocked(path: String, timeout: TimeInterval) async -> Bool {
         // Poll lsof to check whether any process holds the file open
         let interval: TimeInterval = 0.2
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            let (out, err, code) = runCommand(["/usr/sbin/lsof", path])
+            let (out, err, code) = await runProcess("/usr/sbin/lsof", [path])
             if code != 0 {
                 // If lsof returns non-zero and no output, assume no process holds it
                 if out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && err.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -607,112 +612,128 @@ final class DiskImageManager: ObservableObject {
                     return true
                 }
             }
-            Thread.sleep(forTimeInterval: interval)
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
         }
         return false
     }
 
-    func detachImageIfMounted() {
-        guard let device = mountedDevice else { return }
-        do {
-            try runHdiutilDetach(device: device)
-        } catch {
-            // If detach fails, ignore here because a new mount may still work.
-        }
-        mountedDevice = nil
-        mountPoint = nil
-        currentDirectory = nil
-        entries = []
-        selectedEntry = nil
-        statusMessage = "Image detached"
-    }
-
-    func ejectImage() {
+    func detachImageIfMounted() async {
         if let device = mountedDevice {
             do {
-                try runHdiutilDetach(device: device)
-                mountPoint = nil
-                mountedDevice = nil
-                currentDirectory = nil
-                entries = []
-                selectedEntry = nil
-                statusMessage = "Image ejected"
-                errorMessage = nil
+                try await runHdiutilDetach(device: device)
             } catch {
-                self.errorMessage = error.localizedDescription
-                statusMessage = "Failed to eject image"
+                // If detach fails, ignore here because a new mount may still work.
             }
+            // Bumped here, immediately before clearing state and with no `await` in between,
+            // rather than at the top of this function: bumping earlier would leave a window
+            // (while the `await` above was in flight) where some other in-flight listing could
+            // capture the *already-bumped* sessionID as its own baseline, pass the staleness
+            // check, and then write its result right after — undoing the clear below.
+            sessionID = UUID()
+            mountedDevice = nil
+            mountPoint = nil
+            currentDirectory = nil
+            entries = []
+            selectedEntry = nil
+            hfsUtilsPrepared = false
+            statusMessage = "Image detached"
             return
         }
 
-        if usingHFSUtils {
+        if imageURL != nil {
+            // Previous image was hfsutils-backed (no real device to detach); make sure its
+            // lock is released and its temp copy cleaned up before attaching a new image.
+            if let humount = humountPath {
+                _ = await runCommand([humount])
+            }
+            sessionID = UUID()
             cleanupTempCopyIfAny()
             imageURL = nil
             entries = []
             selectedEntry = nil
             currentHFSPath = ":"
-            statusMessage = "Image closed"
-            errorMessage = nil
+            hfsUtilsPrepared = false
         }
     }
 
-    private func runHdiutilDetach(device: String) throws {
-        // Try a normal detach, then fall back to force detach and diskutil if necessary
-        func runDetach(args: [String]) -> (String, Int32) {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
-            p.arguments = args
-            let errPipe = Pipe()
-            p.standardError = errPipe
-            do {
-                try p.run()
-                p.waitUntilExit()
-                let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                return (err, p.terminationStatus)
-            } catch {
-                return ("\(error)", -1)
+    func ejectImage() async {
+        await withBusy {
+            if let device = mountedDevice {
+                do {
+                    try await runHdiutilDetach(device: device)
+                    // See the comment in `detachImageIfMounted` on why this is bumped here,
+                    // right alongside the clear, rather than before the `await` above.
+                    sessionID = UUID()
+                    mountPoint = nil
+                    mountedDevice = nil
+                    currentDirectory = nil
+                    entries = []
+                    selectedEntry = nil
+                    hfsUtilsPrepared = false
+                    statusMessage = "Image ejected"
+                    errorMessage = nil
+                } catch {
+                    self.errorMessage = error.localizedDescription
+                    statusMessage = "Failed to eject image"
+                }
+                return
+            }
+
+            if usingHFSUtils {
+                // Best-effort: explicitly release the hfsutils-level lock rather than relying
+                // on it being implicitly dropped when the last hmount/hcopy/hdel process
+                // exited, in case anything is still outstanding.
+                if let humount = humountPath {
+                    _ = await runCommand([humount])
+                }
+                sessionID = UUID()
+                cleanupTempCopyIfAny()
+                imageURL = nil
+                entries = []
+                selectedEntry = nil
+                currentHFSPath = ":"
+                hfsUtilsPrepared = false
+                statusMessage = "Image ejected"
+                errorMessage = nil
             }
         }
+    }
 
-        // 1) normal detach
-        let (normalErr, normalCode) = runDetach(args: ["detach", device])
+    private nonisolated func runHdiutilDetach(device: String) async throws {
+        // Try a normal detach, then fall back to force detach and diskutil if necessary
+        let (_, normalErr, normalCode) = await runProcess("/usr/bin/hdiutil", ["detach", device])
         if normalCode == 0 { return }
 
-        // 2) try force detach
-        let (forceErr, forceCode) = runDetach(args: ["detach", "-force", device])
+        let (_, forceErr, forceCode) = await runProcess("/usr/bin/hdiutil", ["detach", "-force", device])
         if forceCode == 0 { return }
 
-        // 3) try diskutil unmountDisk force <device>
-        let diskutil = Process()
-        diskutil.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-        diskutil.arguments = ["unmountDisk", "force", device]
-        let diskErrPipe = Pipe()
-        diskutil.standardError = diskErrPipe
-        do {
-            try diskutil.run()
-            diskutil.waitUntilExit()
-            if diskutil.terminationStatus == 0 { return }
-        } catch {
-            // continue to throw below
-        }
+        let (_, _, diskutilCode) = await runProcess("/usr/sbin/diskutil", ["unmountDisk", "force", device])
+        if diskutilCode == 0 { return }
 
         // If all attempts failed, surface the last error message
         let lastErr = forceErr.isEmpty ? normalErr : forceErr
         throw DiskImageError.detachmentFailed(lastErr.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    func loadDirectory(at url: URL) throws {
-        // If the image is mounted normally, use FileManager
-        if let mount = mountPoint {
-            let resourceKeys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey]
-            let directoryContents = try fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: resourceKeys, options: [.skipsHiddenFiles])
+    func loadDirectory(at url: URL) async throws {
+        // Captured so that if the image gets ejected (or a different one opened) while this
+        // listing is still in flight, we can tell our result is stale and discard it instead
+        // of clobbering the now-current (possibly empty) state — see `sessionID`.
+        let session = sessionID
 
-            let entries = try directoryContents.map { url -> FileEntry in
-                let resourceValues = try url.resourceValues(forKeys: Set(resourceKeys))
-                let isDirectory = resourceValues.isDirectory ?? false
-                let fileSize = resourceValues.fileSize
-                return FileEntry(url: url, isDirectory: isDirectory, size: fileSize)
-            }
+        // If the image is mounted normally, use FileManager
+        if isMounted {
+            let resourceKeys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey]
+            let entries = try await Task.detached(priority: .userInitiated) {
+                let directoryContents = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: resourceKeys, options: [.skipsHiddenFiles])
+                return try directoryContents.map { itemURL -> FileEntry in
+                    let resourceValues = try itemURL.resourceValues(forKeys: Set(resourceKeys))
+                    let isDirectory = resourceValues.isDirectory ?? false
+                    let fileSize = resourceValues.fileSize
+                    return FileEntry(url: itemURL, isDirectory: isDirectory, size: fileSize)
+                }
+            }.value
+            guard session == sessionID else { return }
 
             self.entries = entries.sorted { first, second in
                 if first.isDirectory == second.isDirectory {
@@ -732,79 +753,24 @@ final class DiskImageManager: ObservableObject {
         }
 
         let hfsPath = currentHFSPath ?? ":"
-        let list = try hfsList(path: hfsPath, imagePath: image.path)
+        let list = try await hfsList(path: hfsPath, imagePath: image.path)
+        guard session == sessionID else { return }
         self.entries = list
         self.currentDirectory = nil
         self.errorMessage = nil
     }
 
-    func refresh() {
-        if let currentDirectory {
-            do {
-                try loadDirectory(at: currentDirectory)
-            } catch {
-                self.errorMessage = DiskImageError.loadDirectoryFailed(currentDirectory, error).localizedDescription
-            }
-        } else if usingHFSUtils {
-            do {
-                try loadDirectory(at: URL(fileURLWithPath: "/"))
-            } catch {
-                self.errorMessage = DiskImageError.loadDirectoryFailed(URL(fileURLWithPath: "/"), error).localizedDescription
-            }
-        }
-    }
-
-    func navigate(into entry: FileEntry) {
-        guard entry.isDirectory else { return }
-        do {
-            if isMounted, let url = entry.url as URL? {
-                try loadDirectory(at: url)
-            } else if usingHFSUtils, let image = imageURL {
-                // update currentHFSPath and load via hfsutils
-                if let current = currentHFSPath {
-                    // append entry name to path
-                    let newPath = current.hasSuffix(":" ) ? "\(current)\(entry.name)" : "\(current):\(entry.name)"
-                    currentHFSPath = newPath
-                } else {
-                    currentHFSPath = ":\(entry.name)"
-                }
-                try loadDirectory(at: URL(fileURLWithPath: "/"))
-            }
-            selectedEntry = nil
-        } catch {
-            self.errorMessage = DiskImageError.loadDirectoryFailed(entry.url, error).localizedDescription
-        }
-    }
-
-    func goUp() {
-        if isMounted {
-            guard let currentDirectory, let mountPoint else { return }
-            guard currentDirectory.path != mountPoint.path else { return }
-            let parent = currentDirectory.deletingLastPathComponent()
-            if parent.path.hasPrefix(mountPoint.path) {
+    func refresh() async {
+        await withBusy {
+            if let currentDirectory {
                 do {
-                    try loadDirectory(at: parent)
-                    selectedEntry = nil
+                    try await loadDirectory(at: currentDirectory)
                 } catch {
-                    self.errorMessage = DiskImageError.loadDirectoryFailed(parent, error).localizedDescription
+                    self.errorMessage = DiskImageError.loadDirectoryFailed(currentDirectory, error).localizedDescription
                 }
-            }
-        } else if usingHFSUtils {
-            // go up in HFS path
-            if var path = currentHFSPath {
-                if path == ":" { return }
-                // remove last segment
-                if let idx = path.range(of: ":", options: .backwards)?.lowerBound {
-                    let trimmed = String(path[..<idx])
-                    currentHFSPath = trimmed.isEmpty ? ":" : trimmed
-                } else if let slashIdx = path.range(of: "/", options: .backwards)?.lowerBound {
-                    currentHFSPath = String(path[..<slashIdx])
-                } else {
-                    currentHFSPath = ":"
-                }
+            } else if usingHFSUtils {
                 do {
-                    try loadDirectory(at: URL(fileURLWithPath: "/"))
-                    selectedEntry = nil
+                    try await loadDirectory(at: URL(fileURLWithPath: "/"))
                 } catch {
                     self.errorMessage = DiskImageError.loadDirectoryFailed(URL(fileURLWithPath: "/"), error).localizedDescription
                 }
@@ -812,42 +778,113 @@ final class DiskImageManager: ObservableObject {
         }
     }
 
-    func deleteSelected() {
-        guard let selectedEntry else { return }
-        deleteEntry(selectedEntry)
+    func navigate(into entry: FileEntry) async {
+        guard entry.isDirectory else { return }
+        await withBusy {
+            do {
+                if isMounted {
+                    try await loadDirectory(at: entry.url)
+                } else if usingHFSUtils {
+                    // update currentHFSPath and load via hfsutils
+                    if let current = currentHFSPath {
+                        // append entry name to path
+                        let newPath = current.hasSuffix(":" ) ? "\(current)\(entry.name)" : "\(current):\(entry.name)"
+                        currentHFSPath = newPath
+                    } else {
+                        currentHFSPath = ":\(entry.name)"
+                    }
+                    try await loadDirectory(at: URL(fileURLWithPath: "/"))
+                }
+                selectedEntry = nil
+            } catch {
+                self.errorMessage = DiskImageError.loadDirectoryFailed(entry.url, error).localizedDescription
+            }
+        }
     }
 
-    func deleteEntry(_ entry: FileEntry) {
-        if isMounted {
-            do {
-                try fileManager.removeItem(at: entry.url)
-                if selectedEntry?.url == entry.url {
-                    selectedEntry = nil
+    func goUp() async {
+        await withBusy {
+            if isMounted {
+                guard let currentDirectory, let mountPoint else { return }
+                guard currentDirectory.path != mountPoint.path else { return }
+                let parent = currentDirectory.deletingLastPathComponent()
+                if parent.path.hasPrefix(mountPoint.path) {
+                    do {
+                        try await loadDirectory(at: parent)
+                        selectedEntry = nil
+                    } catch {
+                        self.errorMessage = DiskImageError.loadDirectoryFailed(parent, error).localizedDescription
+                    }
                 }
-                refresh()
-                statusMessage = "Deleted \(entry.name)"
-            } catch {
-                self.errorMessage = DiskImageError.deleteFailed(entry.url, error).localizedDescription
+            } else if usingHFSUtils {
+                // go up in HFS path
+                if let path = currentHFSPath, path != ":" {
+                    if let idx = path.range(of: ":", options: .backwards)?.lowerBound {
+                        let trimmed = String(path[..<idx])
+                        currentHFSPath = trimmed.isEmpty ? ":" : trimmed
+                    } else {
+                        currentHFSPath = ":"
+                    }
+                    do {
+                        try await loadDirectory(at: URL(fileURLWithPath: "/"))
+                        selectedEntry = nil
+                    } catch {
+                        self.errorMessage = DiskImageError.loadDirectoryFailed(URL(fileURLWithPath: "/"), error).localizedDescription
+                    }
+                }
             }
-            return
         }
+    }
 
-        // hfsutils backend
-        guard usingHFSUtils, let image = imageURL, let hdel = hdelPath else {
-            self.errorMessage = "Delete not supported for this backend"
-            return
-        }
+    func deleteSelected() {
+        guard let selectedEntry else { return }
+        Task { await deleteEntry(selectedEntry) }
+    }
 
-        // Build HFS path
-        let hfsPath = pathForEntry(entry)
-        let humount = humountPath ?? hmountPath!
-        let cmd = "\(hmountPath!) \"\(image.path)\" && \(hdel) \"\(hfsPath)\" && \(humount)"
-        let (out, err, code) = runCommand(["/bin/sh", "-c", cmd])
-        if code == 0 {
-            statusMessage = "Deleted \(entry.name)"
-            refresh()
-        } else {
-            errorMessage = "hdel failed: \(err.isEmpty ? out : err)"
+    func deleteEntry(_ entry: FileEntry) async {
+        await withBusy {
+            if isMounted {
+                do {
+                    try await Task.detached(priority: .userInitiated) {
+                        try FileManager.default.removeItem(at: entry.url)
+                    }.value
+                    if selectedEntry?.url == entry.url {
+                        selectedEntry = nil
+                    }
+                    await refresh()
+                    statusMessage = "Deleted \(entry.name)"
+                } catch {
+                    self.errorMessage = DiskImageError.deleteFailed(entry.url, error).localizedDescription
+                }
+                return
+            }
+
+            // hfsutils backend
+            guard usingHFSUtils, let image = imageURL, let hdel = hdelPath, let hmount = hmountPath else {
+                self.errorMessage = "Delete not supported for this backend"
+                return
+            }
+
+            // Build HFS path
+            let hfsPath = pathForEntry(entry)
+            let humount = humountPath ?? hmount
+            // hmount, hdel, and humount run as separate calls (not `a && b && c` in one shell
+            // string) so humount always runs even if hdel fails — otherwise a failed delete
+            // would leave the volume locked from hfsutils's point of view until something else
+            // happened to humount it.
+            let (mountOut, mountErr, mountCode) = await runCommand([hmount, image.path])
+            guard mountCode == 0 else {
+                errorMessage = "hmount failed: \(mountErr.isEmpty ? mountOut : mountErr)"
+                return
+            }
+            let (out, err, code) = await runCommand([hdel, hfsPath])
+            _ = await runCommand([humount])
+            if code == 0 {
+                statusMessage = "Deleted \(entry.name)"
+                await refresh()
+            } else {
+                errorMessage = "hdel failed: \(err.isEmpty ? out : err)"
+            }
         }
     }
 
@@ -880,11 +917,11 @@ final class DiskImageManager: ObservableObject {
         guard let target = currentDirectory ?? mountPoint ?? (usingHFSUtils ? URL(fileURLWithPath: "/") : nil) else { return }
         let pasteboard = NSPasteboard.general
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
-            importFiles(urls: urls, destination: target)
+            Task { await importFiles(urls: urls, destination: target) }
             return
         }
         if let source = internalClipboardURL {
-            importFiles(urls: [source], destination: target)
+            Task { await importFiles(urls: [source], destination: target) }
             return
         }
     }
@@ -899,71 +936,83 @@ final class DiskImageManager: ObservableObject {
         panel.message = "Choose files or folders to copy into the mounted HFS volume."
 
         guard panel.runModal() == .OK else { return }
-        importFiles(urls: panel.urls, destination: target)
+        Task { await importFiles(urls: panel.urls, destination: target) }
     }
 
     /// Run diagnostic commands against the provided disk image and write the combined output to a temp file. The file path is returned.
-    func runDiagnostics(on imageURL: URL) -> URL? {
-        // Running diagnostics may take a while; ensure UI has time to update
-        statusMessage = "Running diagnostics..."
-        defer { statusMessage = "Diagnostics complete" }
-        var combined = "Diagnostics for \(imageURL.path)\n\n"
-        let cmds: [[String]] = [
-            ["/usr/bin/hdiutil", "attach", "-plist", imageURL.path],
-            ["/usr/bin/hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path],
-            ["/usr/bin/hdiutil", "attach", "-nomount", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path],
-            ["/usr/bin/hdiutil", "imageinfo", imageURL.path]
-        ]
+    func runDiagnostics(on imageURL: URL) async -> URL? {
+        await withBusy {
+            // Running diagnostics may take a while; ensure UI has time to update
+            statusMessage = "Running diagnostics..."
+            defer { statusMessage = "Diagnostics complete" }
+            var combined = "Diagnostics for \(imageURL.path)\n\n"
+            let cmds: [[String]] = [
+                ["/usr/bin/hdiutil", "attach", "-plist", imageURL.path],
+                ["/usr/bin/hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path],
+                ["/usr/bin/hdiutil", "attach", "-nomount", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path],
+                ["/usr/bin/hdiutil", "imageinfo", imageURL.path]
+            ]
 
-        for cmd in cmds {
-            combined += "$ \(cmd.joined(separator: " "))\n"
-            let (out, err, code) = runCommand(cmd)
-            combined += "Exit: \(code)\n"
-            if !out.isEmpty { combined += "STDOUT:\n\(out)\n" }
-            if !err.isEmpty { combined += "STDERR:\n\(err)\n" }
-            combined += "---\n\n"
+            for cmd in cmds {
+                combined += "$ \(cmd.joined(separator: " "))\n"
+                let (out, err, code) = await runCommand(cmd)
+                combined += "Exit: \(code)\n"
+                if !out.isEmpty { combined += "STDOUT:\n\(out)\n" }
+                if !err.isEmpty { combined += "STDERR:\n\(err)\n" }
+                combined += "---\n\n"
 
-            // `attach` (including -nomount) leaves the device attached even when no
-            // filesystem is mountable. Detach it again immediately so diagnostics doesn't
-            // leak raw devices, and so the hfsutils probe below isn't blocked by the lock.
-            if code == 0, cmd.contains("attach"), let device = extractDeviceEntry(from: out) {
-                _ = runCommand(["/usr/bin/hdiutil", "detach", device])
+                // `attach` (including -nomount) leaves the device attached even when no
+                // filesystem is mountable. Detach it again immediately so diagnostics doesn't
+                // leak raw devices, and so the hfsutils probe below isn't blocked by the lock.
+                if code == 0, cmd.contains("attach"), let device = extractDeviceEntry(from: out) {
+                    _ = await runCommand(["/usr/bin/hdiutil", "detach", device])
+                }
             }
-        }
 
-        // Also clean up any devices left attached by earlier (e.g. pre-fix) diagnostics
-        // runs or failed attach attempts, so the hfsutils probe below has exclusive access.
-        for device in findAttachedDevices(for: imageURL.path) {
-            _ = runCommand(["/usr/bin/hdiutil", "detach", device])
-        }
+            // Also clean up any devices left attached by earlier (e.g. pre-fix) diagnostics
+            // runs or failed attach attempts, so the hfsutils probe below has exclusive access.
+            for device in await findAttachedDevices(for: imageURL.path) {
+                _ = await runCommand(["/usr/bin/hdiutil", "detach", device])
+            }
 
-        // If hfsutils installed, try a quick hfsutils probe (hmount+hls)
-        if FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/hmount") || FileManager.default.isExecutableFile(atPath: "/usr/local/bin/hmount") {
-            let hmountPath = FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/hmount") ? "/opt/homebrew/bin/hmount" : "/usr/local/bin/hmount"
-            combined += "$ \(hmountPath) 'image' && hls ':' && humount\n"
-            let hlsPath = FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/hls") ? "/opt/homebrew/bin/hls" : "/usr/local/bin/hls"
-            let humountPath = FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/humount") ? "/opt/homebrew/bin/humount" : "/usr/local/bin/humount"
-            let (out, err, code) = runCommand(["/bin/sh", "-c", "\(hmountPath) \"\(imageURL.path)\" && \(hlsPath) ':' && \(humountPath)"])
-            combined += "Exit: \(code)\n"
-            if !out.isEmpty { combined += "STDOUT:\n\(out)\n" }
-            if !err.isEmpty { combined += "STDERR:\n\(err)\n" }
-            combined += "---\n\n"
-        }
+            // If hfsutils installed, try a quick hfsutils probe (hmount+hls), always humounting
+            // afterward (as separate calls, not `a && b && c`) so this probe can't itself leave
+            // the volume locked if hls fails.
+            if FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/hmount") || FileManager.default.isExecutableFile(atPath: "/usr/local/bin/hmount") {
+                let hmountPath = FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/hmount") ? "/opt/homebrew/bin/hmount" : "/usr/local/bin/hmount"
+                let hlsPath = FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/hls") ? "/opt/homebrew/bin/hls" : "/usr/local/bin/hls"
+                let humountPath = FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/humount") ? "/opt/homebrew/bin/humount" : "/usr/local/bin/humount"
+                combined += "$ \(hmountPath) 'image' && \(hlsPath) ':' && \(humountPath)\n"
+                let (mountOut, mountErr, mountCode) = await runCommand([hmountPath, imageURL.path])
+                if mountCode == 0 {
+                    let (out, err, code) = await runCommand([hlsPath, ":"])
+                    _ = await runCommand([humountPath])
+                    combined += "Exit: \(code)\n"
+                    if !out.isEmpty { combined += "STDOUT:\n\(out)\n" }
+                    if !err.isEmpty { combined += "STDERR:\n\(err)\n" }
+                } else {
+                    combined += "Exit: \(mountCode)\n"
+                    if !mountOut.isEmpty { combined += "STDOUT:\n\(mountOut)\n" }
+                    if !mountErr.isEmpty { combined += "STDERR:\n\(mountErr)\n" }
+                }
+                combined += "---\n\n"
+            }
 
-        // Write to temporary file
-        let timestamp = Int(Date().timeIntervalSince1970)
-        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hfsapp-diagnostics-\(timestamp).txt")
-        do {
-            try combined.write(to: tmp, atomically: true, encoding: .utf8)
-            NotificationCenter.default.post(name: .didCreateDiagnosticsFile, object: tmp)
-            return tmp
-        } catch {
-            self.errorMessage = "Could not write diagnostics: \(error.localizedDescription)"
-            return nil
+            // Write to temporary file
+            let timestamp = Int(Date().timeIntervalSince1970)
+            let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hfsapp-diagnostics-\(timestamp).txt")
+            do {
+                try combined.write(to: tmp, atomically: true, encoding: .utf8)
+                NotificationCenter.default.post(name: .didCreateDiagnosticsFile, object: tmp)
+                return tmp
+            } catch {
+                self.errorMessage = "Could not write diagnostics: \(error.localizedDescription)"
+                return nil
+            }
         }
     }
 
-    private func extractDeviceEntry(from plistOutput: String) -> String? {
+    private nonisolated func extractDeviceEntry(from plistOutput: String) -> String? {
         guard let data = plistOutput.data(using: .utf8),
               let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
               let entities = plist["system-entities"] as? [[String: Any]] else { return nil }
@@ -973,77 +1022,68 @@ final class DiskImageManager: ObservableObject {
         return nil
     }
 
-    private func runCommand(_ cmd: [String]) -> (String, String, Int32) {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: cmd[0])
-        if cmd.count > 1 { proc.arguments = Array(cmd.dropFirst()) }
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        proc.standardOutput = outPipe
-        proc.standardError = errPipe
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            return (out, err, proc.terminationStatus)
-        } catch {
-            return ("", "\(error)", -1)
-        }
-    }
+    func exportSelected() async {
+        await withBusy {
+            // if using hfsutils, ensure no hdiutil attached device blocks the file
+            if usingHFSUtils, let image = imageURL {
+                try? await prepareForHFSUtils(imagePath: image.path)
+            }
+            guard let selectedEntry else { return }
+            if !isMounted && selectedEntry.isDirectory {
+                self.errorMessage = "Exporting folders isn't supported yet; only individual files can be exported."
+                return
+            }
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = selectedEntry.name
+            panel.canCreateDirectories = true
+            panel.title = "Export File from Volume"
+            panel.message = "Choose a destination to export the selected item."
 
-    func exportSelected() {
-        // if using hfsutils, ensure no hdiutil attached device blocks the file
-        if usingHFSUtils, let image = imageURL {
-            try? prepareForHFSUtils(imagePath: image.path)
-        }
-        guard let selectedEntry else { return }
-        if !isMounted && selectedEntry.isDirectory {
-            self.errorMessage = "Exporting folders isn't supported yet; only individual files can be exported."
-            return
-        }
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = selectedEntry.name
-        panel.canCreateDirectories = true
-        panel.title = "Export File from Volume"
-        panel.message = "Choose a destination to export the selected item."
+            guard panel.runModal() == .OK, let destination = panel.url else { return }
+            if isMounted {
+                do {
+                    try await Task.detached(priority: .userInitiated) {
+                        try Self.copyItem(from: selectedEntry.url, to: destination)
+                    }.value
+                    statusMessage = "Exported \(selectedEntry.name)"
+                } catch {
+                    self.errorMessage = DiskImageError.exportFailed(selectedEntry.url, error).localizedDescription
+                }
+                return
+            }
 
-        guard panel.runModal() == .OK, let destination = panel.url else { return }
-        if isMounted {
+            // hfsutils backend
+            guard usingHFSUtils else {
+                self.errorMessage = "Export not supported for this backend"
+                return
+            }
             do {
-                try copyItem(from: selectedEntry.url, to: destination)
+                try await exportHFSEntry(selectedEntry, to: destination)
                 statusMessage = "Exported \(selectedEntry.name)"
             } catch {
-                self.errorMessage = DiskImageError.exportFailed(selectedEntry.url, error).localizedDescription
+                errorMessage = error.localizedDescription
             }
-            return
-        }
-
-        // hfsutils backend
-        guard usingHFSUtils else {
-            self.errorMessage = "Export not supported for this backend"
-            return
-        }
-        do {
-            try exportHFSEntry(selectedEntry, to: destination)
-            statusMessage = "Exported \(selectedEntry.name)"
-        } catch {
-            errorMessage = error.localizedDescription
         }
     }
 
     /// Copies an hfsutils-backed entry out to a real file at `destination`, using its actual
     /// HFS name/extension. Shared by the Export button and drag-out-to-Finder.
-    private func exportHFSEntry(_ entry: FileEntry, to destination: URL) throws {
+    private func exportHFSEntry(_ entry: FileEntry, to destination: URL) async throws {
         guard let hcopy = hcopyPath, let hmount = hmountPath, let image = imageURL else {
             throw NSError(domain: "hfsutils", code: 0, userInfo: [NSLocalizedDescriptionKey: "hfsutils backend unavailable"])
         }
         let hfsPath = pathForEntry(entry)
-        // Build command: hmount image && hcopy ":<hfsPath>" "<destination>" && humount
         let humount = humountPath ?? hmount
         let usePath = imagePathToUse(original: image.path)
-        let cmd = "\(hmount) \"\(usePath)\" && \(hcopy) \"\(hfsPath)\" \"\(destination.path)\" && \(humount)"
-        let (out, err, code) = runCommand(["/bin/sh", "-c", cmd])
+        // hmount, hcopy, and humount run as separate calls so humount always runs even if
+        // hcopy fails — otherwise a failed export would leave the volume locked from
+        // hfsutils's point of view.
+        let (mountOut, mountErr, mountCode) = await runCommand([hmount, usePath])
+        guard mountCode == 0 else {
+            throw NSError(domain: "hfsutils", code: Int(mountCode), userInfo: [NSLocalizedDescriptionKey: "hmount failed: \(mountErr.isEmpty ? mountOut : mountErr)"])
+        }
+        let (out, err, code) = await runCommand([hcopy, hfsPath, destination.path])
+        _ = await runCommand([humount])
         guard code == 0, fileManager.fileExists(atPath: destination.path) else {
             throw NSError(domain: "hfsutils", code: Int(code), userInfo: [NSLocalizedDescriptionKey: "hcopy failed: \(err.isEmpty ? out : err)"])
         }
@@ -1055,80 +1095,97 @@ final class DiskImageManager: ObservableObject {
     /// with no bytes on the host filesystem, so the file has to be copied out to a temporary
     /// location first, named after its real HFS name (including extension) rather than the
     /// pseudo-URL (which would otherwise show up in Finder as an unnamed "localhost" item).
+    ///
+    /// This stays synchronous: SwiftUI's `.onDrag` closure must return an `NSItemProvider`
+    /// immediately and can't `await`. By the time a drag can happen the volume has already
+    /// been prepared once during the initial directory listing (see `hfsUtilsPrepared`), so
+    /// this is just one fast hmount+hcopy+humount round trip rather than a full lock check.
     func materializedURLForDrag(_ entry: FileEntry) -> URL? {
         if isMounted {
             return entry.url
         }
-        guard usingHFSUtils, !entry.isDirectory, let image = imageURL else { return nil }
-        try? prepareForHFSUtils(imagePath: image.path)
+        guard usingHFSUtils, !entry.isDirectory, let image = imageURL, let hcopy = hcopyPath, let hmount = hmountPath else { return nil }
 
         let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hfsapp-drag-\(UUID().uuidString)", isDirectory: true)
         guard (try? fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)) != nil else { return nil }
         let destination = tempDir.appendingPathComponent(entry.name)
 
-        do {
-            try exportHFSEntry(entry, to: destination)
-            return destination
-        } catch {
-            return nil
-        }
+        let hfsPath = pathForEntry(entry)
+        let humount = humountPath ?? hmount
+        let usePath = imagePathToUse(original: image.path)
+        // Separate calls (not `a && b && c`) so humount always runs even if hcopy fails.
+        let (_, _, mountCode) = Self.runCommandSync([hmount, usePath])
+        guard mountCode == 0 else { return nil }
+        let (_, _, code) = Self.runCommandSync([hcopy, hfsPath, destination.path])
+        _ = Self.runCommandSync([humount])
+        guard code == 0, fileManager.fileExists(atPath: destination.path) else { return nil }
+        return destination
     }
 
-    func importFiles(urls: [URL], destination: URL) {
-        if isMounted {
+    func importFiles(urls: [URL], destination: URL) async {
+        await withBusy {
+            if isMounted {
+                for source in urls {
+                    let targetURL = destination.appendingPathComponent(source.lastPathComponent)
+                    do {
+                        try await Task.detached(priority: .userInitiated) {
+                            try Self.copyItem(from: source, to: targetURL)
+                        }.value
+                    } catch {
+                        self.errorMessage = DiskImageError.importFailed(source, error).localizedDescription
+                        return
+                    }
+                }
+                await refresh()
+                return
+            }
+
+            // hfsutils backend: copy each file into image at currentHFSPath
+            guard usingHFSUtils, let image = imageURL, let hcopy = hcopyPath, let hmount = hmountPath else {
+                self.errorMessage = "Import not supported for this backend"
+                return
+            }
+
+            // Detach any hdiutil attachments to the image so hfsutils can lock it
+            do { try await prepareForHFSUtils(imagePath: image.path) } catch {
+                print("prepareForHFSUtils failed before import: \(error)")
+            }
+
+            let destPath = currentHFSPath ?? ":"
             for source in urls {
-                let targetURL = destination.appendingPathComponent(source.lastPathComponent)
-                do {
-                    try copyItem(from: source, to: targetURL)
-                } catch {
-                    self.errorMessage = DiskImageError.importFailed(source, error).localizedDescription
+                let hfsDest = destPath.hasSuffix(":" ) ? "\(destPath)\(source.lastPathComponent)" : "\(destPath):\(source.lastPathComponent)"
+                let humount = humountPath ?? hmount
+                let usePath = imagePathToUse(original: image.path)
+                // Separate calls (not `a && b && c`) so humount always runs even if hcopy fails.
+                let (mountOut, mountErr, mountCode) = await runCommand([hmount, usePath])
+                guard mountCode == 0 else {
+                    self.errorMessage = DiskImageError.importFailed(source, NSError(domain: "hfsutils", code: Int(mountCode), userInfo: [NSLocalizedDescriptionKey: mountErr.isEmpty ? mountOut : mountErr])).localizedDescription
+                    return
+                }
+                let (out, err, code) = await runCommand([hcopy, source.path, hfsDest])
+                _ = await runCommand([humount])
+                if code != 0 {
+                    self.errorMessage = DiskImageError.importFailed(source, NSError(domain: "hfsutils", code: Int(code), userInfo: [NSLocalizedDescriptionKey: err.isEmpty ? out : err])).localizedDescription
                     return
                 }
             }
-            refresh()
-            return
+            await refresh()
         }
-
-        // hfsutils backend: copy each file into image at currentHFSPath
-        guard usingHFSUtils, let image = imageURL, let hcopy = hcopyPath, let hmount = hmountPath else {
-            self.errorMessage = "Import not supported for this backend"
-            return
-        }
-
-        // Detach any hdiutil attachments to the image so hfsutils can lock it
-        do { try prepareForHFSUtils(imagePath: image.path) } catch {
-            print("prepareForHFSUtils failed before import: \(error)")
-        }
-
-        let destPath = currentHFSPath ?? ":"
-        for source in urls {
-            // Build command: hmount image && hcopy "hostfile" ":<dest>" && humount
-            let hfsDest = destPath.hasSuffix(":" ) ? "\(destPath)\(source.lastPathComponent)" : "\(destPath)/\(source.lastPathComponent)"
-            let humount = humountPath ?? hmount
-            let usePath = imagePathToUse(original: image.path)
-            let cmd = "\(hmount) \"\(usePath)\" && \(hcopy) \"\(source.path)\" \"\(hfsDest)\" && \(humount)"
-            let (out, err, code) = runCommand(["/bin/sh", "-c", cmd])
-            if code != 0 {
-                self.errorMessage = DiskImageError.importFailed(source, NSError(domain: "hfsutils", code: Int(code), userInfo: [NSLocalizedDescriptionKey: err.isEmpty ? out : err])).localizedDescription
-                return
-            }
-        }
-        refresh()
     }
 
-    private func copyItem(from source: URL, to destination: URL) throws {
-        if fileManager.fileExists(atPath: destination.path) {
+    private nonisolated static func copyItem(from source: URL, to destination: URL) throws {
+        if FileManager.default.fileExists(atPath: destination.path) {
             throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteFileExistsError, userInfo: [NSLocalizedDescriptionKey: "Destination already exists."])
         }
-        try fileManager.copyItem(at: source, to: destination)
+        try FileManager.default.copyItem(at: source, to: destination)
     }
 
     // MARK: - hfsutils integration helpers
 
-    private func hfsList(path: String, imagePath: String) throws -> [FileEntry] {
+    private func hfsList(path: String, imagePath: String) async throws -> [FileEntry] {
         guard let hmount = hmountPath, let hls = hlsPath else { return [] }
         // Ensure exclusive access: detach any hdiutil-attached devices for this image to avoid lock errors
-        do { try prepareForHFSUtils(imagePath: imagePath) } catch {
+        do { try await prepareForHFSUtils(imagePath: imagePath) } catch {
             // Log but continue; hfsutils may still work
             print("prepareForHFSUtils failed: \(error)")
         }
@@ -1142,13 +1199,13 @@ final class DiskImageManager: ObservableObject {
         // so we only capture hls's own stdout. hmount persists the current volume across
         // process invocations via ~/.hcwd, and hmount's own banner text ("Volume name is...")
         // would otherwise get parsed as bogus file entries if captured together with hls's output.
-        let (mountOut, mountErr, mountCode) = runCommand([hmount, usePath])
+        let (mountOut, mountErr, mountCode) = await runCommand([hmount, usePath])
         guard mountCode == 0 else {
             throw NSError(domain: "hfsutils", code: Int(mountCode), userInfo: [NSLocalizedDescriptionKey: "hmount failed: \(mountErr.isEmpty ? mountOut : mountErr)"])
         }
-        let (out, err, code) = runCommand([hls, query])
+        let (out, err, code) = await runCommand([hls, query])
         guard code == 0 else {
-            _ = runCommand([humount])
+            _ = await runCommand([humount])
             throw NSError(domain: "hfsutils", code: Int(code), userInfo: [NSLocalizedDescriptionKey: "hls failed: \(err.isEmpty ? out : err)"])
         }
         var results: [FileEntry] = []
@@ -1177,14 +1234,14 @@ final class DiskImageManager: ObservableObject {
             // into it, `-l` adds the leading 'd'/'f' type marker) while the volume is still
             // mounted. Passed as separate process arguments (no shell), so spaces/quotes in
             // the name can't cause any escaping issues here.
-            let (dlOut, _, dlCode) = runCommand([hls, "-dl", hfsFullPath])
+            let (dlOut, _, dlCode) = await runCommand([hls, "-dl", hfsFullPath])
             let isDir = dlCode == 0 && dlOut.hasPrefix("d")
 
             let pseudo = URL(string: "hfs://localhost\(imagePath)?path=\(hfsFullPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? hfsFullPath)")!
             let entry = FileEntry(url: pseudo, isDirectory: isDir, size: nil, hfsPath: hfsFullPath)
             results.append(entry)
         }
-        _ = runCommand([humount])
+        _ = await runCommand([humount])
 
         // Sort directories first
         results.sort { a, b in
@@ -1205,6 +1262,27 @@ final class DiskImageManager: ObservableObject {
             return rel.isEmpty ? ":" : ":\(rel)"
         }
         return entry.url.path
+    }
+
+    /// Synchronous variant of `runCommand`, used only by `materializedURLForDrag` since SwiftUI's
+    /// `.onDrag` closure must return synchronously and can't `await`.
+    private nonisolated static func runCommandSync(_ cmd: [String]) -> (String, String, Int32) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: cmd[0])
+        if cmd.count > 1 { proc.arguments = Array(cmd.dropFirst()) }
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return (out, err, proc.terminationStatus)
+        } catch {
+            return ("", "\(error)", -1)
+        }
     }
 
     func handleDroppedFiles(providers: [NSItemProvider]) -> Bool {
@@ -1234,14 +1312,36 @@ final class DiskImageManager: ObservableObject {
                 if !urls.isEmpty {
                     if self.isMounted {
                         let dest = self.currentDirectory ?? self.mountPoint!
-                        self.importFiles(urls: urls, destination: dest)
+                        await self.importFiles(urls: urls, destination: dest)
                     } else if self.usingHFSUtils {
-                        self.importFiles(urls: urls, destination: URL(fileURLWithPath: "/"))
+                        await self.importFiles(urls: urls, destination: URL(fileURLWithPath: "/"))
                     }
                 }
             }
         }
 
+        return true
+    }
+
+    /// Opens the first dropped file as a disk image — used by the placeholder view so a
+    /// `.dsk`/`.img` file can be dragged straight onto the (empty) window to open it, the same
+    /// way `openImage()`'s panel would.
+    func handleDroppedImageToOpen(providers: [NSItemProvider]) -> Bool {
+        guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) else {
+            return false
+        }
+        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+            var droppedURL: URL?
+            if let url = item as? URL {
+                droppedURL = url
+            } else if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
+                droppedURL = url
+            }
+            guard let droppedURL else { return }
+            Task { @MainActor in
+                await self.attachImage(imageURL: droppedURL)
+            }
+        }
         return true
     }
 }

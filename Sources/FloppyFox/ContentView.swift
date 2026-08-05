@@ -4,12 +4,19 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @StateObject private var manager = DiskImageManager()
     @State private var isDropTarget = false
+    @State private var isDropTargetForOpen = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
-                .padding()
-                .background(Color(nsColor: .windowBackgroundColor))
+                .padding(14)
+                .background(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(Color(nsColor: .windowBackgroundColor).opacity(0.98))
+                        .shadow(color: .black.opacity(0.08), radius: 10, x: 0, y: 4)
+                )
+                .padding(.horizontal)
+                .padding(.top)
 
             Divider()
 
@@ -20,6 +27,17 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 820, minHeight: 520)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.96, green: 0.94, blue: 1.0),
+                    Color(red: 0.98, green: 1.0, blue: 0.97)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+        )
         .alert("Error", isPresented: .constant(manager.errorMessage != nil), presenting: manager.errorMessage) { message in
             Button("OK", role: .cancel) {
                 manager.errorMessage = nil
@@ -57,14 +75,19 @@ struct ContentView: View {
             .disabled(!manager.isMounted && !manager.usingHFSUtils)
 
             Button("Export") {
-                manager.exportSelected()
+                Task { await manager.exportSelected() }
             }
             .disabled(manager.selectedEntry == nil)
 
             Spacer()
 
+            if manager.isBusy {
+                ProgressView()
+                    .controlSize(.small)
+            }
+
             Button("Refresh") {
-                manager.refresh()
+                Task { await manager.refresh() }
             }
             .disabled(!manager.isMounted && !manager.usingHFSUtils)
 
@@ -75,9 +98,7 @@ struct ContentView: View {
             Button("Diagnostics") {
                 // Run diagnostics on current image if loaded, otherwise let user choose
                 if let image = manager.imageURL {
-                    if let _ = manager.runDiagnostics(on: image) {
-                        // notification opens the file
-                    }
+                    Task { _ = await manager.runDiagnostics(on: image) }
                 } else {
                     let panel = NSOpenPanel()
                     panel.allowedContentTypes = [UTType(filenameExtension: "dsk"), UTType(filenameExtension: "img")].compactMap { $0 }
@@ -86,15 +107,13 @@ struct ContentView: View {
                     panel.allowsMultipleSelection = false
                     panel.title = "Choose image for diagnostics"
                     if panel.runModal() == .OK, let url = panel.url {
-                        if let _ = manager.runDiagnostics(on: url) {
-                            // notification opens the file
-                        }
+                        Task { _ = await manager.runDiagnostics(on: url) }
                     }
                 }
             }
 
             Button("Eject") {
-                manager.ejectImage()
+                Task { await manager.ejectImage() }
             }
             .disabled(!manager.isMounted && !manager.usingHFSUtils)
         }
@@ -104,7 +123,12 @@ struct ContentView: View {
         HStack(spacing: 0) {
             fileBrowser
                 .frame(minWidth: 340)
-                .background(Color(nsColor: .textBackgroundColor))
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(nsColor: .textBackgroundColor).opacity(0.96))
+                        .shadow(color: .black.opacity(0.05), radius: 8, x: 0, y: 4)
+                )
+                .padding(12)
                 .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTarget) { providers in
                     manager.handleDroppedFiles(providers: providers)
                 }
@@ -113,6 +137,12 @@ struct ContentView: View {
 
             detailPane
                 .frame(minWidth: 280)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(nsColor: .windowBackgroundColor).opacity(0.94))
+                        .shadow(color: .black.opacity(0.05), radius: 8, x: 0, y: 4)
+                )
+                .padding(12)
         }
     }
 
@@ -140,13 +170,13 @@ struct ContentView: View {
 
             HStack {
                 Button("Up") {
-                    manager.goUp()
+                    Task { await manager.goUp() }
                 }
                 .disabled(!manager.canGoBack)
 
                 Spacer()
 
-                Text(isDropTarget ? "Drop files here to add them to the volume" : "Drag files here from Finder to copy them into the mounted volume")
+                Text(isDropTarget ? "Drop files here to add them to the volume" : "Drag files here from Finder to copy floppy treasures into the mounted volume")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -159,7 +189,7 @@ struct ContentView: View {
                         .tag(entry)
                         .contextMenu {
                             Button("Open") {
-                                manager.navigate(into: entry)
+                                Task { await manager.navigate(into: entry) }
                             }
                             .disabled(!entry.isDirectory)
 
@@ -168,7 +198,7 @@ struct ContentView: View {
                             }
 
                             Button("Delete", role: .destructive) {
-                                manager.deleteEntry(entry)
+                                Task { await manager.deleteEntry(entry) }
                             }
                             .disabled(entry.url == manager.currentDirectory)
                         }
@@ -197,11 +227,17 @@ struct ContentView: View {
             Spacer()
         }
         .contentShape(Rectangle())
-        // `.simultaneousGesture` (rather than `.onTapGesture`/`.gesture`) so this doesn't
-        // consume the click List needs for its own single-click row selection on macOS —
-        // attaching a plain tap gesture here made selection unreliable.
+        // `.simultaneousGesture` (rather than `.onTapGesture`/`.gesture`) so these don't
+        // consume the click List needs for its own handling — attaching a plain tap gesture
+        // here made selection unreliable. The explicit single-tap handler below is needed
+        // because `.onDrag` on a macOS List row intercepts the mouse-down before List's own
+        // click-to-select logic sees it, so without this, clicking a row (with drag enabled)
+        // silently fails to highlight/select it.
+        .simultaneousGesture(TapGesture(count: 1).onEnded {
+            manager.selectedEntry = entry
+        })
         .simultaneousGesture(TapGesture(count: 2).onEnded {
-            manager.navigate(into: entry)
+            Task { await manager.navigate(into: entry) }
         })
         .onDrag {
             guard let url = manager.materializedURLForDrag(entry) else {
@@ -248,13 +284,18 @@ struct ContentView: View {
 
     private var placeholderView: some View {
         VStack(spacing: 16) {
-            Image(systemName: "externaldrive.connected.to.line.below")
-                .font(.system(size: 56))
-                .foregroundColor(.accentColor)
+            ZStack {
+                Circle()
+                    .fill(Color(red: 0.95, green: 0.88, blue: 1.0))
+                    .frame(width: 130, height: 130)
+                Image(systemName: "externaldrive.connected.to.line.below")
+                    .font(.system(size: 52))
+                    .foregroundColor(.accentColor)
+            }
             Text("Open an HFS disk image")
                 .font(.title)
                 .bold()
-            Text("Choose a .dsk or .img image file formatted with Apple HFS, then browse and manage its contents.")
+            Text(isDropTargetForOpen ? "Drop to open" : "Choose a .dsk or .img image file formatted with Apple HFS, then browse and manage its contents.")
                 .multilineTextAlignment(.center)
                 .foregroundColor(.secondary)
                 .frame(maxWidth: 520)
@@ -262,8 +303,17 @@ struct ContentView: View {
                 manager.openImage()
             }
             .buttonStyle(.borderedProminent)
+            .controlSize(.large)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(isDropTargetForOpen ? Color.accentColor.opacity(0.1) : Color.clear)
+                .padding(20)
+        )
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTargetForOpen) { providers in
+            manager.handleDroppedImageToOpen(providers: providers)
+        }
     }
 }
 
