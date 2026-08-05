@@ -5,8 +5,11 @@ struct ContentView: View {
     @EnvironmentObject var manager: DiskImageManager
     @State private var isDropTarget = false
     @State private var isDropTargetForOpen = false
-    @State private var deleteConfirmationEntry: FileEntry? = nil
+    @State private var deleteConfirmationEntries: Set<FileEntry> = []
     @State private var quickLook = QuickLookController()
+    // Tracks the last plain (unmodified) click, as the starting point for Shift-click range
+    // selection — matches Finder's click-to-extend-selection behavior.
+    @State private var selectionAnchor: FileEntry?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -54,16 +57,27 @@ struct ContentView: View {
         } message: { message in
             Text(message)
         }
-        .alert(item: $deleteConfirmationEntry) { entry in
-            Alert(
-                title: Text("Delete item?"),
-                message: Text("Are you sure you want to delete \"") + Text(entry.name).bold() + Text("\"? This action cannot be undone."),
-                primaryButton: .destructive(Text("Delete")) {
-                    deleteConfirmationEntry = nil
-                    Task { await manager.deleteEntry(entry) }
-                },
-                secondaryButton: .cancel()
+        .alert(
+            "Delete \(deleteConfirmationEntries.count == 1 ? "item" : "items")?",
+            isPresented: Binding(
+                get: { !deleteConfirmationEntries.isEmpty },
+                set: { if !$0 { deleteConfirmationEntries = [] } }
             )
+        ) {
+            Button("Delete", role: .destructive) {
+                let entries = deleteConfirmationEntries
+                deleteConfirmationEntries = []
+                Task { await manager.deleteEntries(entries) }
+            }
+            Button("Cancel", role: .cancel) {
+                deleteConfirmationEntries = []
+            }
+        } message: {
+            if deleteConfirmationEntries.count == 1, let name = deleteConfirmationEntries.first?.name {
+                Text("Are you sure you want to delete \"") + Text(name).bold() + Text("\"? This action cannot be undone.")
+            } else {
+                Text("Are you sure you want to delete these \(deleteConfirmationEntries.count) items? This action cannot be undone.")
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .didCreateDiagnosticsFile)) { note in
             if let url = note.object as? URL {
@@ -98,7 +112,7 @@ struct ContentView: View {
             Button("Export") {
                 Task { await manager.exportSelected() }
             }
-            .disabled(manager.selectedEntry == nil)
+            .disabled(manager.selectedEntries.isEmpty)
 
             Button("Quick Look") {
                 quickLook.toggle(for: manager.selectedEntry)
@@ -203,8 +217,12 @@ struct ContentView: View {
             .padding(.horizontal)
             .padding(.bottom, 8)
 
-            List(selection: $manager.selectedEntry) {
+            List(selection: $manager.selectedEntries) {
                 ForEach(manager.entries) { entry in
+                    // If the right-clicked row is part of a larger multi-selection, Copy/Delete
+                    // act on the whole selection (matching Finder); otherwise just this row.
+                    let isPartOfSelection = manager.selectedEntries.count > 1 && manager.selectedEntries.contains(entry)
+
                     row(for: entry)
                         .tag(entry)
                         .contextMenu {
@@ -212,12 +230,16 @@ struct ContentView: View {
                                 Task { await manager.openEntry(entry) }
                             }
 
-                            Button("Copy") {
-                                manager.copyEntry(entry)
+                            Button(isPartOfSelection ? "Copy \(manager.selectedEntries.count) Items" : "Copy") {
+                                if isPartOfSelection {
+                                    manager.copySelected()
+                                } else {
+                                    manager.copyEntry(entry)
+                                }
                             }
 
-                            Button("Delete", role: .destructive) {
-                                deleteConfirmationEntry = entry
+                            Button(isPartOfSelection ? "Delete \(manager.selectedEntries.count) Items" : "Delete", role: .destructive) {
+                                deleteConfirmationEntries = isPartOfSelection ? manager.selectedEntries : [entry]
                             }
                             .disabled(entry.url == manager.currentDirectory || manager.isReadOnly)
                         }
@@ -251,28 +273,66 @@ struct ContentView: View {
         // here made selection unreliable. The explicit single-tap handler below is needed
         // because `.onDrag` on a macOS List row intercepts the mouse-down before List's own
         // click-to-select logic sees it, so without this, clicking a row (with drag enabled)
-        // silently fails to highlight/select it.
+        // silently fails to highlight/select it. Since we're overriding List's own click
+        // handling anyway, Cmd/Shift-click multi-select has to be reimplemented here too.
         .simultaneousGesture(TapGesture(count: 1).onEnded {
-            manager.selectedEntry = entry
+            handleSingleClick(on: entry)
         })
         .simultaneousGesture(TapGesture(count: 2).onEnded {
             Task { await manager.openEntry(entry) }
         })
         .onDrag {
-            guard let url = manager.materializedURLForDrag(entry) else {
-                return NSItemProvider()
+            manager.makeDragItemProvider(for: entry)
+        }
+    }
+
+    /// Cmd-click toggles the entry in/out of the selection; Shift-click extends a contiguous
+    /// range from the last plain click; a plain click replaces the selection with just this
+    /// entry — the same three behaviors Finder's list view supports.
+    private func handleSingleClick(on entry: FileEntry) {
+        let flags = NSEvent.modifierFlags
+        if flags.contains(.command) {
+            if manager.selectedEntries.contains(entry) {
+                manager.selectedEntries.remove(entry)
+            } else {
+                manager.selectedEntries.insert(entry)
             }
-            return NSItemProvider(object: url as NSURL)
+            selectionAnchor = entry
+        } else if flags.contains(.shift), let anchor = selectionAnchor,
+                  let anchorIndex = manager.entries.firstIndex(of: anchor),
+                  let targetIndex = manager.entries.firstIndex(of: entry) {
+            let range = anchorIndex < targetIndex ? anchorIndex...targetIndex : targetIndex...anchorIndex
+            manager.selectedEntries = Set(manager.entries[range])
+        } else {
+            manager.selectedEntries = [entry]
+            selectionAnchor = entry
         }
     }
 
     private var detailPane: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Selected item")
+            Text(manager.selectedEntries.count > 1 ? "Selected items" : "Selected item")
                 .font(.title3.bold())
                 .padding(.top)
 
-            if let entry = manager.selectedEntry {
+            if manager.selectedEntries.count > 1 {
+                let entries = manager.selectedEntries
+                Text("\(entries.count) items selected")
+                    .font(.headline)
+                let totalSize = entries.compactMap { $0.size }.reduce(0, +)
+                if totalSize > 0 {
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(totalSize), countStyle: .file))
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button("Delete Selected") {
+                    deleteConfirmationEntries = entries
+                }
+                .buttonStyle(.borderedProminent)
+                .foregroundColor(.red)
+                .disabled(manager.isReadOnly)
+            } else if let entry = manager.selectedEntry {
                 Text(entry.name)
                     .font(.headline)
                 Text(entry.url.path)
@@ -288,13 +348,11 @@ struct ContentView: View {
                 }
                 Spacer()
                 Button("Delete This Item") {
-                    if let selectedEntry = manager.selectedEntry {
-                        deleteConfirmationEntry = selectedEntry
-                    }
+                    deleteConfirmationEntries = [entry]
                 }
                 .buttonStyle(.borderedProminent)
                 .foregroundColor(.red)
-                .disabled(manager.selectedEntry == nil || manager.isReadOnly)
+                .disabled(manager.isReadOnly)
             } else {
                 Text("Select a file or folder to see details.")
                     .foregroundColor(.secondary)

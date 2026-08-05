@@ -26,7 +26,17 @@ struct FloppyFoxApp: App {
             // but include replacements when running from command line)
             CommandGroup(replacing: .appInfo) {}
 
-            CommandMenu("File") {
+            // `CommandGroup(replacing:)` inserts into the File/Edit menus every Mac app already
+            // gets for free; a `CommandMenu("File")`/`CommandMenu("Edit")` used to be used here
+            // instead, which doesn't replace anything — it creates a brand-new top-level menu
+            // with that title, so the menu bar showed two "File" menus and two "Edit" menus, with
+            // shortcuts like ⌘X/⌘C/⌘V/⌘A/⌘Q each bound twice (once automatically, once by the
+            // duplicate menu).
+            //
+            // `.newItem` is normally "New Window ⌘N" / "Open Recent" — replaced outright rather
+            // than added after, since this app has exactly one shared `DiskImageManager` and a
+            // second window would just show the same disk image state, not a genuinely new one.
+            CommandGroup(replacing: .newItem) {
                 Button("Open Image") {
                     manager.openImage()
                 }
@@ -40,7 +50,7 @@ struct FloppyFoxApp: App {
                 Button("Export Selected") {
                     Task { await manager.exportSelected() }
                 }
-                .disabled(manager.selectedEntry == nil)
+                .disabled(manager.selectedEntries.isEmpty)
 
                 Divider()
 
@@ -66,34 +76,45 @@ struct FloppyFoxApp: App {
                     Task { await manager.ejectImage() }
                 }
                 .disabled(!manager.isMounted && !manager.usingHFSUtils)
-
-                Divider()
-
-                Button("Quit") {
-                    NSApplication.shared.terminate(nil)
-                }
-                .keyboardShortcut("q", modifiers: [.command])
             }
+            // "Quit FloppyFox ⌘Q" is already provided automatically (CommandGroup(.appTermination),
+            // in the app menu) — the old File menu additionally defined its own "Quit" bound to
+            // the same ⌘Q, which is the same duplicate-shortcut problem as above.
 
-            CommandMenu("Edit") {
+            // Undo/Redo and Find/Spelling/Substitutions/Transformations/Speech are part of every
+            // app's default Edit menu, but nothing in this app ever registers an `UndoManager` or
+            // hosts an editable text view for them to act on — they'd just sit there permanently
+            // grayed out, so they're dropped instead of leaving dead menu items around.
+            CommandGroup(replacing: .undoRedo) {}
+            CommandGroup(replacing: .textEditing) {}
+
+            // `.pasteboard` is the standard Edit menu's Cut/Copy/Paste/Select All section.
+            CommandGroup(replacing: .pasteboard) {
                 Button("Cut") {
-                    manager.copySelected()
-                    manager.deleteSelected()
+                    manager.cutSelected()
                 }
                 .keyboardShortcut("x", modifiers: [.command])
-                .disabled(manager.selectedEntry == nil || manager.isReadOnly)
+                .disabled(manager.selectedEntries.isEmpty || manager.isReadOnly)
 
                 Button("Copy") {
                     manager.copySelected()
                 }
                 .keyboardShortcut("c", modifiers: [.command])
-                .disabled(manager.selectedEntry == nil)
+                .disabled(manager.selectedEntries.isEmpty)
 
                 Button("Paste") {
                     manager.paste()
                 }
                 .keyboardShortcut("v", modifiers: [.command])
                 .disabled((!manager.isMounted && !manager.usingHFSUtils) || manager.isReadOnly)
+
+                Divider()
+
+                Button("Select All") {
+                    manager.selectedEntries = Set(manager.entries)
+                }
+                .keyboardShortcut("a", modifiers: [.command])
+                .disabled(manager.entries.isEmpty)
             }
         }
     }
