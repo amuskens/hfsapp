@@ -2,7 +2,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
-    @StateObject private var manager = DiskImageManager()
+    @EnvironmentObject var manager: DiskImageManager
     @State private var isDropTarget = false
     @State private var isDropTargetForOpen = false
     @State private var deleteConfirmationEntry: FileEntry? = nil
@@ -120,23 +120,6 @@ struct ContentView: View {
             Toggle("Confirm detach", isOn: $manager.confirmBeforeDetach)
                 .toggleStyle(.switch)
                 .frame(width: 200)
-
-            Button("Diagnostics") {
-                // Run diagnostics on current image if loaded, otherwise let user choose
-                if let image = manager.imageURL {
-                    Task { _ = await manager.runDiagnostics(on: image) }
-                } else {
-                    let panel = NSOpenPanel()
-                    panel.allowedContentTypes = [UTType(filenameExtension: "dsk"), UTType(filenameExtension: "img")].compactMap { $0 }
-                    panel.canChooseFiles = true
-                    panel.canChooseDirectories = false
-                    panel.allowsMultipleSelection = false
-                    panel.title = "Choose image for diagnostics"
-                    if panel.runModal() == .OK, let url = panel.url {
-                        Task { _ = await manager.runDiagnostics(on: url) }
-                    }
-                }
-            }
 
             Button("Eject") {
                 Task { await manager.ejectImage() }
@@ -334,7 +317,7 @@ struct ContentView: View {
             Text("Open an HFS disk image")
                 .font(.title)
                 .bold()
-            Text(isDropTargetForOpen ? "Drop to open" : "Choose a .dsk or .img image file formatted with Apple HFS, then browse and manage its contents.")
+            Text(isDropTargetForOpen ? "Drop to open" : "Choose a .dsk, .img, or .hda image file formatted with Apple HFS, then browse and manage its contents.")
                 .multilineTextAlignment(.center)
                 .foregroundColor(.secondary)
                 .frame(maxWidth: 520)

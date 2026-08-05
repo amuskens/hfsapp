@@ -233,11 +233,14 @@ final class DiskImageManager: ObservableObject {
 
     func openImage() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [UTType(filenameExtension: "dsk"), UTType(filenameExtension: "img")].compactMap { $0 }
+        // .hda is the raw hard disk image extension BlueSCSI (and similar SCSI emulators) use;
+        // structurally it's just another raw disk image, same as .img — hdiutil/hfsutils don't
+        // care about the extension at all, so allowing it here is the only change needed.
+        panel.allowedContentTypes = [UTType(filenameExtension: "dsk"), UTType(filenameExtension: "img"), UTType(filenameExtension: "hda")].compactMap { $0 }
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.title = "Open HFS Disk Image"
-        panel.message = "Choose a .dsk or .img file formatted with the Apple HFS filesystem."
+        panel.message = "Choose a .dsk, .img, or .hda file formatted with the Apple HFS filesystem."
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
         Task { await attachImage(imageURL: url) }
