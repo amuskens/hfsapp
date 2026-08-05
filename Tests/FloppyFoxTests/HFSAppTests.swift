@@ -1,3 +1,4 @@
+#if canImport(XCTest)
 import XCTest
 @testable import FloppyFox
 
@@ -6,3 +7,6 @@ final class FloppyFoxTests: XCTestCase {
         XCTAssertTrue(true)
     }
 }
+#else
+// XCTest is unavailable in this Swift toolchain, so this test target is disabled.
+#endif
