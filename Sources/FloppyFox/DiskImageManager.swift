@@ -121,6 +121,14 @@ final class DiskImageManager: ObservableObject {
     // True while a background hdiutil/hfsutils/Finder operation is in flight, so the UI can
     // show a lightweight progress indicator instead of the whole app looking frozen.
     @Published var isBusy: Bool = false
+    // Set when the currently-open image is read-only, either because its file permissions
+    // don't allow writing or because another program (e.g. an emulator) already has it open.
+    // Write operations (add/paste/delete) check this and refuse to run.
+    @Published var isReadOnly: Bool = false
+    @Published var readOnlyReason: String?
+    // One-shot informational warning (distinct from `errorMessage`, which represents a failed
+    // action) — currently only used to tell the user an image was opened read-only and why.
+    @Published var warningMessage: String?
 
     // For hfsutils-based backend when the image cannot be mounted
     @Published var currentHFSPath: String? = ":" // ':' denotes root for hfsutils
@@ -239,8 +247,13 @@ final class DiskImageManager: ObservableObject {
         await withBusy {
             await detachImageIfMounted()
             hfsUtilsPrepared = false
+
+            let reason = await detectReadOnlyReason(for: imageURL.path)
+            self.isReadOnly = reason != nil
+            self.readOnlyReason = reason
+
             do {
-                let result = try await attachImageUsingHdiutil(imageURL)
+                let result = try await attachImageUsingHdiutil(imageURL, readOnly: self.isReadOnly)
                 guard let mountPoint = result.mountPoint else {
                     throw DiskImageError.missingMountPoint
                 }
@@ -248,7 +261,7 @@ final class DiskImageManager: ObservableObject {
                 self.mountPoint = mountPoint
                 self.mountedDevice = result.device
                 self.currentDirectory = mountPoint
-                self.statusMessage = "Mounted at \(mountPoint.path)"
+                self.statusMessage = self.isReadOnly ? "Mounted read-only at \(mountPoint.path)" : "Mounted at \(mountPoint.path)"
                 self.errorMessage = nil
                 try await loadDirectory(at: mountPoint)
             } catch {
@@ -257,6 +270,12 @@ final class DiskImageManager: ObservableObject {
                 // partition table). Fall back to the userspace hfsutils backend, which reads
                 // the raw image bytes directly and doesn't depend on kernel filesystem support.
                 await attachImageUsingHFSUtilsFallback(imageURL, hdiutilError: error)
+            }
+
+            // Only surface the warning if the image actually ended up open — a read-only file
+            // that also fails to mount at all should just show its normal attach error instead.
+            if let reason, self.imageURL != nil {
+                self.warningMessage = reason
             }
         }
     }
@@ -277,7 +296,9 @@ final class DiskImageManager: ObservableObject {
         self.currentHFSPath = ":"
         do {
             try await loadDirectory(at: URL(fileURLWithPath: "/"))
-            self.statusMessage = "Opened via hfsutils (macOS could not mount this volume directly)"
+            self.statusMessage = self.isReadOnly
+                ? "Opened read-only via hfsutils (macOS could not mount this volume directly)"
+                : "Opened via hfsutils (macOS could not mount this volume directly)"
             self.errorMessage = nil
         } catch {
             self.imageURL = nil
@@ -287,9 +308,11 @@ final class DiskImageManager: ObservableObject {
         }
     }
 
-    private func attachImageUsingHdiutil(_ imageURL: URL) async throws -> (mountPoint: URL?, device: String?) {
+    private func attachImageUsingHdiutil(_ imageURL: URL, readOnly: Bool) async throws -> (mountPoint: URL?, device: String?) {
+        let accessFlag = readOnly ? "-readonly" : "-readwrite"
+
         // First try the normal attach that auto-detects filesystem and mounts.
-        let options = ["attach", "-readwrite", "-noverify", "-nobrowse", "-noautoopen", "-plist", imageURL.path]
+        let options = ["attach", accessFlag, "-noverify", "-nobrowse", "-noautoopen", "-plist", imageURL.path]
         do {
             let res = try await runHdiutil(arguments: options)
             if res.mountPoint != nil { return res }
@@ -304,7 +327,7 @@ final class DiskImageManager: ObservableObject {
         }
 
         // Some raw disk images need the raw disk image class; try attaching that way.
-        let rawOptions = ["attach", "-readwrite", "-noverify", "-nobrowse", "-noautoopen", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path]
+        let rawOptions = ["attach", accessFlag, "-noverify", "-nobrowse", "-noautoopen", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path]
         do {
             let res = try await runHdiutil(arguments: rawOptions)
             if res.mountPoint != nil { return res }
@@ -318,7 +341,7 @@ final class DiskImageManager: ObservableObject {
         }
 
         // Try attach nomount + mount HFS partitions explicitly as a final fallback.
-        let nomountOptions = ["attach", "-nomount", "-readwrite", "-noverify", "-nobrowse", "-noautoopen", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path]
+        let nomountOptions = ["attach", "-nomount", accessFlag, "-noverify", "-nobrowse", "-noautoopen", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path]
         let nomountRes = try await runHdiutil(arguments: nomountOptions)
         if let device = nomountRes.device {
             if let mp = try await tryMountPartitions(of: device) {
@@ -617,6 +640,22 @@ final class DiskImageManager: ObservableObject {
         return false
     }
 
+    /// Checked once, up front, when opening an image — separate from (and much cheaper than)
+    /// `isFileUnlocked`'s polling loop, which exists for a different purpose (waiting out a
+    /// transient lock before falling back to a temp copy mid-session). This is a single quick
+    /// check so we can decide *before* attaching whether to open read-only and tell the user
+    /// why, rather than silently discovering it later.
+    private nonisolated func detectReadOnlyReason(for imagePath: String) async -> String? {
+        if !FileManager.default.isWritableFile(atPath: imagePath) {
+            return "This image's file permissions don't allow writing, so it was opened read-only."
+        }
+        let (out, _, code) = await runProcess("/usr/sbin/lsof", [imagePath])
+        if code == 0, !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "This image is currently open in another program (e.g. an emulator like Mini vMac), so it was opened read-only to avoid conflicting changes."
+        }
+        return nil
+    }
+
     func detachImageIfMounted() async {
         if let device = mountedDevice {
             do {
@@ -636,6 +675,8 @@ final class DiskImageManager: ObservableObject {
             entries = []
             selectedEntry = nil
             hfsUtilsPrepared = false
+            isReadOnly = false
+            readOnlyReason = nil
             statusMessage = "Image detached"
             return
         }
@@ -653,6 +694,8 @@ final class DiskImageManager: ObservableObject {
             selectedEntry = nil
             currentHFSPath = ":"
             hfsUtilsPrepared = false
+            isReadOnly = false
+            readOnlyReason = nil
         }
     }
 
@@ -670,6 +713,8 @@ final class DiskImageManager: ObservableObject {
                     entries = []
                     selectedEntry = nil
                     hfsUtilsPrepared = false
+                    isReadOnly = false
+                    readOnlyReason = nil
                     statusMessage = "Image ejected"
                     errorMessage = nil
                 } catch {
@@ -693,6 +738,8 @@ final class DiskImageManager: ObservableObject {
                 selectedEntry = nil
                 currentHFSPath = ":"
                 hfsUtilsPrepared = false
+                isReadOnly = false
+                readOnlyReason = nil
                 statusMessage = "Image ejected"
                 errorMessage = nil
             }
@@ -842,6 +889,10 @@ final class DiskImageManager: ObservableObject {
     }
 
     func deleteEntry(_ entry: FileEntry) async {
+        guard !isReadOnly else {
+            self.errorMessage = "This image is read-only, so \(entry.name) can't be deleted."
+            return
+        }
         await withBusy {
             if isMounted {
                 do {
@@ -1123,6 +1174,10 @@ final class DiskImageManager: ObservableObject {
     }
 
     func importFiles(urls: [URL], destination: URL) async {
+        guard !isReadOnly else {
+            self.errorMessage = "This image is read-only, so files can't be added to it."
+            return
+        }
         await withBusy {
             if isMounted {
                 for source in urls {
@@ -1136,6 +1191,7 @@ final class DiskImageManager: ObservableObject {
                         return
                     }
                 }
+                statusMessage = urls.count == 1 ? "Added \(urls[0].lastPathComponent)" : "Added \(urls.count) items"
                 await refresh()
                 return
             }
@@ -1169,6 +1225,7 @@ final class DiskImageManager: ObservableObject {
                     return
                 }
             }
+            statusMessage = urls.count == 1 ? "Added \(urls[0].lastPathComponent)" : "Added \(urls.count) items"
             await refresh()
         }
     }
@@ -1294,12 +1351,24 @@ final class DiskImageManager: ObservableObject {
             if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
                 group.enter()
                 provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    // Extract the URL (a Sendable value) here, outside the Task, since `item`
+                    // itself (`Any?`) isn't Sendable and can't be captured into one directly.
+                    var droppedURL: URL?
                     if let url = item as? URL {
-                        Task { await collector.append(url) }
+                        droppedURL = url
                     } else if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
-                        Task { await collector.append(url) }
+                        droppedURL = url
                     }
-                    group.leave()
+                    // `group.leave()` must happen *after* the append actually completes, not
+                    // right after merely starting it — otherwise `group.notify` below can (and
+                    // reliably does under real drag timing) fire before any URL has actually
+                    // landed in the collector, silently running the import with an empty list.
+                    Task {
+                        if let droppedURL {
+                            await collector.append(droppedURL)
+                        }
+                        group.leave()
+                    }
                 }
             } else {
                 group.leave()

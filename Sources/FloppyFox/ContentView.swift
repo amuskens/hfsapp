@@ -45,6 +45,13 @@ struct ContentView: View {
         } message: { message in
             Text(message)
         }
+        .alert("Opened Read-Only", isPresented: .constant(manager.warningMessage != nil), presenting: manager.warningMessage) { message in
+            Button("OK", role: .cancel) {
+                manager.warningMessage = nil
+            }
+        } message: { message in
+            Text(message)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .didCreateDiagnosticsFile)) { note in
             if let url = note.object as? URL {
                 NSWorkspace.shared.open(url)
@@ -62,7 +69,7 @@ struct ContentView: View {
             Button("Add Files") {
                 manager.addFiles()
             }
-            .disabled(!manager.isMounted && !manager.usingHFSUtils)
+            .disabled((!manager.isMounted && !manager.usingHFSUtils) || manager.isReadOnly)
 
             Button("Copy") {
                 manager.copySelected()
@@ -72,7 +79,7 @@ struct ContentView: View {
             Button("Paste") {
                 manager.paste()
             }
-            .disabled(!manager.isMounted && !manager.usingHFSUtils)
+            .disabled((!manager.isMounted && !manager.usingHFSUtils) || manager.isReadOnly)
 
             Button("Export") {
                 Task { await manager.exportSelected() }
@@ -130,7 +137,8 @@ struct ContentView: View {
                 )
                 .padding(12)
                 .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTarget) { providers in
-                    manager.handleDroppedFiles(providers: providers)
+                    guard !manager.isReadOnly else { return false }
+                    return manager.handleDroppedFiles(providers: providers)
                 }
 
             Divider()
@@ -149,8 +157,18 @@ struct ContentView: View {
     private var fileBrowser: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 6) {
-                Text(manager.mountPoint?.lastPathComponent ?? manager.imageURL?.lastPathComponent ?? "Mounted Volume")
-                    .font(.title2.bold())
+                HStack(spacing: 8) {
+                    Text(manager.mountPoint?.lastPathComponent ?? manager.imageURL?.lastPathComponent ?? "Mounted Volume")
+                        .font(.title2.bold())
+                    if manager.isReadOnly {
+                        Text("Read-Only")
+                            .font(.caption.bold())
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Capsule().fill(Color.orange.opacity(0.2)))
+                            .foregroundColor(.orange)
+                    }
+                }
                 Text(manager.statusMessage)
                     .font(.footnote)
                     .foregroundColor(.secondary)
@@ -176,7 +194,7 @@ struct ContentView: View {
 
                 Spacer()
 
-                Text(isDropTarget ? "Drop files here to add them to the volume" : "Drag files here from Finder to copy floppy treasures into the mounted volume")
+                Text(manager.isReadOnly ? "This image is read-only" : (isDropTarget ? "Drop files here to add them to the volume" : "Drag files here from Finder to copy floppy treasures into the mounted volume"))
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -200,7 +218,7 @@ struct ContentView: View {
                             Button("Delete", role: .destructive) {
                                 Task { await manager.deleteEntry(entry) }
                             }
-                            .disabled(entry.url == manager.currentDirectory)
+                            .disabled(entry.url == manager.currentDirectory || manager.isReadOnly)
                         }
                 }
             }
@@ -273,6 +291,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .foregroundColor(.red)
+                .disabled(manager.isReadOnly)
             } else {
                 Text("Select a file or folder to see details.")
                     .foregroundColor(.secondary)
