@@ -1155,11 +1155,8 @@ final class DiskImageManager: ObservableObject {
         if isMounted {
             return entry.url
         }
-        guard usingHFSUtils, !entry.isDirectory, let image = imageURL, let hcopy = hcopyPath, let hmount = hmountPath else { return nil }
-
-        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hfsapp-drag-\(UUID().uuidString)", isDirectory: true)
-        guard (try? fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)) != nil else { return nil }
-        let destination = tempDir.appendingPathComponent(entry.name)
+        guard usingHFSUtils, !entry.isDirectory, let image = imageURL, let hcopy = hcopyPath, let hmount = hmountPath,
+              let destination = makeTempExtractionDestination(for: entry, prefix: "hfsapp-drag") else { return nil }
 
         let hfsPath = pathForEntry(entry)
         let humount = humountPath ?? hmount
@@ -1171,6 +1168,52 @@ final class DiskImageManager: ObservableObject {
         _ = Self.runCommandSync([humount])
         guard code == 0, fileManager.fileExists(atPath: destination.path) else { return nil }
         return destination
+    }
+
+    private func makeTempExtractionDestination(for entry: FileEntry, prefix: String) -> URL? {
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
+        guard (try? fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)) != nil else { return nil }
+        return tempDir.appendingPathComponent(entry.name)
+    }
+
+    /// Materializes a file for previewing or opening in its default application (double-click /
+    /// "Open" / Quick Look), unlike `materializedURLForDrag` this can genuinely `await`, since
+    /// it isn't constrained by a synchronous SwiftUI callback — so it reuses `exportHFSEntry`
+    /// (which always runs humount even on failure) instead of duplicating that logic
+    /// synchronously. Shared by `openEntry` and `QuickLookController`.
+    func materializeForPreview(_ entry: FileEntry) async -> URL? {
+        if isMounted {
+            return entry.url
+        }
+        guard usingHFSUtils, !entry.isDirectory,
+              let destination = makeTempExtractionDestination(for: entry, prefix: "hfsapp-preview") else { return nil }
+        do {
+            try await exportHFSEntry(entry, to: destination)
+            return destination
+        } catch {
+            return nil
+        }
+    }
+
+    /// Double-click / "Open" on a row: descends into folders as before, and for files, opens
+    /// them in their default application the way Finder would. hfsutils-backed files aren't
+    /// real files on disk, so they're first materialized to a temp location — as with drag and
+    /// Quick Look, edits made in the external app won't propagate back into the disk image;
+    /// use Export for that.
+    func openEntry(_ entry: FileEntry) async {
+        if entry.isDirectory {
+            await navigate(into: entry)
+            return
+        }
+        await withBusy {
+            guard let url = await materializeForPreview(entry) else {
+                self.errorMessage = "Could not open \(entry.name)."
+                return
+            }
+            if !NSWorkspace.shared.open(url) {
+                self.errorMessage = "No application could open \(entry.name)."
+            }
+        }
     }
 
     func importFiles(urls: [URL], destination: URL) async {

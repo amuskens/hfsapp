@@ -5,6 +5,8 @@ struct ContentView: View {
     @StateObject private var manager = DiskImageManager()
     @State private var isDropTarget = false
     @State private var isDropTargetForOpen = false
+    @State private var deleteConfirmationEntry: FileEntry? = nil
+    @State private var quickLook = QuickLookController()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -52,10 +54,30 @@ struct ContentView: View {
         } message: { message in
             Text(message)
         }
+        .alert(item: $deleteConfirmationEntry) { entry in
+            Alert(
+                title: Text("Delete item?"),
+                message: Text("Are you sure you want to delete \"") + Text(entry.name).bold() + Text("\"? This action cannot be undone."),
+                primaryButton: .destructive(Text("Delete")) {
+                    deleteConfirmationEntry = nil
+                    Task { await manager.deleteEntry(entry) }
+                },
+                secondaryButton: .cancel()
+            )
+        }
         .onReceive(NotificationCenter.default.publisher(for: .didCreateDiagnosticsFile)) { note in
             if let url = note.object as? URL {
                 NSWorkspace.shared.open(url)
             }
+        }
+        .onAppear {
+            quickLook.attach(to: manager)
+        }
+        .onDisappear {
+            quickLook.detach()
+        }
+        .onChange(of: manager.selectedEntry) { newValue in
+            quickLook.selectionChanged(to: newValue)
         }
     }
 
@@ -71,20 +93,17 @@ struct ContentView: View {
             }
             .disabled((!manager.isMounted && !manager.usingHFSUtils) || manager.isReadOnly)
 
-            Button("Copy") {
-                manager.copySelected()
-            }
-            .disabled(manager.selectedEntry == nil)
-
-            Button("Paste") {
-                manager.paste()
-            }
-            .disabled((!manager.isMounted && !manager.usingHFSUtils) || manager.isReadOnly)
+            // Copy/Paste buttons hidden per user preference
 
             Button("Export") {
                 Task { await manager.exportSelected() }
             }
             .disabled(manager.selectedEntry == nil)
+
+            Button("Quick Look") {
+                quickLook.toggle(for: manager.selectedEntry)
+            }
+            .disabled(manager.selectedEntry == nil || manager.selectedEntry?.isDirectory == true)
 
             Spacer()
 
@@ -207,16 +226,15 @@ struct ContentView: View {
                         .tag(entry)
                         .contextMenu {
                             Button("Open") {
-                                Task { await manager.navigate(into: entry) }
+                                Task { await manager.openEntry(entry) }
                             }
-                            .disabled(!entry.isDirectory)
 
                             Button("Copy") {
                                 manager.copyEntry(entry)
                             }
 
                             Button("Delete", role: .destructive) {
-                                Task { await manager.deleteEntry(entry) }
+                                deleteConfirmationEntry = entry
                             }
                             .disabled(entry.url == manager.currentDirectory || manager.isReadOnly)
                         }
@@ -255,7 +273,7 @@ struct ContentView: View {
             manager.selectedEntry = entry
         })
         .simultaneousGesture(TapGesture(count: 2).onEnded {
-            Task { await manager.navigate(into: entry) }
+            Task { await manager.openEntry(entry) }
         })
         .onDrag {
             guard let url = manager.materializedURLForDrag(entry) else {
@@ -287,11 +305,13 @@ struct ContentView: View {
                 }
                 Spacer()
                 Button("Delete This Item") {
-                    manager.deleteSelected()
+                    if let selectedEntry = manager.selectedEntry {
+                        deleteConfirmationEntry = selectedEntry
+                    }
                 }
                 .buttonStyle(.borderedProminent)
                 .foregroundColor(.red)
-                .disabled(manager.isReadOnly)
+                .disabled(manager.selectedEntry == nil || manager.isReadOnly)
             } else {
                 Text("Select a file or folder to see details.")
                     .foregroundColor(.secondary)
