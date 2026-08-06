@@ -32,17 +32,7 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 820, minHeight: 520)
-        .background(
-            LinearGradient(
-                colors: [
-                    Color(red: 0.96, green: 0.94, blue: 1.0),
-                    Color(red: 0.98, green: 1.0, blue: 0.97)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
-        )
+        .background(appBackground)
         .alert("Error", isPresented: .constant(manager.errorMessage != nil), presenting: manager.errorMessage) { message in
             Button("OK", role: .cancel) {
                 manager.errorMessage = nil
@@ -93,6 +83,24 @@ struct ContentView: View {
         .onChange(of: manager.selectedEntry) { newValue in
             quickLook.selectionChanged(to: newValue)
         }
+    }
+
+    /// Uses AppKit's semantic window color as the base so the whole window follows the
+    /// macOS appearance. The translucent tint keeps the visual warmth of the original
+    /// design without turning into a bright rectangle in Dark Mode.
+    private var appBackground: some View {
+        Color(nsColor: .windowBackgroundColor)
+            .overlay {
+                LinearGradient(
+                    colors: [
+                        Color.accentColor.opacity(0.08),
+                        Color.green.opacity(0.035)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            }
+            .ignoresSafeArea()
     }
 
     private var header: some View {
@@ -364,14 +372,7 @@ struct ContentView: View {
 
     private var placeholderView: some View {
         VStack(spacing: 16) {
-            ZStack {
-                Circle()
-                    .fill(Color(red: 0.95, green: 0.88, blue: 1.0))
-                    .frame(width: 130, height: 130)
-                Image(systemName: "externaldrive.connected.to.line.below")
-                    .font(.system(size: 52))
-                    .foregroundColor(.accentColor)
-            }
+            classicMacGraphic
             Text("Open an HFS disk image")
                 .font(.title)
                 .bold()
@@ -394,6 +395,34 @@ struct ContentView: View {
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTargetForOpen) { providers in
             manager.handleDroppedImageToOpen(providers: providers)
         }
+    }
+
+    private var classicMacGraphic: some View {
+        HStack(alignment: .bottom, spacing: -12) {
+            classicMacIcon(named: "Floppy", size: 76, rotation: -8)
+                .offset(y: 8)
+            classicMacIcon(named: "ClassicMac", size: 128)
+                .zIndex(1)
+            classicMacIcon(named: "HappyMac", size: 76, rotation: 8)
+                .offset(y: 8)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 12)
+        .background {
+            Capsule(style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.72))
+                .shadow(color: .black.opacity(0.12), radius: 12, y: 5)
+        }
+        .accessibilityHidden(true)
+    }
+
+    private func classicMacIcon(named name: String, size: CGFloat, rotation: Double = 0) -> some View {
+        Image(name, bundle: .module)
+            .interpolation(.high)
+            .resizable()
+            .scaledToFit()
+            .frame(width: size, height: size)
+            .rotationEffect(.degrees(rotation))
     }
 }
 

@@ -17,7 +17,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "FloppyFox",
-            path: "Sources/FloppyFox"
+            path: "Sources/FloppyFox",
+            resources: [
+                .process("Resources")
+            ]
         ),
         .testTarget(
             name: "FloppyFoxTests",
