@@ -81,6 +81,37 @@ final class FloppyFoxTests: XCTestCase {
         XCTAssertEqual(DiskImageManager.decodeProcessOutput(output), "After Dark®")
     }
 
+    func testMakesImportedNamesSafeForClassicHFS() {
+        XCTAssertEqual(DiskImageManager.classicHFSName(from: "After Dark®"), "After Dark®")
+        XCTAssertEqual(DiskImageManager.classicHFSName(from: "Résumé: ２０２６"), "Résumé- 2026")
+        XCTAssertEqual(DiskImageManager.classicHFSName(from: "Notes😀.txt"), "Notes~1F600.txt")
+
+        let shortened = DiskImageManager.classicHFSName(from: String(repeating: "é", count: 40))
+        XCTAssertEqual(shortened.data(using: .macOSRoman)?.count, 31)
+    }
+
+    func testMapsClassicSlashToSafeHostFilename() {
+        XCTAssertEqual(
+            DiskImageManager.hostName(fromClassicHFSName: "MacDRUMS Instruments/Tracks"),
+            "MacDRUMS Instruments:Tracks"
+        )
+    }
+
+    func testEscapesHFSGlobCharactersInLiteralPaths() {
+        XCTAssertEqual(
+            DiskImageManager.escapedHFSGlobPath(":Other Plug-ins:*Stars*?[Draft]\\File"),
+            #":Other Plug-ins:\*Stars\*\?\[Draft]\\File"#
+        )
+    }
+
+    func testDecodesEscapedHFSListingNames() {
+        XCTAssertEqual(DiskImageManager.decodeHLSQuotedName(#""After\ Dark®""#), "After Dark®")
+        XCTAssertEqual(DiskImageManager.decodeHLSQuotedName(#""Icon\r""#), "Icon\r")
+        XCTAssertEqual(DiskImageManager.decodeHLSQuotedName(#""A\\B\"C""#), #"A\B"C"#)
+        XCTAssertEqual(DiskImageManager.decodeHLSQuotedName(#""Caf\216""#), "Café")
+        XCTAssertNil(DiskImageManager.decodeHLSQuotedName("not quoted"))
+    }
+
     func testOpensOptionalVHDIntegrationFixture() async throws {
         guard let path = ProcessInfo.processInfo.environment["FLOPPYFOX_VHD_FIXTURE"] else {
             throw XCTSkip("Set FLOPPYFOX_VHD_FIXTURE to run the VHD integration test")
@@ -93,6 +124,33 @@ final class FloppyFoxTests: XCTestCase {
 
         XCTAssertNil(error)
         XCTAssertGreaterThan(entryCount, 0)
+    }
+
+    func testCopiesOptionalHFSFolderToMacOSPasteboard() async throws {
+        guard let path = ProcessInfo.processInfo.environment["FLOPPYFOX_VHD_FIXTURE"] else {
+            throw XCTSkip("Set FLOPPYFOX_VHD_FIXTURE to run the VHD clipboard integration test")
+        }
+        let manager = DiskImageManager()
+        await manager.attachImage(imageURL: URL(fileURLWithPath: path))
+        defer { Task { await manager.ejectImage() } }
+
+        let folder = try XCTUnwrap(manager.entries.first(where: { $0.isDirectory && $0.name == "System Picker" }))
+        manager.copyEntry(folder)
+
+        let deadline = Date().addingTimeInterval(15)
+        var copiedURL: URL?
+        repeat {
+            copiedURL = (NSPasteboard.general.readObjects(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]
+            ) as? [URL])?.first
+            if copiedURL != nil { break }
+            try await Task.sleep(for: .milliseconds(100))
+        } while Date() < deadline
+
+        let url = try XCTUnwrap(copiedURL)
+        XCTAssertTrue((try url.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true)
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: url.path).isEmpty)
     }
 
     func testOpenRealMultiPartitionHDAImage() async throws {

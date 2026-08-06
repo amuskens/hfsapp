@@ -36,6 +36,8 @@ struct ContentView: View {
     @State private var selectionAnchor: FileEntry?
     @State private var browserViewStyle: BrowserViewStyle = .list
     @State private var inspectorAttributesExpanded = true
+    @State private var isNewFolderPromptPresented = false
+    @State private var newFolderName = "untitled folder"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -59,6 +61,36 @@ struct ContentView: View {
         }
         .frame(minWidth: 820, minHeight: 520)
         .background(appBackground)
+        .overlay {
+            if let title = manager.transferTitle, let message = manager.transferMessage {
+                VStack(spacing: 12) {
+                    Text(title)
+                        .font(.headline)
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                        .frame(width: 280)
+                    Text(message)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .frame(maxWidth: 300)
+                    Button("Cancel", role: .cancel) {
+                        manager.cancelActiveTransfer()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 18)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(Color.primary.opacity(0.12))
+                }
+                .shadow(color: .black.opacity(0.2), radius: 18, y: 8)
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+            }
+        }
+        .animation(.easeInOut(duration: 0.16), value: manager.transferMessage != nil)
         .alert("Error", isPresented: .constant(manager.errorMessage != nil), presenting: manager.errorMessage) { message in
             Button("OK", role: .cancel) {
                 manager.errorMessage = nil
@@ -72,6 +104,17 @@ struct ContentView: View {
             }
         } message: { message in
             Text(message)
+        }
+        .alert("New Folder", isPresented: $isNewFolderPromptPresented) {
+            TextField("Folder name", text: $newFolderName)
+            Button("Create") {
+                let name = newFolderName
+                Task { await manager.createFolder(named: name) }
+            }
+            .disabled(newFolderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Enter a name for the new folder.")
         }
         .alert(
             "Delete \(deleteConfirmationEntries.count == 1 ? "item" : "items")?",
@@ -136,17 +179,7 @@ struct ContentView: View {
             }
             .keyboardShortcut("o", modifiers: [.command])
 
-            Button("Add Files") {
-                manager.addFiles()
-            }
-            .disabled((!manager.isMounted && !manager.usingHFSUtils) || manager.isReadOnly)
-
             // Copy/Paste buttons hidden per user preference
-
-            Button("Export") {
-                Task { await manager.exportSelected() }
-            }
-            .disabled(manager.selectedEntries.isEmpty)
 
             Spacer()
 
@@ -185,7 +218,10 @@ struct ContentView: View {
             Divider()
 
             detailPane
-                .frame(minWidth: 280)
+                // Keep the inspector footprint stable as names, paths, and available
+                // attributes change with the selection. The browser takes all remaining room.
+                .frame(width: 300)
+                .frame(maxHeight: .infinity, alignment: .topLeading)
                 .background(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(Color(nsColor: .windowBackgroundColor).opacity(0.94))
@@ -197,10 +233,10 @@ struct ContentView: View {
 
     private var fileBrowser: some View {
         VStack(spacing: 0) {
-            VStack(spacing: 6) {
+            VStack(spacing: 10) {
                 ZStack {
                     Text(manager.imageURL?.lastPathComponent ?? manager.mountPoint?.lastPathComponent ?? "Mounted Volume")
-                        .font(.title2.bold())
+                        .font(.title.bold())
                         .frame(maxWidth: .infinity)
                         .multilineTextAlignment(.center)
                     HStack {
@@ -217,21 +253,35 @@ struct ContentView: View {
                 }
                 if let directory = manager.currentDirectory {
                     Text(directory.path)
-                        .font(.caption)
+                        .font(.system(.caption, design: .monospaced))
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
                         .lineLimit(1)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(Color(nsColor: .controlBackgroundColor)))
                 } else if manager.usingHFSUtils, let hfsPath = manager.currentHFSPath {
                     Text(hfsPath)
-                        .font(.caption)
+                        .font(.system(.caption, design: .monospaced))
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
                         .lineLimit(1)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(Color(nsColor: .controlBackgroundColor)))
                 }
             }
-            .padding([.horizontal, .top])
+            .padding(.horizontal, 20)
+            .padding(.vertical, 18)
 
             HStack {
+                Button {
+                    presentNewFolderPrompt()
+                } label: {
+                    Label("New Folder", systemImage: "folder.badge.plus")
+                }
+                .disabled(manager.isReadOnly)
+
                 Button("Up") {
                     Task { await manager.goUp() }
                 }
@@ -286,6 +336,7 @@ struct ContentView: View {
             }
         }
         .listStyle(.inset)
+        .contextMenu { browserContextMenu }
     }
 
     private var iconView: some View {
@@ -329,6 +380,28 @@ struct ContentView: View {
             }
             .padding(16)
         }
+        .contextMenu { browserContextMenu }
+    }
+
+    @ViewBuilder
+    private var browserContextMenu: some View {
+        Button("New Folder") {
+            presentNewFolderPrompt()
+        }
+        .disabled(manager.isReadOnly)
+        Divider()
+        Button("Cut") {
+            manager.cutSelected()
+        }
+        .disabled(manager.selectedEntries.isEmpty || manager.isReadOnly)
+        Button("Copy") {
+            manager.copySelected()
+        }
+        .disabled(manager.selectedEntries.isEmpty)
+        Button("Paste") {
+            manager.paste()
+        }
+        .disabled(manager.isReadOnly)
     }
 
     @ViewBuilder
@@ -337,6 +410,15 @@ struct ContentView: View {
         Button("Open") {
             Task { await manager.openEntry(entry) }
         }
+        Divider()
+        Button(isPartOfSelection ? "Cut \(manager.selectedEntries.count) Items" : "Cut") {
+            if isPartOfSelection {
+                manager.cutSelected()
+            } else {
+                manager.cutEntry(entry)
+            }
+        }
+        .disabled(manager.isReadOnly)
         Button(isPartOfSelection ? "Copy \(manager.selectedEntries.count) Items" : "Copy") {
             if isPartOfSelection {
                 manager.copySelected()
@@ -344,6 +426,15 @@ struct ContentView: View {
                 manager.copyEntry(entry)
             }
         }
+        Button("Paste") {
+            manager.paste()
+        }
+        .disabled(manager.isReadOnly)
+        Divider()
+        Button("New Folder") {
+            presentNewFolderPrompt()
+        }
+        .disabled(manager.isReadOnly)
         Button(isPartOfSelection ? "Delete \(manager.selectedEntries.count) Items" : "Delete", role: .destructive) {
             deleteConfirmationEntries = isPartOfSelection ? manager.selectedEntries : [entry]
         }
@@ -479,6 +570,7 @@ struct ContentView: View {
             }
         }
         .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private func inspectorRow(_ label: String, value: String) -> some View {
@@ -489,6 +581,9 @@ struct ContentView: View {
             Text(value)
                 .multilineTextAlignment(.trailing)
                 .textSelection(.enabled)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .frame(maxWidth: 150, alignment: .trailing)
         }
         .font(.subheadline)
     }
@@ -537,6 +632,11 @@ struct ContentView: View {
         case .hfs(let path):
             Task { await manager.navigate(toHFSDirectory: path) }
         }
+    }
+
+    private func presentNewFolderPrompt() {
+        newFolderName = "untitled folder"
+        isNewFolderPromptPresented = true
     }
 
     private var placeholderView: some View {
