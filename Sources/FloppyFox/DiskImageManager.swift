@@ -111,12 +111,14 @@ struct FileEntry: Identifiable, Hashable {
                let image = NSImage(named: "Floppy") ?? Bundle.module.image(forResource: "Floppy") {
                 return image
             }
-            let fallbackName = isDirectory ? "ClassicFolder" : "ClassicDocument"
-            if let image = NSImage(named: fallbackName) ?? Bundle.module.image(forResource: fallbackName) {
+            if isDirectory {
+                return workspace.icon(for: .folder)
+            }
+            if let image = NSImage(named: "ClassicDocument") ?? Bundle.module.image(forResource: "ClassicDocument") {
                 image.isTemplate = false
                 return image
             }
-            return workspace.icon(for: isDirectory ? .folder : .data)
+            return workspace.icon(for: .data)
         }
         return workspace.icon(forFile: url.path)
     }
@@ -176,7 +178,11 @@ final class DiskImageManager: ObservableObject {
     private let fileManager = FileManager.default
     private var internalClipboardURLs: [URL] = []
     private var internalClipboardOperation: ClipboardOperation = .copy
+    private var internalClipboardToken: String?
+    private var clipboardExportTask: Task<Void, Never>?
     private var busyDepth = 0
+
+    private static let internalClipboardType = NSPasteboard.PasteboardType("com.floppyfox.hfs-clipboard")
 
     var isMounted: Bool {
         mountPoint != nil
@@ -644,64 +650,38 @@ final class DiskImageManager: ObservableObject {
     }
 
     private var tempImageCopyURL: URL? = nil
-    @Published var confirmBeforeDetach: Bool = false {
-        didSet {
-            UserDefaults.standard.set(confirmBeforeDetach, forKey: "confirmBeforeDetach")
-        }
-    }
-
-    init() {
-        // Load persisted preference
-        self.confirmBeforeDetach = UserDefaults.standard.bool(forKey: "confirmBeforeDetach")
-    }
 
     private func prepareForHFSUtils(imagePath: String) async throws {
         if hfsUtilsPrepared { return }
 
         let attached = await findAttachedDevices(for: imagePath)
         if !attached.isEmpty {
-            if confirmBeforeDetach {
-                // Ask user for confirmation before detaching
-                let alert = NSAlert()
-                alert.messageText = "Detach device(s) for image?"
-                alert.informativeText = "The image appears to be attached as raw device(s): \(attached.joined(separator: ", ")).\nDetaching them is required to allow exclusive access for HFS operations. Detaching is safe but will unmount the raw device. Proceed?"
-                alert.alertStyle = .warning
-                alert.addButton(withTitle: "Detach")
-                alert.addButton(withTitle: "Use Temporary Copy")
-                alert.addButton(withTitle: "Cancel")
+            // Confirmation is intentionally always enabled: encountering an attached raw
+            // device is uncommon, and detaching it is significant enough to keep explicit.
+            let alert = NSAlert()
+            alert.messageText = "Detach device(s) for image?"
+            alert.informativeText = "The image appears to be attached as raw device(s): \(attached.joined(separator: ", ")).\nDetaching them is required to allow exclusive access for HFS operations. Detaching is safe but will unmount the raw device. Proceed?"
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Detach")
+            alert.addButton(withTitle: "Use Temporary Copy")
+            alert.addButton(withTitle: "Cancel")
 
-                let resp = alert.runModal()
-                if resp == .alertFirstButtonReturn {
-                    // user chose Detach: proceed
-                    for dev in attached {
-                        do {
-                            try await runHdiutilDetach(device: dev)
-                            print("Detached \(dev) for image \(imagePath)")
-                        } catch {
-                            print("Failed to detach \(dev): \(error)")
-                            // continue trying others
-                        }
-                    }
-                } else if resp == .alertSecondButtonReturn {
-                    // Use temporary copy instead of detaching
-                    try await createTempCopyAndUse(imagePath: imagePath)
-                    hfsUtilsPrepared = true
-                    return
-                } else {
-                    // Cancel: throw to abort the hfsutils operation
-                    throw NSError(domain: "HFSApp", code: 1, userInfo: [NSLocalizedDescriptionKey: "User cancelled detaching devices"]) as Error
-                }
-            } else {
-                // Auto-detach behavior (existing behavior)
+            let resp = alert.runModal()
+            if resp == .alertFirstButtonReturn {
                 for dev in attached {
                     do {
                         try await runHdiutilDetach(device: dev)
                         print("Detached \(dev) for image \(imagePath)")
                     } catch {
                         print("Failed to detach \(dev): \(error)")
-                        // continue trying others
                     }
                 }
+            } else if resp == .alertSecondButtonReturn {
+                try await createTempCopyAndUse(imagePath: imagePath)
+                hfsUtilsPrepared = true
+                return
+            } else {
+                throw NSError(domain: "HFSApp", code: 1, userInfo: [NSLocalizedDescriptionKey: "User cancelled detaching devices"]) as Error
             }
         }
 
@@ -1023,6 +1003,35 @@ final class DiskImageManager: ObservableObject {
         }
     }
 
+    func navigate(toMountedDirectory directory: URL) async {
+        guard isMounted else { return }
+        await withBusy {
+            do {
+                try await loadDirectory(at: directory)
+                selectedEntry = nil
+            } catch {
+                self.errorMessage = DiskImageError.loadDirectoryFailed(directory, error).localizedDescription
+            }
+        }
+    }
+
+    func navigate(toHFSDirectory path: String) async {
+        guard usingHFSUtils else { return }
+        await withBusy {
+            let previousPath = currentHFSPath
+            currentHFSPath = path
+            do {
+                try await loadDirectory(at: URL(fileURLWithPath: "/"))
+                selectedEntry = nil
+            } catch {
+                if currentHFSPath == path {
+                    currentHFSPath = previousPath
+                }
+                self.errorMessage = DiskImageError.loadDirectoryFailed(URL(fileURLWithPath: "/"), error).localizedDescription
+            }
+        }
+    }
+
     func deleteSelected() {
         guard !selectedEntries.isEmpty else { return }
         Task { await deleteEntries(selectedEntries) }
@@ -1087,23 +1096,23 @@ final class DiskImageManager: ObservableObject {
 
     func copySelected() {
         guard !selectedEntries.isEmpty else { return }
+        let selected = Array(selectedEntries)
         if isMounted {
-            let urls = selectedEntries.map { $0.url }
+            let urls = selected.map { $0.url }
             internalClipboardURLs = urls
             internalClipboardOperation = .copy
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.writeObjects(urls.map { $0 as NSURL })
-            statusMessage = urls.count == 1 ? "Copied \(selectedEntries.first!.name)" : "Copied \(urls.count) items"
+            publishClipboard(urls: urls)
+            statusMessage = urls.count == 1 ? "Copied \(selected[0].name)" : "Copied \(urls.count) items"
             return
         }
         // For hfsutils backend, store HFS paths as pseudo-URLs using scheme hfs://
         guard usingHFSUtils, let image = imageURL else { return }
-        internalClipboardURLs = selectedEntries.compactMap { entry in
+        internalClipboardURLs = selected.compactMap { entry in
             let hfsPath = pathForEntry(entry)
             return URL(string: "hfs://localhost\(image.path)?path=\(hfsPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? hfsPath)")
         }
         internalClipboardOperation = .copy
-        statusMessage = selectedEntries.count == 1 ? "Copied \(selectedEntries.first!.name)" : "Copied \(selectedEntries.count) items"
+        prepareHFSClipboard(entries: selected)
     }
 
     /// Marks the current selection to be moved on the next Paste, rather than deleting the
@@ -1117,30 +1126,29 @@ final class DiskImageManager: ObservableObject {
     /// to the new location has actually succeeded — removes the race entirely.
     func cutSelected() {
         guard !selectedEntries.isEmpty else { return }
+        let selected = Array(selectedEntries)
         if isMounted {
-            let urls = selectedEntries.map { $0.url }
+            let urls = selected.map { $0.url }
             internalClipboardURLs = urls
             internalClipboardOperation = .cut
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.writeObjects(urls.map { $0 as NSURL })
-            statusMessage = urls.count == 1 ? "Cut \(selectedEntries.first!.name)" : "Cut \(urls.count) items"
+            publishClipboard(urls: urls)
+            statusMessage = urls.count == 1 ? "Cut \(selected[0].name)" : "Cut \(urls.count) items"
             return
         }
         guard usingHFSUtils, let image = imageURL else { return }
-        internalClipboardURLs = selectedEntries.compactMap { entry in
+        internalClipboardURLs = selected.compactMap { entry in
             let hfsPath = pathForEntry(entry)
             return URL(string: "hfs://localhost\(image.path)?path=\(hfsPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? hfsPath)")
         }
         internalClipboardOperation = .cut
-        statusMessage = selectedEntries.count == 1 ? "Cut \(selectedEntries.first!.name)" : "Cut \(selectedEntries.count) items"
+        prepareHFSClipboard(entries: selected)
     }
 
     func copyEntry(_ entry: FileEntry) {
         if isMounted {
             internalClipboardURLs = [entry.url]
             internalClipboardOperation = .copy
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.writeObjects([entry.url as NSURL])
+            publishClipboard(urls: [entry.url])
             statusMessage = "Copied \(entry.name)"
             return
         }
@@ -1151,31 +1159,84 @@ final class DiskImageManager: ObservableObject {
             let pseudo = URL(string: "hfs://localhost\(image.path)?path=\(hfsPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? hfsPath)")
             internalClipboardURLs = pseudo.map { [$0] } ?? []
             internalClipboardOperation = .copy
-            statusMessage = "Copied \(entry.name)"
+            prepareHFSClipboard(entries: [entry])
+        }
+    }
+
+    /// Publishes both a private ownership marker (for lossless in-app copy/move) and ordinary
+    /// file URLs (for Finder and other macOS apps). If another app copies something later, the
+    /// marker disappears and Paste correctly consumes that app's clipboard instead of stale
+    /// internal state.
+    private func publishClipboard(urls: [URL], token: String = UUID().uuidString) {
+        clipboardExportTask?.cancel()
+        internalClipboardToken = token
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        let marker = NSPasteboardItem()
+        marker.setString(token, forType: Self.internalClipboardType)
+        pasteboard.writeObjects([marker])
+        pasteboard.writeObjects(urls.map { $0 as NSURL })
+    }
+
+    private func prepareHFSClipboard(entries: [FileEntry]) {
+        clipboardExportTask?.cancel()
+        let token = UUID().uuidString
+        internalClipboardToken = token
+
+        // Claim the pasteboard immediately, so an in-app Paste made while extraction is still
+        // running uses the internal HFS paths rather than whatever Finder previously copied.
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        let marker = NSPasteboardItem()
+        marker.setString(token, forType: Self.internalClipboardType)
+        pasteboard.writeObjects([marker])
+        statusMessage = entries.count == 1 ? "Preparing \(entries[0].name) for copying…" : "Preparing \(entries.count) items for copying…"
+
+        clipboardExportTask = Task { [weak self] in
+            guard let self else { return }
+            var urls: [URL] = []
+            for entry in entries {
+                guard !Task.isCancelled else { return }
+                guard let url = await self.materializeForPreview(entry) else {
+                    self.errorMessage = "Could not copy \(entry.name) to the macOS clipboard."
+                    return
+                }
+                urls.append(url)
+            }
+            guard !Task.isCancelled,
+                  self.internalClipboardToken == token,
+                  NSPasteboard.general.string(forType: Self.internalClipboardType) == token else { return }
+            // Keep the same token while replacing the marker-only clipboard with real file
+            // URLs Finder can paste. The temporary files remain alive for the app session.
+            self.clipboardExportTask = nil
+            self.publishClipboard(urls: urls, token: token)
+            self.statusMessage = entries.count == 1 ? "Copied \(entries[0].name)" : "Copied \(entries.count) items"
         }
     }
 
     func paste() {
         guard let target = currentDirectory ?? mountPoint ?? (usingHFSUtils ? URL(fileURLWithPath: "/") : nil) else { return }
-        // A pending Cut takes priority over the system pasteboard — it can only have come from
-        // our own `cutSelected()`, and consuming it here (clearing it right away, before the
-        // move even starts) matches Finder's one-shot cut/paste behavior: pasting again without
-        // cutting something new just falls through to a regular copy/no-op instead of trying to
-        // move already-moved files a second time.
-        if internalClipboardOperation == .cut, !internalClipboardURLs.isEmpty {
+        let pasteboard = NSPasteboard.general
+        let ownsPasteboard = internalClipboardToken != nil
+            && pasteboard.string(forType: Self.internalClipboardType) == internalClipboardToken
+
+        if ownsPasteboard, internalClipboardOperation == .cut, !internalClipboardURLs.isEmpty {
             let sources = internalClipboardURLs
             internalClipboardURLs = []
             internalClipboardOperation = .copy
+            internalClipboardToken = nil
             Task { await moveFiles(urls: sources, destination: target) }
             return
         }
-        let pasteboard = NSPasteboard.general
-        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
-            Task { await importFiles(urls: urls, destination: target) }
+
+        if ownsPasteboard, !internalClipboardURLs.isEmpty {
+            Task { await importFiles(urls: internalClipboardURLs, destination: target) }
             return
         }
-        if !internalClipboardURLs.isEmpty {
-            Task { await importFiles(urls: internalClipboardURLs, destination: target) }
+
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL], !urls.isEmpty {
+            Task { await importFiles(urls: urls, destination: target) }
             return
         }
     }

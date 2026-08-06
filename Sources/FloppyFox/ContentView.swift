@@ -2,6 +2,22 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
+    private struct FolderPathItem: Identifiable {
+        enum Destination {
+            case mounted(URL)
+            case hfs(String)
+        }
+
+        let label: String
+        let destination: Destination
+        var id: String {
+            switch destination {
+            case .mounted(let url): "mounted:\(url.path)"
+            case .hfs(let path): "hfs:\(path)"
+            }
+        }
+    }
+
     private enum BrowserViewStyle: String, CaseIterable, Identifiable {
         case list = "List"
         case grid = "Icons"
@@ -19,6 +35,7 @@ struct ContentView: View {
     // selection — matches Finder's click-to-extend-selection behavior.
     @State private var selectionAnchor: FileEntry?
     @State private var browserViewStyle: BrowserViewStyle = .list
+    @State private var inspectorAttributesExpanded = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -143,10 +160,6 @@ struct ContentView: View {
             }
             .disabled(!manager.isMounted && !manager.usingHFSUtils)
 
-            Toggle("Confirm detach", isOn: $manager.confirmBeforeDetach)
-                .toggleStyle(.switch)
-                .frame(width: 200)
-
             Button("Eject") {
                 Task { await manager.ejectImage() }
             }
@@ -184,31 +197,35 @@ struct ContentView: View {
 
     private var fileBrowser: some View {
         VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    Text(manager.mountPoint?.lastPathComponent ?? manager.imageURL?.lastPathComponent ?? "Mounted Volume")
+            VStack(spacing: 6) {
+                ZStack {
+                    Text(manager.imageURL?.lastPathComponent ?? manager.mountPoint?.lastPathComponent ?? "Mounted Volume")
                         .font(.title2.bold())
-                    if manager.isReadOnly {
-                        Text("Read-Only")
-                            .font(.caption.bold())
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(Capsule().fill(Color.orange.opacity(0.2)))
-                            .foregroundColor(.orange)
+                        .frame(maxWidth: .infinity)
+                        .multilineTextAlignment(.center)
+                    HStack {
+                        Spacer()
+                        if manager.isReadOnly {
+                            Text("Read-Only")
+                                .font(.caption.bold())
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color.orange.opacity(0.2)))
+                                .foregroundColor(.orange)
+                        }
                     }
                 }
-                Text(manager.statusMessage)
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
                 if let directory = manager.currentDirectory {
                     Text(directory.path)
                         .font(.caption)
                         .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
                         .lineLimit(1)
                 } else if manager.usingHFSUtils, let hfsPath = manager.currentHFSPath {
                     Text(hfsPath)
                         .font(.caption)
                         .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
                         .lineLimit(1)
                 }
             }
@@ -219,6 +236,20 @@ struct ContentView: View {
                     Task { await manager.goUp() }
                 }
                 .disabled(!manager.canGoBack)
+
+                Menu {
+                    ForEach(folderPathItems) { item in
+                        Button {
+                            navigate(to: item.destination)
+                        } label: {
+                            Label(item.label, systemImage: "folder")
+                        }
+                    }
+                } label: {
+                    Label(currentFolderName, systemImage: "folder")
+                }
+                .menuStyle(.borderlessButton)
+                .help("Go to a folder in the current path")
 
                 Spacer()
 
@@ -410,25 +441,29 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
                 if !entry.isDirectory {
                     Divider()
-                    Text("Attributes")
-                        .font(.headline)
-                    if let size = entry.size {
-                        inspectorRow("Size", value: ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))
+                    DisclosureGroup("Attributes", isExpanded: $inspectorAttributesExpanded) {
+                        VStack(spacing: 8) {
+                            if let size = entry.size {
+                                inspectorRow("Size", value: ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))
+                            }
+                            if let dataSize = entry.dataForkSize {
+                                inspectorRow("Data fork", value: ByteCountFormatter.string(fromByteCount: Int64(dataSize), countStyle: .file))
+                            }
+                            if let resourceSize = entry.resourceForkSize {
+                                inspectorRow("Resource fork", value: ByteCountFormatter.string(fromByteCount: Int64(resourceSize), countStyle: .file))
+                            }
+                            if let type = entry.finderType {
+                                inspectorRow("Type", value: type)
+                            }
+                            if let creator = entry.finderCreator {
+                                inspectorRow("Creator", value: creator)
+                            }
+                            inspectorRow("Locked", value: entry.isLocked ? "Yes" : "No")
+                            inspectorRow("Invisible", value: entry.isInvisible ? "Yes" : "No")
+                        }
+                        .padding(.top, 8)
                     }
-                    if let dataSize = entry.dataForkSize {
-                        inspectorRow("Data fork", value: ByteCountFormatter.string(fromByteCount: Int64(dataSize), countStyle: .file))
-                    }
-                    if let resourceSize = entry.resourceForkSize {
-                        inspectorRow("Resource fork", value: ByteCountFormatter.string(fromByteCount: Int64(resourceSize), countStyle: .file))
-                    }
-                    if let type = entry.finderType {
-                        inspectorRow("Type", value: type)
-                    }
-                    if let creator = entry.finderCreator {
-                        inspectorRow("Creator", value: creator)
-                    }
-                    inspectorRow("Locked", value: entry.isLocked ? "Yes" : "No")
-                    inspectorRow("Invisible", value: entry.isInvisible ? "Yes" : "No")
+                    .font(.headline)
                 }
                 Spacer()
                 Button("Delete This Item") {
@@ -456,6 +491,52 @@ struct ContentView: View {
                 .textSelection(.enabled)
         }
         .font(.subheadline)
+    }
+
+    private var currentFolderName: String {
+        if let currentDirectory = manager.currentDirectory {
+            return currentDirectory.lastPathComponent
+        }
+        guard let path = manager.currentHFSPath, path != ":" else {
+            return manager.imageURL?.deletingPathExtension().lastPathComponent ?? "Volume"
+        }
+        return path.split(separator: ":").last.map(String.init) ?? "Volume"
+    }
+
+    private var folderPathItems: [FolderPathItem] {
+        if let current = manager.currentDirectory, let root = manager.mountPoint {
+            var items: [FolderPathItem] = []
+            var cursor = current
+            while cursor.path.hasPrefix(root.path) {
+                let label = cursor == root ? root.lastPathComponent : cursor.lastPathComponent
+                items.append(FolderPathItem(label: label, destination: .mounted(cursor)))
+                if cursor == root { break }
+                let parent = cursor.deletingLastPathComponent()
+                guard parent != cursor else { break }
+                cursor = parent
+            }
+            return items
+        }
+
+        guard manager.usingHFSUtils else { return [] }
+        let volumeName = manager.imageURL?.deletingPathExtension().lastPathComponent ?? "Volume"
+        let components = (manager.currentHFSPath ?? ":").split(separator: ":").map(String.init)
+        var items: [FolderPathItem] = []
+        for count in stride(from: components.count, through: 1, by: -1) {
+            let path = ":" + components.prefix(count).joined(separator: ":")
+            items.append(FolderPathItem(label: components[count - 1], destination: .hfs(path)))
+        }
+        items.append(FolderPathItem(label: volumeName, destination: .hfs(":")))
+        return items
+    }
+
+    private func navigate(to destination: FolderPathItem.Destination) {
+        switch destination {
+        case .mounted(let url):
+            Task { await manager.navigate(toMountedDirectory: url) }
+        case .hfs(let path):
+            Task { await manager.navigate(toHFSDirectory: path) }
+        }
     }
 
     private var placeholderView: some View {
