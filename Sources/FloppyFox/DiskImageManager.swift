@@ -53,12 +53,25 @@ struct FileEntry: Identifiable, Hashable {
     // parsing when decoded back out via URLComponents. nil for entries on a normally-mounted
     // (real file://) volume, where url.lastPathComponent is already reliable.
     let hfsPath: String?
+    /// Finder metadata and an icon decoded from the classic resource fork. These are filled
+    /// by the hfsutils backend, whose synthetic URLs cannot be resolved by NSWorkspace.
+    let finderType: String?
+    let resourceIconPNG: Data?
 
-    init(url: URL, isDirectory: Bool, size: Int?, hfsPath: String? = nil) {
+    init(
+        url: URL,
+        isDirectory: Bool,
+        size: Int?,
+        hfsPath: String? = nil,
+        finderType: String? = nil,
+        resourceIconPNG: Data? = nil
+    ) {
         self.url = url
         self.isDirectory = isDirectory
         self.size = size
         self.hfsPath = hfsPath
+        self.finderType = finderType
+        self.resourceIconPNG = resourceIconPNG
     }
 
     var name: String {
@@ -73,6 +86,16 @@ struct FileEntry: Identifiable, Hashable {
     var icon: NSImage? {
         let workspace = NSWorkspace.shared
         if hfsPath != nil {
+            if let resourceIconPNG, let image = NSImage(data: resourceIconPNG) {
+                return image
+            }
+            if finderType == "APPL", let image = NSImage(named: "ClassicMac") ?? Bundle.module.image(forResource: "ClassicMac") {
+                return image
+            }
+            if ["dsk", "img", "hda"].contains((name as NSString).pathExtension.lowercased()),
+               let image = NSImage(named: "Floppy") ?? Bundle.module.image(forResource: "Floppy") {
+                return image
+            }
             let ext = (name as NSString).pathExtension
             if !ext.isEmpty, let type = UTType(filenameExtension: ext) {
                 return workspace.icon(for: type)
@@ -1788,8 +1811,31 @@ final class DiskImageManager: ObservableObject {
                 let (dlOut, _, dlCode) = await runCommand([hls, "-dl", hfsFullPath])
                 let isDir = dlCode == 0 && dlOut.hasPrefix("d")
 
+                // Long listings begin with, for example, `f  APPL/FNDR ...`. Resource forks
+                // are expensive to materialize, so only inspect applications: that captures
+                // the most useful classic icons without turning every directory refresh into
+                // a full export of every document on the disk.
+                let finderType = Self.finderType(fromHLSLongListing: dlOut)
+                var resourceIconPNG: Data?
+                if finderType == "APPL", let hcopy = hcopyPath {
+                    let temporary = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("floppyfox-icon-\(UUID().uuidString).bin")
+                    let (_, _, copyCode) = await runCommand([hcopy, "-m", hfsFullPath, temporary.path])
+                    if copyCode == 0, let macBinary = try? Data(contentsOf: temporary) {
+                        resourceIconPNG = ClassicMacResourceIcon.iconPNG(fromMacBinary: macBinary)
+                    }
+                    try? FileManager.default.removeItem(at: temporary)
+                }
+
                 let pseudo = URL(string: "hfs://localhost\(imagePath)?path=\(hfsFullPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? hfsFullPath)")!
-                let entry = FileEntry(url: pseudo, isDirectory: isDir, size: nil, hfsPath: hfsFullPath)
+                let entry = FileEntry(
+                    url: pseudo,
+                    isDirectory: isDir,
+                    size: nil,
+                    hfsPath: hfsFullPath,
+                    finderType: finderType,
+                    resourceIconPNG: resourceIconPNG
+                )
                 results.append(entry)
             }
             _ = await runCommand([humount])
@@ -1801,6 +1847,15 @@ final class DiskImageManager: ObservableObject {
             }
             return results
         }
+    }
+
+    private nonisolated static func finderType(fromHLSLongListing listing: String) -> String? {
+        // hfsutils formats files as `%c%c %4s/%4s ...`; directories have no type/creator.
+        guard listing.count >= 12, listing.first == "f" || listing.first == "F" else { return nil }
+        let start = listing.index(listing.startIndex, offsetBy: 3)
+        let end = listing.index(start, offsetBy: 4)
+        guard listing.indices.contains(end), listing[end] == "/" else { return nil }
+        return String(listing[start..<end])
     }
 
     private func pathForEntry(_ entry: FileEntry) -> String {
