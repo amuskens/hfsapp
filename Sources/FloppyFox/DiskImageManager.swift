@@ -1754,6 +1754,7 @@ final class DiskImageManager: ObservableObject {
                 throw NSError(domain: "hfsutils", code: Int(mountCode), userInfo: [NSLocalizedDescriptionKey: "hmount failed: \(mountErr.isEmpty ? mountOut : mountErr)"])
             }
             let (out, err, code) = await runCommand([hls, query])
+            print("DEBUG hfsList: usePath=\(usePath) query=\(query) mountOut=\(mountOut) hlsOut=\(out) hlsErr=\(err) hlsCode=\(code)")
             guard code == 0 else {
                 _ = await runCommand([humount])
                 throw NSError(domain: "hfsutils", code: Int(code), userInfo: [NSLocalizedDescriptionKey: "hls failed: \(err.isEmpty ? out : err)"])

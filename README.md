@@ -15,6 +15,13 @@ A macOS app project for browsing and editing Apple HFS disk images (`.dsk` and `
 - Xcode 15+ or newer
 - macOS 13+
 
+
+## Make a donation
+
+If you like the app and like these types of projects, please make a donation here:
+https://www.andersmuskens.com/donate
+Thank you for your support!
+
 ## Run locally
 
 ```bash
