@@ -22,6 +22,79 @@ final class FloppyFoxTests: XCTestCase {
         XCTAssertNil(ClassicMacResourceIcon.iconPNG(fromMacBinary: Data(repeating: 0, count: 127)))
     }
 
+    func testExpandsDynamicVHDToRawSectors() async throws {
+        let source = FileManager.default.temporaryDirectory
+            .appendingPathComponent("floppyfox-test-\(UUID().uuidString).vhd")
+        try makeDynamicVHD().write(to: source)
+        defer { try? FileManager.default.removeItem(at: source) }
+
+        let prepared = try await VHDImage.prepareForReading(source)
+        defer { try? FileManager.default.removeItem(at: prepared.imageURL) }
+        XCTAssertNotEqual(prepared.imageURL, source)
+        let raw = try Data(contentsOf: prepared.imageURL)
+        XCTAssertEqual(raw.count, 512)
+        XCTAssertEqual(raw, Data(repeating: 0xa5, count: 512))
+    }
+
+    func testUsesFixedVHDWithoutConversion() async throws {
+        let source = FileManager.default.temporaryDirectory
+            .appendingPathComponent("floppyfox-fixed-test-\(UUID().uuidString).vhd")
+        var fixed = Data(repeating: 0, count: 1024)
+        fixed.replaceSubrange(512..<520, with: "conectix".utf8)
+        fixed.writeUInt32BE(2, at: 512 + 60)
+        try fixed.write(to: source)
+        defer { try? FileManager.default.removeItem(at: source) }
+
+        let prepared = try await VHDImage.prepareForReading(source)
+        XCTAssertEqual(prepared.imageURL, source)
+    }
+
+    func testTreatsNonContainerVHDAsRawImage() async throws {
+        let source = FileManager.default.temporaryDirectory
+            .appendingPathComponent("floppyfox-raw-test-\(UUID().uuidString).vhd")
+        try Data(repeating: 0, count: 1024).write(to: source)
+        defer { try? FileManager.default.removeItem(at: source) }
+
+        let prepared = try await VHDImage.prepareForReading(source)
+        XCTAssertEqual(prepared.imageURL, source)
+    }
+
+    func testPrefersWholeDiskFromHdiutilEntities() {
+        let devices = ["/dev/disk4s1", "/dev/disk4s2", "/dev/disk4s3", "/dev/disk4"]
+        XCTAssertEqual(DiskImageManager.preferredWholeDiskDevice(from: devices), "/dev/disk4")
+    }
+
+    func testParsesFinderAttributesFromHLSLongListing() throws {
+        let attributes = try XCTUnwrap(DiskImageManager.finderAttributes(
+            fromHLSLongListing: "Fi TEXT/ttxt       332       987 Jun 19  2021 :ReadMe"
+        ))
+        XCTAssertEqual(attributes.type, "TEXT")
+        XCTAssertEqual(attributes.creator, "ttxt")
+        XCTAssertEqual(attributes.dataForkSize, 332)
+        XCTAssertEqual(attributes.resourceForkSize, 987)
+        XCTAssertTrue(attributes.isInvisible)
+        XCTAssertTrue(attributes.isLocked)
+    }
+
+    func testDecodesClassicMacRomanDirectoryOutput() {
+        let output = Data([0x41, 0x66, 0x74, 0x65, 0x72, 0x20, 0x44, 0x61, 0x72, 0x6b, 0xa8])
+        XCTAssertEqual(DiskImageManager.decodeProcessOutput(output), "After Dark®")
+    }
+
+    func testOpensOptionalVHDIntegrationFixture() async throws {
+        guard let path = ProcessInfo.processInfo.environment["FLOPPYFOX_VHD_FIXTURE"] else {
+            throw XCTSkip("Set FLOPPYFOX_VHD_FIXTURE to run the VHD integration test")
+        }
+        let manager = DiskImageManager()
+        await manager.attachImage(imageURL: URL(fileURLWithPath: path))
+        let error = manager.errorMessage
+        let entryCount = manager.entries.count
+        await manager.ejectImage()
+
+        XCTAssertNil(error)
+        XCTAssertGreaterThan(entryCount, 0)
+    }
+
     func testOpenRealMultiPartitionHDAImage() async throws {
         let url = URL(fileURLWithPath: "/Users/amuskens/Downloads/ PreInstalled MacOS Images/HD0-OpenRetroSCSI-7.1.hda")
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "fixture not found at \(url.path)")
@@ -75,6 +148,32 @@ private func makeMacBinaryWithICNResource() -> Data {
     return macBinary
 }
 
+private func makeDynamicVHD() -> Data {
+    let headerOffset = 512
+    let tableOffset = 1536
+    let storedBlockOffset = 2048
+    let trailingFooterOffset = 3072
+    var vhd = Data(repeating: 0, count: trailingFooterOffset + 512)
+
+    func writeFooter(at offset: Int) {
+        vhd.replaceSubrange(offset..<(offset + 8), with: "conectix".utf8)
+        vhd.writeUInt64BE(UInt64(headerOffset), at: offset + 16)
+        vhd.writeUInt64BE(512, at: offset + 48)
+        vhd.writeUInt32BE(3, at: offset + 60)
+    }
+    writeFooter(at: 0)
+    writeFooter(at: trailingFooterOffset)
+
+    vhd.replaceSubrange(headerOffset..<(headerOffset + 8), with: "cxsparse".utf8)
+    vhd.writeUInt64BE(UInt64(tableOffset), at: headerOffset + 16)
+    vhd.writeUInt32BE(1, at: headerOffset + 28)
+    vhd.writeUInt32BE(512, at: headerOffset + 32)
+    vhd.writeUInt32BE(UInt32(storedBlockOffset / 512), at: tableOffset)
+    vhd[storedBlockOffset] = 0x80 // first (and only) virtual sector is present
+    vhd.replaceSubrange((storedBlockOffset + 512)..<(storedBlockOffset + 1024), with: repeatElement(UInt8(0xa5), count: 512))
+    return vhd
+}
+
 private extension Data {
     mutating func writeUInt16BE(_ value: UInt16, at offset: Int) {
         self[offset] = UInt8((value >> 8) & 0xff)
@@ -86,6 +185,13 @@ private extension Data {
         self[offset + 1] = UInt8((value >> 16) & 0xff)
         self[offset + 2] = UInt8((value >> 8) & 0xff)
         self[offset + 3] = UInt8(value & 0xff)
+    }
+
+
+    mutating func writeUInt64BE(_ value: UInt64, at offset: Int) {
+        for byte in 0..<8 {
+            self[offset + byte] = UInt8((value >> UInt64((7 - byte) * 8)) & 0xff)
+        }
     }
 }
 #else

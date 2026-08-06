@@ -2,6 +2,14 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
+    private enum BrowserViewStyle: String, CaseIterable, Identifiable {
+        case list = "List"
+        case grid = "Icons"
+
+        var id: Self { self }
+        var systemImage: String { self == .list ? "list.bullet" : "square.grid.2x2" }
+    }
+
     @EnvironmentObject var manager: DiskImageManager
     @State private var isDropTarget = false
     @State private var isDropTargetForOpen = false
@@ -10,6 +18,7 @@ struct ContentView: View {
     // Tracks the last plain (unmodified) click, as the starting point for Shift-click range
     // selection — matches Finder's click-to-extend-selection behavior.
     @State private var selectionAnchor: FileEntry?
+    @State private var browserViewStyle: BrowserViewStyle = .list
 
     var body: some View {
         VStack(spacing: 0) {
@@ -122,11 +131,6 @@ struct ContentView: View {
             }
             .disabled(manager.selectedEntries.isEmpty)
 
-            Button("Quick Look") {
-                quickLook.toggle(for: manager.selectedEntry)
-            }
-            .disabled(manager.selectedEntry == nil || manager.selectedEntry?.isDirectory == true)
-
             Spacer()
 
             if manager.isBusy {
@@ -218,6 +222,15 @@ struct ContentView: View {
 
                 Spacer()
 
+                Picker("View as", selection: $browserViewStyle) {
+                    ForEach(BrowserViewStyle.allCases) { style in
+                        Label(style.rawValue, systemImage: style.systemImage)
+                            .tag(style)
+                    }
+                }
+                .pickerStyle(.menu)
+                .fixedSize()
+
                 Text(manager.isReadOnly ? "This image is read-only" : (isDropTarget ? "Drop files here to add them to the volume" : "Drag files here from Finder to copy floppy treasures into the mounted volume"))
                     .font(.caption)
                     .foregroundColor(.secondary)
@@ -225,36 +238,85 @@ struct ContentView: View {
             .padding(.horizontal)
             .padding(.bottom, 8)
 
-            List(selection: $manager.selectedEntries) {
+            if browserViewStyle == .list {
+                listView
+            } else {
+                iconView
+            }
+        }
+    }
+
+    private var listView: some View {
+        List(selection: $manager.selectedEntries) {
+            ForEach(manager.entries) { entry in
+                row(for: entry)
+                    .tag(entry)
+                    .contextMenu { entryContextMenu(for: entry) }
+            }
+        }
+        .listStyle(.inset)
+    }
+
+    private var iconView: some View {
+        ScrollView {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 92), spacing: 14)], spacing: 18) {
                 ForEach(manager.entries) { entry in
-                    // If the right-clicked row is part of a larger multi-selection, Copy/Delete
-                    // act on the whole selection (matching Finder); otherwise just this row.
-                    let isPartOfSelection = manager.selectedEntries.count > 1 && manager.selectedEntries.contains(entry)
-
-                    row(for: entry)
-                        .tag(entry)
-                        .contextMenu {
-                            Button("Open") {
-                                Task { await manager.openEntry(entry) }
-                            }
-
-                            Button(isPartOfSelection ? "Copy \(manager.selectedEntries.count) Items" : "Copy") {
-                                if isPartOfSelection {
-                                    manager.copySelected()
-                                } else {
-                                    manager.copyEntry(entry)
-                                }
-                            }
-
-                            Button(isPartOfSelection ? "Delete \(manager.selectedEntries.count) Items" : "Delete", role: .destructive) {
-                                deleteConfirmationEntries = isPartOfSelection ? manager.selectedEntries : [entry]
-                            }
-                            .disabled(entry.url == manager.currentDirectory || manager.isReadOnly)
+                    VStack(spacing: 6) {
+                        if let icon = entry.icon {
+                            Image(nsImage: icon)
+                                .interpolation(.none)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: 48, height: 48)
                         }
+                        Text(entry.name)
+                            .font(.caption)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(2)
+                            .frame(maxWidth: 88)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 76)
+                    .padding(6)
+                    .background {
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(manager.selectedEntries.contains(entry) ? Color.accentColor.opacity(0.2) : .clear)
+                    }
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(manager.selectedEntries.contains(entry) ? Color.accentColor.opacity(0.7) : .clear)
+                    }
+                    .contentShape(Rectangle())
+                    .simultaneousGesture(TapGesture(count: 1).onEnded {
+                        handleSingleClick(on: entry)
+                    })
+                    .simultaneousGesture(TapGesture(count: 2).onEnded {
+                        Task { await manager.openEntry(entry) }
+                    })
+                    .onDrag { manager.makeDragItemProvider(for: entry) }
+                    .contextMenu { entryContextMenu(for: entry) }
                 }
             }
-            .listStyle(.inset)
+            .padding(16)
         }
+    }
+
+    @ViewBuilder
+    private func entryContextMenu(for entry: FileEntry) -> some View {
+        let isPartOfSelection = manager.selectedEntries.count > 1 && manager.selectedEntries.contains(entry)
+        Button("Open") {
+            Task { await manager.openEntry(entry) }
+        }
+        Button(isPartOfSelection ? "Copy \(manager.selectedEntries.count) Items" : "Copy") {
+            if isPartOfSelection {
+                manager.copySelected()
+            } else {
+                manager.copyEntry(entry)
+            }
+        }
+        Button(isPartOfSelection ? "Delete \(manager.selectedEntries.count) Items" : "Delete", role: .destructive) {
+            deleteConfirmationEntries = isPartOfSelection ? manager.selectedEntries : [entry]
+        }
+        .disabled(entry.url == manager.currentDirectory || manager.isReadOnly)
     }
 
     private func row(for entry: FileEntry) -> some View {
@@ -328,11 +390,7 @@ struct ContentView: View {
                 Text("\(entries.count) items selected")
                     .font(.headline)
                 let totalSize = entries.compactMap { $0.size }.reduce(0, +)
-                if totalSize > 0 {
-                    Text(ByteCountFormatter.string(fromByteCount: Int64(totalSize), countStyle: .file))
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                }
+                inspectorRow("Total size", value: ByteCountFormatter.string(fromByteCount: Int64(totalSize), countStyle: .file))
                 Spacer()
                 Button("Delete Selected") {
                     deleteConfirmationEntries = entries
@@ -350,9 +408,27 @@ struct ContentView: View {
                 Text(entry.isDirectory ? "Folder" : "File")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
-                if let size = entry.size, !entry.isDirectory {
-                    Text(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))
-                        .font(.subheadline)
+                if !entry.isDirectory {
+                    Divider()
+                    Text("Attributes")
+                        .font(.headline)
+                    if let size = entry.size {
+                        inspectorRow("Size", value: ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))
+                    }
+                    if let dataSize = entry.dataForkSize {
+                        inspectorRow("Data fork", value: ByteCountFormatter.string(fromByteCount: Int64(dataSize), countStyle: .file))
+                    }
+                    if let resourceSize = entry.resourceForkSize {
+                        inspectorRow("Resource fork", value: ByteCountFormatter.string(fromByteCount: Int64(resourceSize), countStyle: .file))
+                    }
+                    if let type = entry.finderType {
+                        inspectorRow("Type", value: type)
+                    }
+                    if let creator = entry.finderCreator {
+                        inspectorRow("Creator", value: creator)
+                    }
+                    inspectorRow("Locked", value: entry.isLocked ? "Yes" : "No")
+                    inspectorRow("Invisible", value: entry.isInvisible ? "Yes" : "No")
                 }
                 Spacer()
                 Button("Delete This Item") {
@@ -370,13 +446,25 @@ struct ContentView: View {
         .padding()
     }
 
+    private func inspectorRow(_ label: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label)
+                .foregroundColor(.secondary)
+            Spacer()
+            Text(value)
+                .multilineTextAlignment(.trailing)
+                .textSelection(.enabled)
+        }
+        .font(.subheadline)
+    }
+
     private var placeholderView: some View {
         VStack(spacing: 16) {
             classicMacGraphic
             Text("Open an HFS disk image")
                 .font(.title)
                 .bold()
-            Text(isDropTargetForOpen ? "Drop to open" : "Choose a .dsk, .img, or .hda image file formatted with Apple HFS, then browse and manage its contents.")
+            Text(isDropTargetForOpen ? "Drop to open" : "Choose a .dsk, .img, .hda, or .vhd image containing Apple HFS, then browse and manage its contents.")
                 .multilineTextAlignment(.center)
                 .foregroundColor(.secondary)
                 .frame(maxWidth: 520)

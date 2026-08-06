@@ -56,6 +56,11 @@ struct FileEntry: Identifiable, Hashable {
     /// Finder metadata and an icon decoded from the classic resource fork. These are filled
     /// by the hfsutils backend, whose synthetic URLs cannot be resolved by NSWorkspace.
     let finderType: String?
+    let finderCreator: String?
+    let dataForkSize: Int?
+    let resourceForkSize: Int?
+    let isInvisible: Bool
+    let isLocked: Bool
     let resourceIconPNG: Data?
 
     init(
@@ -64,6 +69,11 @@ struct FileEntry: Identifiable, Hashable {
         size: Int?,
         hfsPath: String? = nil,
         finderType: String? = nil,
+        finderCreator: String? = nil,
+        dataForkSize: Int? = nil,
+        resourceForkSize: Int? = nil,
+        isInvisible: Bool = false,
+        isLocked: Bool = false,
         resourceIconPNG: Data? = nil
     ) {
         self.url = url
@@ -71,6 +81,11 @@ struct FileEntry: Identifiable, Hashable {
         self.size = size
         self.hfsPath = hfsPath
         self.finderType = finderType
+        self.finderCreator = finderCreator
+        self.dataForkSize = dataForkSize
+        self.resourceForkSize = resourceForkSize
+        self.isInvisible = isInvisible
+        self.isLocked = isLocked
         self.resourceIconPNG = resourceIconPNG
     }
 
@@ -92,13 +107,14 @@ struct FileEntry: Identifiable, Hashable {
             if finderType == "APPL", let image = NSImage(named: "ClassicMac") ?? Bundle.module.image(forResource: "ClassicMac") {
                 return image
             }
-            if ["dsk", "img", "hda"].contains((name as NSString).pathExtension.lowercased()),
+            if ["dsk", "img", "hda", "vhd"].contains((name as NSString).pathExtension.lowercased()),
                let image = NSImage(named: "Floppy") ?? Bundle.module.image(forResource: "Floppy") {
                 return image
             }
-            let ext = (name as NSString).pathExtension
-            if !ext.isEmpty, let type = UTType(filenameExtension: ext) {
-                return workspace.icon(for: type)
+            let fallbackName = isDirectory ? "ClassicFolder" : "ClassicDocument"
+            if let image = NSImage(named: fallbackName) ?? Bundle.module.image(forResource: fallbackName) {
+                image.isTemplate = false
+                return image
             }
             return workspace.icon(for: isDirectory ? .folder : .data)
         }
@@ -309,14 +325,11 @@ final class DiskImageManager: ObservableObject {
 
     func openImage() {
         let panel = NSOpenPanel()
-        // .hda is the raw hard disk image extension BlueSCSI (and similar SCSI emulators) use;
-        // structurally it's just another raw disk image, same as .img — hdiutil/hfsutils don't
-        // care about the extension at all, so allowing it here is the only change needed.
-        panel.allowedContentTypes = [UTType(filenameExtension: "dsk"), UTType(filenameExtension: "img"), UTType(filenameExtension: "hda")].compactMap { $0 }
+        panel.allowedContentTypes = Self.supportedImageTypes
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.title = "Open HFS Disk Image"
-        panel.message = "Choose a .dsk, .img, or .hda file formatted with the Apple HFS filesystem."
+        panel.message = "Choose a .dsk, .img, .hda, or .vhd file containing an Apple HFS filesystem."
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
         Task { await attachImage(imageURL: url) }
@@ -327,12 +340,31 @@ final class DiskImageManager: ObservableObject {
             await detachImageIfMounted()
             hfsUtilsPrepared = false
 
-            let reason = await detectReadOnlyReason(for: imageURL.path)
+            var imageToAttach = imageURL
+            var vhdReason: String?
+            if imageURL.pathExtension.lowercased() == "vhd" {
+                do {
+                    let preparation = try await VHDImage.prepareForReading(imageURL)
+                    imageToAttach = preparation.imageURL
+                    if preparation.imageURL != imageURL {
+                        tempImageCopyURL = preparation.imageURL
+                        vhdReason = "Dynamic VHD images are expanded to a temporary raw disk and opened read-only. Changes cannot be written back to the VHD container."
+                    }
+                } catch {
+                    self.imageURL = nil
+                    self.errorMessage = error.localizedDescription
+                    self.statusMessage = "Failed to open VHD image"
+                    return
+                }
+            }
+
+            let fileReadOnlyReason = await detectReadOnlyReason(for: imageURL.path)
+            let reason = vhdReason ?? fileReadOnlyReason
             self.isReadOnly = reason != nil
             self.readOnlyReason = reason
 
             do {
-                let result = try await attachImageUsingHdiutil(imageURL, readOnly: self.isReadOnly)
+                let result = try await attachImageUsingHdiutil(imageToAttach, readOnly: self.isReadOnly)
                 guard let mountPoint = result.mountPoint else {
                     throw DiskImageError.missingMountPoint
                 }
@@ -448,13 +480,23 @@ final class DiskImageManager: ObservableObject {
             do {
                 try proc.run()
                 proc.waitUntilExit()
-                let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                let out = Self.decodeProcessOutput(outPipe.fileHandleForReading.readDataToEndOfFile())
+                let err = Self.decodeProcessOutput(errPipe.fileHandleForReading.readDataToEndOfFile())
                 return (out, err, proc.terminationStatus)
             } catch {
                 return ("", "\(error)", Int32(-1))
             }
         }.value
+    }
+
+    /// macOS tools emit UTF-8, while hfsutils emits classic Mac Roman filenames. A strict
+    /// UTF-8 decode used to turn an entire directory listing into an empty string as soon as
+    /// one filename contained a legacy high-bit character (for example After Dark's disk
+    /// image). Prefer UTF-8 and fall back to Mac Roman so both tool families are preserved.
+    nonisolated static func decodeProcessOutput(_ data: Data) -> String {
+        String(data: data, encoding: .utf8)
+            ?? String(data: data, encoding: .macOSRoman)
+            ?? ""
     }
 
     private nonisolated func runCommand(_ cmd: [String]) async -> (String, String, Int32) {
@@ -527,13 +569,15 @@ final class DiskImageManager: ObservableObject {
             for entity in entities {
                 if mountPointURL == nil, let path = entity["mount-point"] as? String {
                     mountPointURL = URL(fileURLWithPath: path)
-                    device = entity["dev-entry"] as? String
-                    break
-                }
-                if device == nil, let dev = entity["dev-entry"] as? String {
-                    device = dev
                 }
             }
+            // `-nomount` lists partition slices before the parent disk (for example disk4s1,
+            // disk4s2, disk4s3, then disk4). Partition discovery and detach must receive the
+            // whole disk; selecting the first entity leaves classic-HFS VHDs attached and
+            // locked just before the hfsutils fallback tries to open them.
+            device = Self.preferredWholeDiskDevice(
+                from: entities.compactMap { $0["dev-entry"] as? String }
+            )
         } else {
             // If no plist parsed, try to scan stdout text for /dev/diskN
             let regex = try? NSRegularExpression(pattern: "/dev/disk\\\\d+", options: [])
@@ -756,6 +800,7 @@ final class DiskImageManager: ObservableObject {
             hfsUtilsPrepared = false
             isReadOnly = false
             readOnlyReason = nil
+            cleanupTempCopyIfAny()
             statusMessage = "Image detached"
             return
         }
@@ -776,6 +821,10 @@ final class DiskImageManager: ObservableObject {
             isReadOnly = false
             readOnlyReason = nil
         }
+    }
+
+    static var supportedImageTypes: [UTType] {
+        ["dsk", "img", "hda", "vhd"].compactMap { UTType(filenameExtension: $0) }
     }
 
     func ejectImage() async {
@@ -911,15 +960,27 @@ final class DiskImageManager: ObservableObject {
                 if isMounted {
                     try await loadDirectory(at: entry.url)
                 } else if usingHFSUtils {
-                    // update currentHFSPath and load via hfsutils
-                    if let current = currentHFSPath {
-                        // append entry name to path
-                        let newPath = current.hasSuffix(":" ) ? "\(current)\(entry.name)" : "\(current):\(entry.name)"
-                        currentHFSPath = newPath
-                    } else {
-                        currentHFSPath = ":\(entry.name)"
+                    // Every hfsutils row already carries its exact full HFS path. Using that
+                    // makes navigation idempotent if two Open tasks overlap; rebuilding from
+                    // mutable `currentHFSPath` could otherwise turn `:Games` into
+                    // `:Games:Games` while the first directory listing was still awaiting.
+                    let previousPath = currentHFSPath
+                    let parentPath = previousPath ?? ":"
+                    let destinationPath = entry.hfsPath ?? (parentPath.hasSuffix(":")
+                        ? "\(parentPath)\(entry.name)"
+                        : "\(parentPath):\(entry.name)")
+                    currentHFSPath = destinationPath
+                    do {
+                        try await loadDirectory(at: URL(fileURLWithPath: "/"))
+                    } catch {
+                        // A failed listing should not strand subsequent Refresh/Up actions at
+                        // a path that was never successfully opened. Do not overwrite a newer
+                        // navigation that may have completed while this operation was awaiting.
+                        if currentHFSPath == destinationPath {
+                            currentHFSPath = previousPath
+                        }
+                        throw error
                     }
-                    try await loadDirectory(at: URL(fileURLWithPath: "/"))
                 }
                 selectedEntry = nil
             } catch {
@@ -1209,10 +1270,18 @@ final class DiskImageManager: ObservableObject {
         guard let data = plistOutput.data(using: .utf8),
               let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
               let entities = plist["system-entities"] as? [[String: Any]] else { return nil }
-        for entity in entities {
-            if let dev = entity["dev-entry"] as? String { return dev }
+        return Self.preferredWholeDiskDevice(
+            from: entities.compactMap { $0["dev-entry"] as? String }
+        )
+    }
+
+    nonisolated static func preferredWholeDiskDevice(from devices: [String]) -> String? {
+        if let wholeDisk = devices.first(where: { device in
+            device.range(of: #"^/dev/disk[0-9]+$"#, options: .regularExpression) != nil
+        }) {
+            return wholeDisk
         }
-        return nil
+        return devices.first
     }
 
     func exportSelected() async {
@@ -1776,7 +1845,9 @@ final class DiskImageManager: ObservableObject {
             guard mountCode == 0 else {
                 throw NSError(domain: "hfsutils", code: Int(mountCode), userInfo: [NSLocalizedDescriptionKey: "hmount failed: \(mountErr.isEmpty ? mountOut : mountErr)"])
             }
-            let (out, err, code) = await runCommand([hls, query])
+            // `-N` returns names verbatim; `runProcess` decodes those bytes as Mac Roman when
+            // they are not valid UTF-8. Without it, hls may substitute legacy characters.
+            let (out, err, code) = await runCommand([hls, "-1N", query])
             print("DEBUG hfsList: usePath=\(usePath) query=\(query) mountOut=\(mountOut) hlsOut=\(out) hlsErr=\(err) hlsCode=\(code)")
             guard code == 0 else {
                 _ = await runCommand([humount])
@@ -1815,7 +1886,8 @@ final class DiskImageManager: ObservableObject {
                 // are expensive to materialize, so only inspect applications: that captures
                 // the most useful classic icons without turning every directory refresh into
                 // a full export of every document on the disk.
-                let finderType = Self.finderType(fromHLSLongListing: dlOut)
+                let attributes = Self.finderAttributes(fromHLSLongListing: dlOut)
+                let finderType = attributes?.type
                 var resourceIconPNG: Data?
                 if finderType == "APPL", let hcopy = hcopyPath {
                     let temporary = FileManager.default.temporaryDirectory
@@ -1831,9 +1903,14 @@ final class DiskImageManager: ObservableObject {
                 let entry = FileEntry(
                     url: pseudo,
                     isDirectory: isDir,
-                    size: nil,
+                    size: attributes.map { $0.dataForkSize + $0.resourceForkSize },
                     hfsPath: hfsFullPath,
                     finderType: finderType,
+                    finderCreator: attributes?.creator,
+                    dataForkSize: attributes?.dataForkSize,
+                    resourceForkSize: attributes?.resourceForkSize,
+                    isInvisible: attributes?.isInvisible ?? false,
+                    isLocked: attributes?.isLocked ?? false,
                     resourceIconPNG: resourceIconPNG
                 )
                 results.append(entry)
@@ -1849,13 +1926,36 @@ final class DiskImageManager: ObservableObject {
         }
     }
 
-    private nonisolated static func finderType(fromHLSLongListing listing: String) -> String? {
-        // hfsutils formats files as `%c%c %4s/%4s ...`; directories have no type/creator.
-        guard listing.count >= 12, listing.first == "f" || listing.first == "F" else { return nil }
-        let start = listing.index(listing.startIndex, offsetBy: 3)
-        let end = listing.index(start, offsetBy: 4)
-        guard listing.indices.contains(end), listing[end] == "/" else { return nil }
-        return String(listing[start..<end])
+    nonisolated static func finderAttributes(fromHLSLongListing listing: String) -> (
+        type: String,
+        creator: String,
+        dataForkSize: Int,
+        resourceForkSize: Int,
+        isInvisible: Bool,
+        isLocked: Bool
+    )? {
+        // hfsutils formats files as `%c%c %4s/%4s data-size resource-size ...`.
+        // Fixed-width type/creator codes may themselves contain spaces, so preserve them
+        // verbatim instead of splitting the whole line on whitespace.
+        let pattern = #"^([fF])([i ])\s(.{4})/(.{4})\s+(\d+)\s+(\d+)\s"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: listing, range: NSRange(listing.startIndex..., in: listing)),
+              let kindRange = Range(match.range(at: 1), in: listing),
+              let invisibleRange = Range(match.range(at: 2), in: listing),
+              let typeRange = Range(match.range(at: 3), in: listing),
+              let creatorRange = Range(match.range(at: 4), in: listing),
+              let dataRange = Range(match.range(at: 5), in: listing),
+              let resourceRange = Range(match.range(at: 6), in: listing),
+              let dataSize = Int(listing[dataRange]),
+              let resourceSize = Int(listing[resourceRange]) else { return nil }
+        return (
+            String(listing[typeRange]),
+            String(listing[creatorRange]),
+            dataSize,
+            resourceSize,
+            listing[invisibleRange] == "i",
+            listing[kindRange] == "F"
+        )
     }
 
     private func pathForEntry(_ entry: FileEntry) -> String {

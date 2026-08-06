@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" shape-rendering="crispEdges">
+  <!-- A compact recreation of the classic Macintosh generic text document. -->
+  <path fill="#000" d="M7 2h14v1h2v2h2v25H7zm14 2v3h3V6h-1V5h-1V4z"/>
+  <path fill="#fff" d="M8 3h12v5h4v21H8zm13 1v3h3V6h-1V5h-1V4z"/>
+  <path fill="#000" d="M11 11h8v1h-8zm0 3h10v1H11zm0 3h9v1h-9zm0 3h10v1H11zm0 3h7v1h-7z"/>
+</svg>

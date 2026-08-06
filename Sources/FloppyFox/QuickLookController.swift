@@ -54,8 +54,7 @@ final class QuickLookController: NSObject {
         Task { await show(entry, panel: panel, makeKey: false) }
     }
 
-    /// Opens (or closes, if already open) the preview for `entry` — used by the "Quick Look"
-    /// button, a mouse-driven equivalent of the spacebar shortcut.
+    /// Opens or closes the preview for `entry`, matching Finder's spacebar behavior.
     func toggle(for entry: FileEntry?) {
         guard let panel = QLPreviewPanel.shared() else { return }
         if panel.isVisible {

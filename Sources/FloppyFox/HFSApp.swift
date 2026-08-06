@@ -60,7 +60,7 @@ struct FloppyFoxApp: App {
                             _ = await manager.runDiagnostics(on: image)
                         } else {
                             let panel = NSOpenPanel()
-                            panel.allowedContentTypes = [UTType(filenameExtension: "dsk"), UTType(filenameExtension: "img"), UTType(filenameExtension: "hda")].compactMap { $0 }
+                            panel.allowedContentTypes = DiskImageManager.supportedImageTypes
                             panel.canChooseFiles = true
                             panel.canChooseDirectories = false
                             panel.allowsMultipleSelection = false

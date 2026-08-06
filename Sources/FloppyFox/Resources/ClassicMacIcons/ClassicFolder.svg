@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" shape-rendering="crispEdges">
+  <!-- Late System 7-style blue/lavender closed folder on a 32-pixel grid. -->
+  <path fill="#000" d="M1 8h2V6h9v1h2v2h16v19H1z"/>
+  <path fill="#fff" d="M2 8h2V7h7v1h2v2h16v2H2z"/>
+  <path fill="#ccccff" d="M2 13h27v13H2z"/>
+  <path fill="#9999cc" d="M2 26h27v1H2z"/>
+  <path fill="#666699" d="M29 13h1v14h-1z"/>
+</svg>

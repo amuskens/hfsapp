@@ -1,10 +1,10 @@
 # FloppyFox
 
-A macOS app project for browsing and editing Apple HFS disk images (`.hda`,`.dsk` and `.img`). It's especially designed for exploring and modifying disk images that are used by the Classic Mac OS, alongisde emulators and devices like the BlueSCSI. 
+A macOS app project for browsing and editing Apple HFS disk images (`.hda`, `.dsk`, `.img`, and `.vhd`). It's especially designed for exploring and modifying disk images that are used by the Classic Mac OS, alongside emulators and devices like the BlueSCSI.
 
 It allows you to:
 
-- open HFS disk image files
+- open HFS disk image files, including raw `.vhd` images and fixed or dynamic VHD containers
 - mount the image in read/write mode using `hdiutil`
 - explore folders and files inside the volume
 - delete files and folders inside the image
