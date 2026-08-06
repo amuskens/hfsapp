@@ -14,8 +14,11 @@ It allows you to:
 
 ## Prerequisites
 
-- Xcode 15+ or newer
+- Xcode 15 or newer, including the Xcode Command Line Tools
 - macOS 13+
+- [Visual Studio Code](https://code.visualstudio.com/) and the official
+  [Swift extension](https://marketplace.visualstudio.com/items?itemName=swiftlang.swift-vscode)
+  if you want to work in VS Code
 
 
 ## Make a donation
@@ -24,18 +27,62 @@ If you like the app and like these types of projects, please make a donation her
 https://www.andersmuskens.com/donate
 Thank you for your support!
 
-## Run locally
+## Open and build in VS Code
+
+1. Install Xcode and launch it once to accept its license and install any required components.
+2. Install Visual Studio Code.
+3. In VS Code, install the official **Swift** extension published by Swift Server Work Group.
+4. Open the FloppyFox repository folder using **File > Open Folder**, or from Terminal:
+
+```bash
+cd /path/to/hfsapp
+code .
+```
+
+VS Code should recognize `Package.swift` automatically and resolve the Swift package. You can
+build from the Command Palette with **Swift: Build Package**, or use the integrated terminal:
 
 ```bash
 swift build
+```
+
+To build and immediately run the development version:
+
+```bash
 swift run
 ```
 
-If the command line tools are not using the full Xcode SDK, run tests with:
+You can also select the `FloppyFox` executable in VS Code's **Run and Debug** view and start it
+with F5. If source indexing is still in progress, allow SourceKit-LSP to finish before debugging.
+
+Run the test suite with:
+
+```bash
+swift test
+```
+
+If the command-line tools are not using the full Xcode SDK, specify it explicitly:
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
 ```
+
+## Build the macOS application bundle
+
+To create a release build at `Build/FloppyFox.app`, run:
+
+```bash
+./Tools/build-app.sh
+```
+
+Open the resulting application directly with:
+
+```bash
+open Build/FloppyFox.app
+```
+
+The local build script does not currently apply a Developer ID signature or submit the app for
+Apple notarization. An app intended for distribution must be signed and notarized separately.
 
 ## Structure
 

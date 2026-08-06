@@ -22,9 +22,11 @@ struct FloppyFoxApp: App {
                 }
         }
         .commands {
-            // App menu placeholder (About/Quit provided automatically by SwiftUI on app bundles,
-            // but include replacements when running from command line)
-            CommandGroup(replacing: .appInfo) {}
+            CommandGroup(replacing: .appInfo) {
+                Button("About FloppyFox") {
+                    AppPresentation.showAboutPanel()
+                }
+            }
 
             // `CommandGroup(replacing:)` inserts into the File/Edit menus every Mac app already
             // gets for free; a `CommandMenu("File")`/`CommandMenu("Edit")` used to be used here
@@ -116,6 +118,88 @@ struct FloppyFoxApp: App {
                 .keyboardShortcut("a", modifiers: [.command])
                 .disabled(manager.entries.isEmpty)
             }
+
+            CommandGroup(replacing: .help) {
+                Button("FloppyFox Help") {
+                    AppPresentation.showReadme()
+                }
+                .keyboardShortcut("?", modifiers: [.command])
+            }
         }
+    }
+}
+
+@MainActor
+private enum AppPresentation {
+    private static let fallbackVersion = "0.1"
+    private static let fallbackBuild = "1"
+    private static let releaseChannel = "beta"
+
+    static func showAboutPanel() {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? fallbackVersion
+        let build = info?["CFBundleVersion"] as? String ?? fallbackBuild
+        let credits = NSAttributedString(
+            string: "(C) 2026 Anders Muskens\n\nCreated by Anders Muskens\n\nAI agent assistance: ChatGPT and Claude",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+        )
+        NSApplication.shared.orderFrontStandardAboutPanel(options: [
+            .applicationName: "FloppyFox",
+            .applicationIcon: aboutIcon,
+            .applicationVersion: "\(version) \(releaseChannel)",
+            .version: "Version \(version) \(releaseChannel) (build \(build))",
+            .credits: credits
+        ])
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    private static var aboutIcon: NSImage {
+        if let releaseIconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let releaseIcon = NSImage(contentsOf: releaseIconURL) {
+            return releaseIcon
+        }
+        if let bundledIconURL = Bundle.module.url(forResource: "FloppyFoxIcon", withExtension: "svg"),
+           let bundledIcon = NSImage(contentsOf: bundledIconURL) {
+            return bundledIcon
+        }
+        return NSApplication.shared.applicationIconImage
+    }
+
+    static func showReadme() {
+        let helpURL = Bundle.module.url(forResource: "FloppyFoxHelp", withExtension: "md")
+        let readme = helpURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+            ?? "FloppyFox Help\n\nThe bundled README could not be loaded."
+
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 590, height: 380))
+        textView.string = readme
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 10, height: 10)
+        textView.font = .systemFont(ofSize: 13)
+        textView.textColor = .labelColor
+        textView.textContainer?.widthTracksTextView = true
+
+        let scrollView = NSScrollView(frame: textView.frame)
+        scrollView.documentView = textView
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .bezelBorder
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "FloppyFox Help"
+        alert.informativeText = "README • Version \(releaseVersion) \(releaseChannel)"
+        alert.accessoryView = scrollView
+        alert.addButton(withTitle: "Close")
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    private static var releaseVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? fallbackVersion
     }
 }

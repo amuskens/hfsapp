@@ -33,6 +33,13 @@ iconutil -c icns "$ICONSET" -o "$ICON"
 mkdir -p "$OUTDIR/Contents/Resources"
 cp "$ICON" "$OUTDIR/Contents/Resources/AppIcon.icns"
 
+# SwiftPM keeps processed assets and the bundled help README in a companion resource bundle.
+# Preserve it inside the application so `Bundle.module` works in packaged release builds too.
+RESOURCE_BUNDLE=$(find .build -path '*/release/FloppyFox_FloppyFox.bundle' -type d -print -quit)
+if [ -n "$RESOURCE_BUNDLE" ]; then
+  cp -R "$RESOURCE_BUNDLE" "$OUTDIR/Contents/Resources/"
+fi
+
 cat > "$OUTDIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -51,9 +58,11 @@ cat > "$OUTDIR/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0</string>
+  <string>0.1</string>
   <key>CFBundleVersion</key>
   <string>1</string>
+  <key>NSHumanReadableCopyright</key>
+  <string>(C) 2026 Anders Muskens</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>

@@ -123,10 +123,12 @@ struct ContentView: View {
                 set: { if !$0 { deleteConfirmationEntries = [] } }
             )
         ) {
-            Button("Delete", role: .destructive) {
+            Button(role: .destructive) {
                 let entries = deleteConfirmationEntries
                 deleteConfirmationEntries = []
                 Task { await manager.deleteEntries(entries) }
+            } label: {
+                Label("Delete", systemImage: "trash")
             }
             Button("Cancel", role: .cancel) {
                 deleteConfirmationEntries = []
@@ -174,9 +176,13 @@ struct ContentView: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            Button("Open Image") {
+            Button {
                 manager.openImage()
+            } label: {
+                Label("Open Image", systemImage: "externaldrive.badge.plus")
             }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
             .keyboardShortcut("o", modifiers: [.command])
 
             // Copy/Paste buttons hidden per user preference
@@ -188,45 +194,61 @@ struct ContentView: View {
                     .controlSize(.small)
             }
 
-            Button("Refresh") {
+            Button {
                 Task { await manager.refresh() }
+            } label: {
+                Label("Refresh", systemImage: "arrow.clockwise")
             }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
             .disabled(!manager.isMounted && !manager.usingHFSUtils)
 
-            Button("Eject") {
+            Button {
                 Task { await manager.ejectImage() }
+            } label: {
+                Label("Eject", systemImage: "eject.fill")
             }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .tint(.orange)
             .disabled(!manager.isMounted && !manager.usingHFSUtils)
         }
     }
 
     private var mountedContent: some View {
-        HStack(spacing: 0) {
+        HSplitView {
             fileBrowser
-                .frame(minWidth: 340)
+                .frame(minWidth: 420, maxWidth: .infinity)
                 .background(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(Color(nsColor: .textBackgroundColor).opacity(0.96))
-                        .shadow(color: .black.opacity(0.05), radius: 8, x: 0, y: 4)
+                        .shadow(color: .black.opacity(0.13), radius: 16, x: 0, y: 7)
+                        .shadow(color: Color.accentColor.opacity(0.07), radius: 4, x: 0, y: 1)
                 )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.primary.opacity(0.09), lineWidth: 1)
+                }
                 .padding(12)
                 .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTarget) { providers in
                     guard !manager.isReadOnly else { return false }
                     return manager.handleDroppedFiles(providers: providers)
                 }
 
-            Divider()
-
             detailPane
-                // Keep the inspector footprint stable as names, paths, and available
-                // attributes change with the selection. The browser takes all remaining room.
-                .frame(width: 300)
+                // HSplitView supplies the draggable divider. These bounds keep the inspector
+                // useful while allowing the user to choose how much room it receives.
+                .frame(minWidth: 260, idealWidth: 300, maxWidth: 440)
                 .frame(maxHeight: .infinity, alignment: .topLeading)
                 .background(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(Color(nsColor: .windowBackgroundColor).opacity(0.94))
-                        .shadow(color: .black.opacity(0.05), radius: 8, x: 0, y: 4)
+                        .shadow(color: .black.opacity(0.09), radius: 12, x: 0, y: 5)
                 )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                }
                 .padding(12)
         }
     }
@@ -280,11 +302,16 @@ struct ContentView: View {
                 } label: {
                     Label("New Folder", systemImage: "folder.badge.plus")
                 }
+                .buttonStyle(.bordered)
+                .tint(.accentColor)
                 .disabled(manager.isReadOnly)
 
-                Button("Up") {
+                Button {
                     Task { await manager.goUp() }
+                } label: {
+                    Label("Up", systemImage: "arrow.up")
                 }
+                .buttonStyle(.bordered)
                 .disabled(!manager.canGoBack)
 
                 Menu {
@@ -298,7 +325,7 @@ struct ContentView: View {
                 } label: {
                     Label(currentFolderName, systemImage: "folder")
                 }
-                .menuStyle(.borderlessButton)
+                .menuStyle(.button)
                 .help("Go to a folder in the current path")
 
                 Spacer()
@@ -312,9 +339,6 @@ struct ContentView: View {
                 .pickerStyle(.menu)
                 .fixedSize()
 
-                Text(manager.isReadOnly ? "This image is read-only" : (isDropTarget ? "Drop files here to add them to the volume" : "Drag files here from Finder to copy floppy treasures into the mounted volume"))
-                    .font(.caption)
-                    .foregroundColor(.secondary)
             }
             .padding(.horizontal)
             .padding(.bottom, 8)
@@ -435,8 +459,10 @@ struct ContentView: View {
             presentNewFolderPrompt()
         }
         .disabled(manager.isReadOnly)
-        Button(isPartOfSelection ? "Delete \(manager.selectedEntries.count) Items" : "Delete", role: .destructive) {
+        Button(role: .destructive) {
             deleteConfirmationEntries = isPartOfSelection ? manager.selectedEntries : [entry]
+        } label: {
+            Label(isPartOfSelection ? "Delete \(manager.selectedEntries.count) Items" : "Delete", systemImage: "trash")
         }
         .disabled(entry.url == manager.currentDirectory || manager.isReadOnly)
     }
@@ -514,11 +540,13 @@ struct ContentView: View {
                 let totalSize = entries.compactMap { $0.size }.reduce(0, +)
                 inspectorRow("Total size", value: ByteCountFormatter.string(fromByteCount: Int64(totalSize), countStyle: .file))
                 Spacer()
-                Button("Delete Selected") {
+                Button {
                     deleteConfirmationEntries = entries
+                } label: {
+                    Label("Delete Selected", systemImage: "trash")
                 }
                 .buttonStyle(.borderedProminent)
-                .foregroundColor(.red)
+                .tint(.red)
                 .disabled(manager.isReadOnly)
             } else if let entry = manager.selectedEntry {
                 Text(entry.name)
@@ -557,11 +585,13 @@ struct ContentView: View {
                     .font(.headline)
                 }
                 Spacer()
-                Button("Delete This Item") {
+                Button {
                     deleteConfirmationEntries = [entry]
+                } label: {
+                    Label("Delete This Item", systemImage: "trash")
                 }
                 .buttonStyle(.borderedProminent)
-                .foregroundColor(.red)
+                .tint(.red)
                 .disabled(manager.isReadOnly)
             } else {
                 Text("Select a file or folder to see details.")
