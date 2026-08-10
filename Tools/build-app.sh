@@ -49,9 +49,11 @@ cp "$DOC_ICON" "$OUTDIR/Contents/Resources/DiskImageDocument.icns"
 
 # SwiftPM keeps processed assets and the bundled help README in a companion resource bundle.
 # Preserve it inside the application so `Bundle.module` works in packaged release builds too.
+# The generated accessor looks for it next to Bundle.main.bundleURL, i.e. at the top level
+# of the .app (a sibling of Contents/), not inside Contents/Resources.
 RESOURCE_BUNDLE=$(find .build -path '*/release/FloppyFox_FloppyFox.bundle' -type d -print -quit)
 if [ -n "$RESOURCE_BUNDLE" ]; then
-  cp -R "$RESOURCE_BUNDLE" "$OUTDIR/Contents/Resources/"
+  cp -R "$RESOURCE_BUNDLE" "$OUTDIR/"
 fi
 
 cat > "$OUTDIR/Contents/Info.plist" <<PLIST
