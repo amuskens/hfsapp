@@ -71,6 +71,26 @@ cat > "$OUTDIR/Contents/Info.plist" <<PLIST
   <string>NSApplication</string>
   <key>CFBundleIconFile</key>
   <string>AppIcon.icns</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>HFS Disk Image</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>dsk</string>
+        <string>img</string>
+        <string>hda</string>
+        <string>vhd</string>
+      </array>
+      <key>CFBundleTypeIconFile</key>
+      <string>AppIcon.icns</string>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST

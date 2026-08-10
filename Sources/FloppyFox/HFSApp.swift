@@ -20,6 +20,12 @@ struct FloppyFoxApp: App {
                     // Activate the app so it shows in the Dock and receives key events
                     NSApplication.shared.activate(ignoringOtherApps: true)
                 }
+                .onOpenURL { url in
+                    // Fires when a registered disk image type (see CFBundleDocumentTypes in
+                    // Tools/build-app.sh) is opened via double-click, "Open With", or dropped
+                    // onto the Dock icon.
+                    Task { await manager.attachImage(imageURL: url) }
+                }
         }
         .commands {
             CommandGroup(replacing: .appInfo) {
