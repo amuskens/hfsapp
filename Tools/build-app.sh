@@ -4,8 +4,10 @@ set -euo pipefail
 OUTDIR=./Build/FloppyFox.app
 ICONSET=./Build/FloppyFox.iconset
 ICON=./Build/FloppyFox.icns
+DOC_ICONSET=./Build/FloppyFoxDoc.iconset
+DOC_ICON=./Build/FloppyFoxDoc.icns
 
-rm -rf "$OUTDIR" "$ICONSET" "$ICON"
+rm -rf "$OUTDIR" "$ICONSET" "$ICON" "$DOC_ICONSET" "$DOC_ICON"
 
 echo "Building release executable..."
 swift build -c release
@@ -30,8 +32,20 @@ fi
 
 iconutil -c icns "$ICONSET" -o "$ICON"
 
+mkdir -p "$DOC_ICONSET"
+echo Generating disk image document iconset...
+Tools/generate_doc_icon.swift "$DOC_ICONSET"
+
+if [ ! -d "$DOC_ICONSET" ]; then
+  echo "Document iconset not created"
+  exit 1
+fi
+
+iconutil -c icns "$DOC_ICONSET" -o "$DOC_ICON"
+
 mkdir -p "$OUTDIR/Contents/Resources"
 cp "$ICON" "$OUTDIR/Contents/Resources/AppIcon.icns"
+cp "$DOC_ICON" "$OUTDIR/Contents/Resources/DiskImageDocument.icns"
 
 # SwiftPM keeps processed assets and the bundled help README in a companion resource bundle.
 # Preserve it inside the application so `Bundle.module` works in packaged release builds too.
@@ -88,7 +102,7 @@ cat > "$OUTDIR/Contents/Info.plist" <<PLIST
         <string>vhd</string>
       </array>
       <key>CFBundleTypeIconFile</key>
-      <string>AppIcon.icns</string>
+      <string>DiskImageDocument.icns</string>
     </dict>
   </array>
 </dict>
