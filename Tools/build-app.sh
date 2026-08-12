@@ -66,7 +66,7 @@ cat > "$OUTDIR/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key>
   <string>FloppyFox</string>
   <key>CFBundleIdentifier</key>
-  <string>com.example.FloppyFox</string>
+  <string>com.andersmuskens.FloppyFox</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -113,3 +113,36 @@ PLIST
 
 echo Built app bundle at $OUTDIR
 chmod +x "$OUTDIR/Contents/MacOS/FloppyFox"
+
+# Signing and notarization only run when the caller opts in, so plain dev builds
+# (no Developer ID cert / keychain profile available) keep working untouched.
+if [ -n "${SIGN_IDENTITY:-}" ]; then
+  echo "Code signing with identity: $SIGN_IDENTITY"
+  codesign --force --deep --options runtime --timestamp \
+    --entitlements Tools/FloppyFox.entitlements \
+    --sign "$SIGN_IDENTITY" "$OUTDIR"
+
+  echo "Verifying signature..."
+  codesign --verify --deep --strict --verbose=2 "$OUTDIR"
+
+  if [ -n "${NOTARY_PROFILE:-}" ]; then
+    ZIP=./Build/FloppyFox-notarize.zip
+    rm -f "$ZIP"
+    echo "Zipping app for notarization..."
+    ditto -c -k --keepParent "$OUTDIR" "$ZIP"
+
+    echo "Submitting to Apple notary service (this can take a few minutes)..."
+    xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+
+    echo "Stapling notarization ticket..."
+    xcrun stapler staple "$OUTDIR"
+
+    rm -f "$ZIP"
+  else
+    echo "NOTARY_PROFILE not set; skipping notarization. Set it to notarize and staple."
+  fi
+else
+  echo "SIGN_IDENTITY not set; skipping code signing and notarization."
+  echo "Set SIGN_IDENTITY=\"Developer ID Application: Your Name (TEAMID)\" to sign,"
+  echo "and NOTARY_PROFILE=<keychain profile name> to also notarize."
+fi
