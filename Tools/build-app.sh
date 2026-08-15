@@ -6,8 +6,10 @@ ICONSET=./Build/FloppyFox.iconset
 ICON=./Build/FloppyFox.icns
 DOC_ICONSET=./Build/FloppyFoxDoc.iconset
 DOC_ICON=./Build/FloppyFoxDoc.icns
+HD_ICONSET=./Build/FloppyFoxHDDoc.iconset
+HD_ICON=./Build/FloppyFoxHDDoc.icns
 
-rm -rf "$OUTDIR" "$ICONSET" "$ICON" "$DOC_ICONSET" "$DOC_ICON"
+rm -rf "$OUTDIR" "$ICONSET" "$ICON" "$DOC_ICONSET" "$DOC_ICON" "$HD_ICONSET" "$HD_ICON"
 
 echo "Building release executable..."
 swift build -c release
@@ -43,9 +45,21 @@ fi
 
 iconutil -c icns "$DOC_ICONSET" -o "$DOC_ICON"
 
+mkdir -p "$HD_ICONSET"
+echo Generating hard disk image document iconset...
+Tools/generate_hd_doc_icon.swift "$HD_ICONSET"
+
+if [ ! -d "$HD_ICONSET" ]; then
+  echo "Hard disk iconset not created"
+  exit 1
+fi
+
+iconutil -c icns "$HD_ICONSET" -o "$HD_ICON"
+
 mkdir -p "$OUTDIR/Contents/Resources"
 cp "$ICON" "$OUTDIR/Contents/Resources/AppIcon.icns"
 cp "$DOC_ICON" "$OUTDIR/Contents/Resources/DiskImageDocument.icns"
+cp "$HD_ICON" "$OUTDIR/Contents/Resources/HardDiskImageDocument.icns"
 
 # SwiftPM keeps processed assets and the bundled help README in a companion resource bundle.
 # Preserve it inside the application so `Bundle.module` works in packaged release builds too.
@@ -91,7 +105,7 @@ cat > "$OUTDIR/Contents/Info.plist" <<PLIST
   <array>
     <dict>
       <key>CFBundleTypeName</key>
-      <string>HFS Disk Image</string>
+      <string>HFS Floppy Disk Image</string>
       <key>CFBundleTypeRole</key>
       <string>Editor</string>
       <key>LSHandlerRank</key>
@@ -100,11 +114,24 @@ cat > "$OUTDIR/Contents/Info.plist" <<PLIST
       <array>
         <string>dsk</string>
         <string>img</string>
+      </array>
+      <key>CFBundleTypeIconFile</key>
+      <string>DiskImageDocument.icns</string>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>HFS Hard Disk Image</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>CFBundleTypeExtensions</key>
+      <array>
         <string>hda</string>
         <string>vhd</string>
       </array>
       <key>CFBundleTypeIconFile</key>
-      <string>DiskImageDocument.icns</string>
+      <string>HardDiskImageDocument.icns</string>
     </dict>
   </array>
 </dict>
