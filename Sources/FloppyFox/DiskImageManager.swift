@@ -149,8 +149,12 @@ extension Notification.Name {
     static let didCreateDiagnosticsFile = Notification.Name("didCreateDiagnosticsFile")
 }
 
+// `@unchecked Sendable` so `self` can be captured into the detached copy tasks below (only
+// ever touched there via `await self.isTransferCancelled(...)`, which re-enters the main
+// actor) — every stored property remains MainActor-isolated and is otherwise never accessed
+// off that actor.
 @MainActor
-final class DiskImageManager: ObservableObject {
+final class DiskImageManager: ObservableObject, @unchecked Sendable {
     @Published var imageURL: URL?
     @Published var mountPoint: URL?
     @Published var mountedDevice: String?
@@ -1547,10 +1551,10 @@ final class DiskImageManager: ObservableObject {
     private func exportOneFile(_ entry: FileEntry, to destination: URL, progressID: UUID? = nil) async -> Result<Void, Error> {
         if isMounted {
             do {
-                try await Task.detached(priority: .userInitiated) {
-                    try Self.copyItem(from: entry.url, to: destination)
-                }.value
+                try await copyEntryCancelable(from: entry.url, to: destination, progressID: progressID)
                 return .success(())
+            } catch is CancellationError {
+                return .failure(CancellationError())
             } catch {
                 return .failure(DiskImageError.exportFailed(entry.url, error))
             }
@@ -1770,9 +1774,10 @@ final class DiskImageManager: ObservableObject {
                     }
                     updateTransfer(progressID, message: "Adding \(source.lastPathComponent)…")
                     do {
-                        renamedItemCount += try await Task.detached(priority: .userInitiated) {
-                            try Self.copyHostItemToMountedHFS(source, parent: destination)
-                        }.value
+                        renamedItemCount += try await importHostItemCancelable(source, parent: destination, progressID: progressID)
+                    } catch is CancellationError {
+                        statusMessage = "Import cancelled"
+                        return
                     } catch {
                         self.errorMessage = DiskImageError.importFailed(source, error).localizedDescription
                         return
@@ -1964,34 +1969,103 @@ final class DiskImageManager: ObservableObject {
         }
     }
 
-    private nonisolated static func copyItem(from source: URL, to destination: URL) throws {
-        if FileManager.default.fileExists(atPath: destination.path) {
+    /// Copies `source` to `destination` a chunk at a time, checking `shouldCancel` between
+    /// chunks — unlike `FileManager.copyItem`, which carries out a whole file (or, worse, a
+    /// whole directory tree) as one uninterruptible blocking call. That was the reason Cancel
+    /// had no effect on a transfer already under way: for a single file there's no next loop
+    /// iteration to catch a cancellation flag, so the copy always ran to completion and
+    /// reported success no matter what the user clicked. The partially written destination is
+    /// removed whenever the copy doesn't finish — cancellation, yes, but also a genuine I/O
+    /// failure partway through (a full destination volume, a source read error, ...):
+    /// leaving a truncated file behind in that case would look like a real, if oddly-sized,
+    /// file rather than the failed transfer it actually is.
+    nonisolated static func copyFileChunked(
+        from source: URL,
+        to destination: URL,
+        chunkSize: Int = 4 * 1024 * 1024,
+        shouldCancel: @Sendable () async -> Bool
+    ) async throws {
+        guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError, userInfo: [NSLocalizedDescriptionKey: "Could not create \(destination.lastPathComponent)."])
+        }
+        do {
+            let inHandle = try FileHandle(forReadingFrom: source)
+            let outHandle = try FileHandle(forWritingTo: destination)
+            defer {
+                try? inHandle.close()
+                try? outHandle.close()
+            }
+            while true {
+                if await shouldCancel() {
+                    throw CancellationError()
+                }
+                let chunk = try inHandle.read(upToCount: chunkSize) ?? Data()
+                if chunk.isEmpty { break }
+                try outHandle.write(contentsOf: chunk)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
+    }
+
+    /// Copies a mounted-volume entry (file or folder) out to `destination`, checking for
+    /// cancellation before every item and periodically during a large file's own copy — the
+    /// export-side counterpart to `importHostItemCancelable` below. Directories are walked by
+    /// hand instead of handed to `FileManager.copyItem` so each child gets its own
+    /// cancellation check rather than the whole tree running as one blocking call.
+    private func copyEntryCancelable(from source: URL, to destination: URL, progressID: UUID?) async throws {
+        try checkCancellation(progressID)
+        guard !fileManager.fileExists(atPath: destination.path) else {
             throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteFileExistsError, userInfo: [NSLocalizedDescriptionKey: "Destination already exists."])
         }
-        try FileManager.default.copyItem(at: source, to: destination)
+        let isDirectory = (try? source.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+        if isDirectory {
+            try fileManager.createDirectory(at: destination, withIntermediateDirectories: false)
+            for child in try fileManager.contentsOfDirectory(at: source, includingPropertiesForKeys: [.isDirectoryKey]) {
+                try checkCancellation(progressID)
+                try await copyEntryCancelable(from: child, to: destination.appendingPathComponent(child.lastPathComponent), progressID: progressID)
+            }
+            return
+        }
+        try await Task.detached(priority: .userInitiated) { [self] in
+            try await Self.copyFileChunked(from: source, to: destination) {
+                await self.isTransferCancelled(progressID)
+            }
+        }.value
     }
 
     /// Copies a host tree one component at a time so mounted HFS volumes receive the same
     /// validated names as the hfsutils backend instead of relying on filesystem-driver
-    /// truncation or lossy Unicode conversion.
-    private nonisolated static func copyHostItemToMountedHFS(_ source: URL, parent: URL) throws -> Int {
-        let safeName = classicHFSName(from: source.lastPathComponent)
+    /// truncation or lossy Unicode conversion — and, like `copyEntryCancelable` above, checks
+    /// for cancellation before every item and periodically during a large file's own copy.
+    private func importHostItemCancelable(_ source: URL, parent: URL, progressID: UUID?) async throws -> Int {
+        try checkCancellation(progressID)
+        let safeName = Self.classicHFSName(from: source.lastPathComponent)
         let destination = parent.appendingPathComponent(safeName)
-        guard !FileManager.default.fileExists(atPath: destination.path) else {
+        guard !fileManager.fileExists(atPath: destination.path) else {
             throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteFileExistsError, userInfo: [NSLocalizedDescriptionKey: "Destination already exists."])
         }
 
         let isDirectory = try source.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
         var renamedCount = safeName == source.lastPathComponent ? 0 : 1
         if isDirectory {
-            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
-            for child in try FileManager.default.contentsOfDirectory(at: source, includingPropertiesForKeys: [.isDirectoryKey]) {
-                renamedCount += try copyHostItemToMountedHFS(child, parent: destination)
+            try fileManager.createDirectory(at: destination, withIntermediateDirectories: false)
+            for child in try fileManager.contentsOfDirectory(at: source, includingPropertiesForKeys: [.isDirectoryKey]) {
+                renamedCount += try await importHostItemCancelable(child, parent: destination, progressID: progressID)
             }
         } else {
-            try FileManager.default.copyItem(at: source, to: destination)
+            try await Task.detached(priority: .userInitiated) { [self] in
+                try await Self.copyFileChunked(from: source, to: destination) {
+                    await self.isTransferCancelled(progressID)
+                }
+            }.value
         }
         return renamedCount
+    }
+
+    private func isTransferCancelled(_ id: UUID?) -> Bool {
+        (try? checkCancellation(id)) == nil
     }
 
     /// Extracts the colon-separated HFS path from one of our synthetic
