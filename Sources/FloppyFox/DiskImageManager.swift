@@ -939,9 +939,17 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
             if usingHFSUtils {
                 // Best-effort: explicitly release the hfsutils-level lock rather than relying
                 // on it being implicitly dropped when the last hmount/hcopy/hdel process
-                // exited, in case anything is still outstanding.
+                // exited, in case anything is still outstanding. Routed through the same
+                // `serializedHFSUtilsOperation` queue as every other hmount/hcopy/hdel/humount
+                // call site — this humount used to fire directly, so clicking Eject (never
+                // disabled while a transfer is running) while an import/export/delete/move was
+                // mid hmount...hcopy...humount could interleave an out-of-order humount into
+                // that in-flight sequence, exactly the cross-process race
+                // `serializedHFSUtilsOperation`'s own documentation warns about.
                 if let humount = humountPath {
-                    _ = await runCommand([humount])
+                    _ = try? await serializedHFSUtilsOperation { [self] in
+                        await runCommand([humount])
+                    }
                 }
                 sessionID = UUID()
                 cleanupTempCopyIfAny()
@@ -1767,27 +1775,43 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
             defer { endTransfer(progressID) }
             if isMounted {
                 var renamedItemCount = 0
+                var wasCancelled = false
+                var failureMessage: String?
                 for source in urls {
                     guard (try? checkCancellation(progressID)) != nil else {
-                        statusMessage = "Import cancelled"
-                        return
+                        wasCancelled = true
+                        break
                     }
                     updateTransfer(progressID, message: "Adding \(source.lastPathComponent)…")
                     do {
                         renamedItemCount += try await importHostItemCancelable(source, parent: destination, progressID: progressID)
                     } catch is CancellationError {
-                        statusMessage = "Import cancelled"
-                        return
+                        wasCancelled = true
+                        break
                     } catch {
-                        self.errorMessage = DiskImageError.importFailed(source, error).localizedDescription
-                        return
+                        failureMessage = DiskImageError.importFailed(source, error).localizedDescription
+                        break
                     }
                 }
-                statusMessage = urls.count == 1 ? "Added \(urls[0].lastPathComponent)" : "Added \(urls.count) items"
-                if renamedItemCount > 0 {
-                    statusMessage += " (renamed \(renamedItemCount) for classic HFS compatibility)"
-                }
+                // However the loop ended, anything that landed before the stopping point is
+                // real, on-disk content — refresh so the browser reflects it instead of quietly
+                // going stale (previously an early `return` here skipped `refresh()`
+                // altogether, leaving already-imported files invisible until some unrelated
+                // action happened to reload the listing). Refresh *before* setting the final
+                // status/error message, not after: a successful `loadDirectory` unconditionally
+                // clears `errorMessage`, so refreshing afterward would silently wipe out a
+                // just-set failure message.
                 await refresh()
+                if wasCancelled {
+                    statusMessage = "Import cancelled"
+                } else if let failureMessage {
+                    self.errorMessage = failureMessage
+                } else {
+                    statusMessage = urls.count == 1 ? "Added \(urls[0].lastPathComponent)" : "Added \(urls.count) items"
+                    if renamedItemCount > 0 {
+                        statusMessage += " (renamed \(renamedItemCount) for classic HFS compatibility)"
+                    }
+                }
                 return
             }
 
@@ -1804,10 +1828,12 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
 
             let destPath = currentHFSPath ?? ":"
             var renamedItemCount = 0
+            var wasCancelled = false
+            var failureMessage: String?
             for source in urls {
                 guard (try? checkCancellation(progressID)) != nil else {
-                    statusMessage = "Import cancelled"
-                    return
+                    wasCancelled = true
+                    break
                 }
                 updateTransfer(progressID, message: "Adding \(source.lastPathComponent)…")
                 var hostSource = source
@@ -1845,18 +1871,31 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
                         try? fileManager.removeItem(at: tempDirToCleanUp)
                     }
                     if error is CancellationError {
-                        statusMessage = "Import cancelled"
-                        return
+                        wasCancelled = true
+                        break
                     }
-                    self.errorMessage = DiskImageError.importFailed(source, error).localizedDescription
-                    return
+                    failureMessage = DiskImageError.importFailed(source, error).localizedDescription
+                    break
                 }
             }
-            statusMessage = urls.count == 1 ? "Added \(urls[0].lastPathComponent)" : "Added \(urls.count) items"
-            if renamedItemCount > 0 {
-                statusMessage += " (renamed \(renamedItemCount) for classic HFS compatibility)"
-            }
+            // However the loop ended, anything that landed before the stopping point is real,
+            // on-disk content — refresh so the browser reflects it instead of quietly going
+            // stale (previously an early `return` here skipped `refresh()` altogether, leaving
+            // already-imported files invisible until some unrelated action happened to reload
+            // the listing). Refresh *before* setting the final status/error message, not after:
+            // a successful `loadDirectory` unconditionally clears `errorMessage`, so refreshing
+            // afterward would silently wipe out a just-set failure message.
             await refresh()
+            if wasCancelled {
+                statusMessage = "Import cancelled"
+            } else if let failureMessage {
+                self.errorMessage = failureMessage
+            } else {
+                statusMessage = urls.count == 1 ? "Added \(urls[0].lastPathComponent)" : "Added \(urls.count) items"
+                if renamedItemCount > 0 {
+                    statusMessage += " (renamed \(renamedItemCount) for classic HFS compatibility)"
+                }
+            }
         }
     }
 

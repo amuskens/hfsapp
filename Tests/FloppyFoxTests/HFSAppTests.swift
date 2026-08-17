@@ -594,6 +594,135 @@ final class FloppyFoxTests: XCTestCase {
         XCTAssertEqual(beforeDigest, afterDigest, "the source image's bytes changed after a cancelled export — export must only ever read from it")
     }
 
+    /// The "Eject" button stays enabled while a transfer is in progress (it's only disabled
+    /// when nothing is mounted at all — see `ContentView.header`), and `ejectImage()`'s
+    /// hfsutils branch calls `humount` directly rather than through
+    /// `serializedHFSUtilsOperation`, unlike every other hmount/hcopy/hdel/humount call site in
+    /// the file. Every one of those *other* call sites is deliberately serialized because
+    /// hfsutils tracks "the current volume" as global state shared across every subprocess
+    /// invocation, and interleaving two hmount/humount sequences is exactly the corruption mode
+    /// the existing `hfsUtilsQueueTail` machinery was built to prevent. This reproduces the race
+    /// for real: eject a real fixture copy while a large import batch is still mid-flight, then
+    /// checks the volume is still readable and its pre-existing content is intact afterward.
+    func testEjectingWhileImportInFlightDoesNotCorruptVolume() async throws {
+        let fixtureName = "HD1 BlueSCSI Bootstrap.hda"
+        let fixture = repoRootFixture(fixtureName)
+        guard FileManager.default.fileExists(atPath: fixture.path) else {
+            throw XCTSkip("Real fixture \(fixtureName) not present in the repo root on this machine")
+        }
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("floppyfox-eject-race-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workDir) }
+        let workingCopy = workDir.appendingPathComponent(fixtureName)
+        try FileManager.default.copyItem(at: fixture, to: workingCopy)
+
+        let manager = DiskImageManager()
+        await manager.attachImage(imageURL: workingCopy)
+        XCTAssertNil(manager.errorMessage)
+        XCTAssertTrue(manager.usingHFSUtils)
+
+        guard let baselineEntry = manager.entries.first(where: { $0.name == "BlueSCSI Bootstrap Usage" }) else {
+            XCTFail("expected the baseline file on the fixture"); return
+        }
+        guard let baselineURL = await manager.materializeForPreview(baselineEntry) else {
+            XCTFail("failed to extract baseline file"); return
+        }
+        let baselineContent = try Data(contentsOf: baselineURL)
+
+        let sources = (1...80).map { index -> URL in
+            let url = workDir.appendingPathComponent("eject-race-\(index).txt")
+            return url
+        }
+        for url in sources {
+            try "payload".write(to: url, atomically: true, encoding: .utf8)
+        }
+
+        let importTask = Task { await manager.importFiles(urls: sources, destination: workDir) }
+        // Each item runs a real hmount+hcopy+humount subprocess sequence (spawn/exec/wait, not
+        // instant) inside the serialized hfsutils queue. Firing the eject the instant we see
+        // *any* progress message — rather than after a fixed guess of a delay — reliably lands
+        // it while some item's subprocess sequence is still actually running, which is the
+        // real-world timing of a user clicking Eject partway through watching a big import.
+        let deadline = Date().addingTimeInterval(30)
+        while manager.transferMessage == nil, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertNotNil(manager.transferMessage, "expected the import to still be in progress before ejecting")
+        async let ejectResult: Void = manager.ejectImage()
+        await importTask.value
+        await ejectResult
+
+        // Whatever the outcome (error, partial completion, clean cancellation), the volume
+        // must still be intact: reattaching fresh must succeed, list correctly, and the
+        // pre-existing baseline file must be byte-identical to before the race.
+        let manager2 = DiskImageManager()
+        await manager2.attachImage(imageURL: workingCopy)
+        addTeardownBlock { await manager2.ejectImage() }
+        XCTAssertNil(manager2.errorMessage, "volume failed to reattach after an eject raced against an in-flight import — possible corruption")
+        XCTAssertFalse(manager2.entries.isEmpty, "volume listed no entries after the race — possible catalog corruption")
+        guard let baselineAfter = manager2.entries.first(where: { $0.name == "BlueSCSI Bootstrap Usage" }),
+              let afterURL = await manager2.materializeForPreview(baselineAfter) else {
+            XCTFail("failed to extract baseline file after the race"); return
+        }
+        XCTAssertEqual(try Data(contentsOf: afterURL), baselineContent, "pre-existing content damaged after an eject raced against an in-flight import")
+    }
+
+    /// `importFiles` must refresh `entries` after *any* early exit from its per-item loop, not
+    /// just a full success. Found while corruption-testing against the real
+    /// "HD1 BlueSCSI Bootstrap.hda" fixture: cancelling a multi-file import partway through
+    /// `return`ed immediately without calling `refresh()`, so files that had genuinely already
+    /// landed on disk stayed invisible in the browser — a real-vs-displayed state mismatch
+    /// that could plausibly cause a later import of the same name to fail with a confusing
+    /// "already exists" error for a file the user can't even see. The same bug applied to a
+    /// genuine per-item error mid-batch, not just cancellation.
+    func testImportRefreshesEntriesAfterCancellationEvenWithPartialProgress() async throws {
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("floppyfox-import-refresh-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workDir) }
+
+        let imageURL = workDir.appendingPathComponent("refresh.dmg")
+        let create = Process()
+        create.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+        create.arguments = ["create", "-size", "200m", "-fs", "HFS+", "-volname", "FloppyFoxRefreshTest", imageURL.path]
+        create.standardOutput = Pipe()
+        create.standardError = Pipe()
+        try create.run()
+        create.waitUntilExit()
+        guard create.terminationStatus == 0 else {
+            throw XCTSkip("hdiutil create is unavailable in this environment")
+        }
+
+        let manager = DiskImageManager()
+        await manager.attachImage(imageURL: imageURL)
+        addTeardownBlock { await manager.ejectImage() }
+        XCTAssertNil(manager.errorMessage)
+        guard let mountPoint = manager.mountPoint else {
+            XCTFail("expected a mount point once attached"); return
+        }
+
+        // A small file (completes essentially instantly) followed by a large one (still
+        // mid-copy when we cancel a few milliseconds in) — the small one must show up in
+        // `entries` immediately after `importFiles` returns, with no extra manual refresh.
+        let smallFile = workDir.appendingPathComponent("landed-before-cancel.txt")
+        try "this should be visible".write(to: smallFile, atomically: true, encoding: .utf8)
+        let bigFile = workDir.appendingPathComponent("still-copying-when-cancelled.bin")
+        try Data(repeating: 0x33, count: 150 * 1024 * 1024).write(to: bigFile)
+
+        let importTask = Task { await manager.importFiles(urls: [smallFile, bigFile], destination: mountPoint) }
+        try await Task.sleep(for: .milliseconds(5))
+        manager.cancelActiveTransfer()
+        await importTask.value
+
+        XCTAssertEqual(manager.statusMessage, "Import cancelled")
+        XCTAssertTrue(
+            manager.entries.contains(where: { $0.name == "landed-before-cancel.txt" }),
+            "a file that successfully landed before cancellation should be visible in `entries` immediately, without a separate manual refresh"
+        )
+        XCTAssertFalse(manager.entries.contains(where: { $0.name == "still-copying-when-cancelled.bin" }))
+    }
+
     /// A real disk-full write failure — not a cancellation — partway through a chunked copy
     /// must be cleaned up exactly like a cancelled one. Found empirically while testing
     /// `copyFileChunked`: the original implementation only removed the partial destination
@@ -660,6 +789,238 @@ final class FloppyFoxTests: XCTestCase {
         XCTAssertNil(manager.errorMessage)
         XCTAssertTrue(FileManager.default.fileExists(atPath: mountPoint.appendingPathComponent("after.txt").path))
     }
+
+    /// Smoke test confirming all four real period-accurate fixtures still open cleanly — a
+    /// regression here would mean something in attach/hfsutils-detection broke for real-world
+    /// images, as opposed to the synthetic ones the other tests build with `hdiutil create`.
+    func testRealFixturesAllOpenSuccessfully() async throws {
+        for name in Self.realFixtureNames {
+            let url = repoRootFixture(name)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw XCTSkip("Real fixture \(name) not present in the repo root on this machine")
+            }
+            let manager = DiskImageManager()
+            await manager.attachImage(imageURL: url)
+            addTeardownBlock { await manager.ejectImage() }
+            XCTAssertNil(manager.errorMessage, "\(name) failed to attach: \(manager.errorMessage ?? "")")
+            XCTAssertFalse(manager.entries.isEmpty, "\(name) attached but listed no entries")
+        }
+    }
+
+    private static let realFixtureNames = [
+        "HD1 BlueSCSI Bootstrap.hda",
+        "StuffIt Deluxe 3.0.7 Disk 1.dsk",
+        "StuffIt Deluxe 3.0.7 Disk 2.dsk",
+        "boot.vhd",
+    ]
+
+    /// The StuffIt Deluxe floppy fixtures ship almost completely full (a handful of KB free on
+    /// an 800K disk) — a perfect real-world trigger for a volume-full write failure, rather
+    /// than the synthetic near-empty volume `testWriteFailureMidCopyCleansUpPartialFileAndLeavesVolumeUsable`
+    /// used. Confirms hfsutils's `hcopy` failing partway (or refusing up front) doesn't corrupt
+    /// the existing installer file already on the disk, and that the volume is still usable
+    /// afterward.
+    func testNearlyFullFloppyRejectsOversizedImportWithoutCorruption() async throws {
+        let fixtureName = "StuffIt Deluxe 3.0.7 Disk 1.dsk"
+        let fixture = repoRootFixture(fixtureName)
+        guard FileManager.default.fileExists(atPath: fixture.path) else {
+            throw XCTSkip("Real fixture \(fixtureName) not present in the repo root on this machine")
+        }
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("floppyfox-realfixture-full-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workDir) }
+        let workingCopy = workDir.appendingPathComponent(fixtureName)
+        try FileManager.default.copyItem(at: fixture, to: workingCopy)
+
+        let manager = DiskImageManager()
+        await manager.attachImage(imageURL: workingCopy)
+        addTeardownBlock { await manager.ejectImage() }
+        XCTAssertNil(manager.errorMessage)
+        XCTAssertTrue(manager.usingHFSUtils)
+
+        guard let installer = manager.entries.first(where: { $0.name.contains("Installer") }) else {
+            XCTFail("expected the StuffIt installer file on the fixture floppy"); return
+        }
+        guard let baselineURL = await manager.materializeForPreview(installer) else {
+            XCTFail("failed to extract baseline installer file"); return
+        }
+        let baselineContent = try Data(contentsOf: baselineURL)
+        XCTAssertFalse(baselineContent.isEmpty)
+        let baselineEntryCount = manager.entries.count
+
+        // The fixture ships with only a few KB free — anything beyond a trivial file exceeds
+        // capacity.
+        let oversizedURL = workDir.appendingPathComponent("toobig.bin")
+        try Data(repeating: 0x99, count: 512 * 1024).write(to: oversizedURL)
+        await manager.importFiles(urls: [oversizedURL], destination: workDir)
+        XCTAssertNotNil(manager.errorMessage, "expected an error importing a 512KB file onto a floppy with only a few KB free")
+
+        // The pre-existing installer must be untouched, and the volume must not have gained a
+        // corrupt/incomplete "toobig.bin" catalog entry.
+        guard let installerAfter = manager.entries.first(where: { $0.name.contains("Installer") }),
+              let afterURL = await manager.materializeForPreview(installerAfter) else {
+            XCTFail("failed to extract the installer file after the failed import"); return
+        }
+        XCTAssertEqual(try Data(contentsOf: afterURL), baselineContent, "pre-existing installer content changed after a failed (volume-full) import")
+        XCTAssertFalse(manager.entries.contains(where: { $0.name.hasPrefix("toobig") }), "a failed import should not leave a partial catalog entry behind")
+        XCTAssertEqual(manager.entries.count, baselineEntryCount, "entry count changed even though the import should have failed cleanly")
+
+        // Confirm the volume is still genuinely usable — not left wedged by the failed write —
+        // by attempting to import something that actually fits.
+        let tinyURL = workDir.appendingPathComponent("tiny.txt")
+        try "ok".write(to: tinyURL, atomically: true, encoding: .utf8)
+        await manager.importFiles(urls: [tinyURL], destination: workDir)
+        // Even a trivial file may still not fit in a few KB once catalog overhead is
+        // accounted for — what matters is that the outcome is either a clean success or a
+        // clean, non-corrupting failure, never silent damage. Either way the installer must
+        // still be intact.
+        guard let installerFinal = manager.entries.first(where: { $0.name.contains("Installer") }),
+              let finalURL = await manager.materializeForPreview(installerFinal) else {
+            XCTFail("installer file disappeared entirely after further use of a full volume"); return
+        }
+        XCTAssertEqual(try Data(contentsOf: finalURL), baselineContent, "installer content damaged after further activity on the full volume")
+    }
+
+    /// Cancels mid-batch imports and a mid-folder export against a disposable copy of the real
+    /// "HD1 BlueSCSI Bootstrap.hda" fixture (a real multi-folder BlueSCSI installer disk, ~512MB)
+    /// and confirms nothing on the volume was damaged — the same shape of test as the earlier
+    /// OpenRetroSCSI-based corruption tests, but against a different, independently-sourced real
+    /// image to widen coverage.
+    func testHD1BlueSCSIBootstrapSurvivesCancelledTransfers() async throws {
+        try await assertRealFixtureSurvivesCancelledTransfers(
+            fixtureName: "HD1 BlueSCSI Bootstrap.hda",
+            baselineFileName: "BlueSCSI Bootstrap Usage",
+            exportFolderName: "Fresh OS Installs"
+        )
+    }
+
+    /// Same treatment as `testHD1BlueSCSIBootstrapSurvivesCancelledTransfers`, but for the real
+    /// "boot.vhd" fixture — a genuine multi-System-Folder bootable Mac hard disk (~1.6GB), and
+    /// notably a `.vhd`-named file that (verified in `testRealFixturesAllOpenSuccessfully`'s
+    /// setup) has no actual VHD container footer, exercising `VHDImage`'s raw-passthrough path
+    /// with real data rather than only the synthetic fixture in `testTreatsNonContainerVHDAsRawImage`.
+    func testBootVHDSurvivesCancelledTransfers() async throws {
+        try await assertRealFixtureSurvivesCancelledTransfers(
+            fixtureName: "boot.vhd",
+            baselineFileName: "MacPack ReadMe",
+            exportFolderName: "System 6.0.5"
+        )
+    }
+
+    private func assertRealFixtureSurvivesCancelledTransfers(
+        fixtureName: String,
+        baselineFileName: String,
+        exportFolderName: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let fixture = repoRootFixture(fixtureName)
+        guard FileManager.default.fileExists(atPath: fixture.path) else {
+            throw XCTSkip("Real fixture \(fixtureName) not present in the repo root on this machine")
+        }
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("floppyfox-realfixture-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workDir) }
+        let workingCopy = workDir.appendingPathComponent(fixtureName)
+        try FileManager.default.copyItem(at: fixture, to: workingCopy)
+
+        let manager = DiskImageManager()
+        await manager.attachImage(imageURL: workingCopy)
+        addTeardownBlock { await manager.ejectImage() }
+        XCTAssertNil(manager.errorMessage, file: file, line: line)
+        XCTAssertTrue(manager.usingHFSUtils, file: file, line: line)
+        let baselineEntryNames = Set(manager.entries.map(\.name))
+
+        guard let baselineEntry = manager.entries.first(where: { $0.name == baselineFileName }) else {
+            XCTFail("expected \(baselineFileName) on \(fixtureName)", file: file, line: line); return
+        }
+        guard let baselineURL = await manager.materializeForPreview(baselineEntry) else {
+            XCTFail("failed to extract baseline \(baselineFileName)", file: file, line: line); return
+        }
+        let baselineContent = try Data(contentsOf: baselineURL)
+        XCTAssertFalse(baselineContent.isEmpty, file: file, line: line)
+
+        // 1) Cancel mid-batch import (per-file granularity — see importHostItemRecursive) and
+        // confirm the pre-existing baseline file is untouched, and whatever did land is intact.
+        let sources = (1...40).map { index -> (URL, String) in
+            let name = "corruption-probe-\(index).txt"
+            return (workDir.appendingPathComponent(name), name)
+        }
+        for (url, name) in sources {
+            try "content of \(name)".write(to: url, atomically: true, encoding: .utf8)
+        }
+        let importTask = Task { await manager.importFiles(urls: sources.map(\.0), destination: workDir) }
+        let importDeadline = Date().addingTimeInterval(30)
+        while manager.transferMessage == nil, Date() < importDeadline {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertNotNil(manager.transferMessage, "expected the import to still be mid-batch before cancelling", file: file, line: line)
+        manager.cancelActiveTransfer()
+        await importTask.value
+
+        guard let baselineAfterImport = manager.entries.first(where: { $0.name == baselineFileName }),
+              let afterImportURL = await manager.materializeForPreview(baselineAfterImport) else {
+            XCTFail("failed to extract \(baselineFileName) after the cancelled import", file: file, line: line); return
+        }
+        XCTAssertEqual(try Data(contentsOf: afterImportURL), baselineContent, "pre-existing content changed after a cancelled import", file: file, line: line)
+        for (source, name) in sources {
+            guard let entry = manager.entries.first(where: { $0.name == name }) else { continue }
+            guard let extracted = await manager.materializeForPreview(entry) else {
+                XCTFail("failed to extract imported \(name)", file: file, line: line); continue
+            }
+            XCTAssertEqual(try Data(contentsOf: extracted), try Data(contentsOf: source), "\(name) landed but its content doesn't match — truncated/corrupt write", file: file, line: line)
+        }
+        // Clean up whatever DID land, so the export test below starts from the original entry
+        // set and the entry-count check at the end is meaningful.
+        let landedProbes = manager.entries.filter { $0.name.hasPrefix("corruption-probe-") }
+        if !landedProbes.isEmpty {
+            await manager.deleteEntries(landedProbes)
+            XCTAssertNil(manager.errorMessage, file: file, line: line)
+        }
+
+        // 2) Cancel a multi-file folder export/materialize partway through (native Task
+        // cancellation — see the equivalent OpenRetroSCSI-based export test for why this
+        // doesn't need progressID/beginTransfer) and confirm the source image's bytes never
+        // changed, since export only ever reads from it.
+        let beforeExportDigest = try sha256(of: workingCopy)
+        guard let exportFolder = manager.entries.first(where: { $0.name == exportFolderName && $0.isDirectory }) else {
+            XCTFail("expected folder \(exportFolderName) on \(fixtureName)", file: file, line: line); return
+        }
+        let materializeTask = Task { await manager.materializeForPreview(exportFolder) }
+        try await Task.sleep(for: .milliseconds(150))
+        materializeTask.cancel()
+        _ = await materializeTask.value
+        let afterExportDigest = try sha256(of: workingCopy)
+        XCTAssertEqual(beforeExportDigest, afterExportDigest, "source image bytes changed after a cancelled export", file: file, line: line)
+
+        // 3) Full cold round-trip: eject and reattach fresh, confirming the volume's directory
+        // listing and baseline content are unchanged from where we started.
+        await manager.ejectImage()
+        let manager2 = DiskImageManager()
+        await manager2.attachImage(imageURL: workingCopy)
+        addTeardownBlock { await manager2.ejectImage() }
+        XCTAssertNil(manager2.errorMessage, file: file, line: line)
+        XCTAssertEqual(Set(manager2.entries.map(\.name)), baselineEntryNames, "top-level entry set changed after cancelled transfers and a cold reattach", file: file, line: line)
+        guard let baselineFinal = manager2.entries.first(where: { $0.name == baselineFileName }),
+              let finalURL = await manager2.materializeForPreview(baselineFinal) else {
+            XCTFail("failed to extract \(baselineFileName) after reattaching", file: file, line: line); return
+        }
+        XCTAssertEqual(try Data(contentsOf: finalURL), baselineContent, "baseline content changed after a cold reattach", file: file, line: line)
+    }
+}
+
+/// The real, period-accurate fixture images the user placed at the repo root for corruption
+/// testing — gitignored (see `.gitignore`'s `*.hda`/`*.dsk`/`*.vhd`/`*.img` rules) so they're
+/// never committed. Resolved relative to this source file rather than hardcoded to a specific
+/// checkout path.
+private func repoRootFixture(_ name: String) -> URL {
+    URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent(name)
 }
 
 /// Shells out to `diskutil verifyVolume`, which unmounts, runs `fsck_hfs`, and remounts a

@@ -7,3 +7,9 @@ DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
+
+# Real disk image fixtures used for local corruption testing — not committed.
+*.hda
+*.dsk
+*.vhd
+*.img
