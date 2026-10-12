@@ -70,6 +70,9 @@ actor HFSVolume: DiskVolume {
     private var dirty = false
     private var markedInUse = false
     private var isClosed = false
+    /// Set when a save was cut short while rewriting the trees in place: the disk needs
+    /// checking (Disk First Aid / fsck) before anything else is written to it.
+    private var needsRepair = false
 
     /// `forcedReadOnly` opens the volume without write access for that reason; otherwise it is
     /// writable unless locked or not cleanly unmounted (`allowUncleanVolume` overrides the
@@ -166,6 +169,22 @@ actor HFSVolume: DiskVolume {
         guard let rootKey = keyByID[HFSCatalogID.rootFolder], rootKey.parentID == HFSCatalogID.rootParent else {
             throw HFSError.corrupt("root folder is missing")
         }
+        // No extent may reach past the volume: one that does would make deletes and the
+        // commit's bookkeeping act on blocks that don't exist.
+        let blocks = Int(mdb.allocationBlockCount)
+        func checkExtents(_ record: ExtentRecord) throws {
+            for extent in record.extents where extent.blockCount > 0 && Int(extent.startBlock) + Int(extent.blockCount) > blocks {
+                throw HFSError.corrupt("an extent lies outside the volume")
+            }
+        }
+        try checkExtents(mdb.catalogFileExtents)
+        try checkExtents(mdb.extentsFileExtents)
+        for entry in extentsRecords { try checkExtents(entry.record) }
+        for record in catalog where record.type == .file {
+            guard let file = try? FileRecord(raw: record.data) else { continue }
+            try checkExtents(file.extents(.data))
+            try checkExtents(file.extents(.resource))
+        }
         self.keyByID = keyByID
         self.committed = Committed(mdb: mdb, bitmap: bitmap, catalog: catalog, extentsRecords: extentsRecords,
                                    catalogHeader: catalogHeader, extentsHeader: extentsHeader, keyByID: keyByID)
@@ -174,7 +193,8 @@ actor HFSVolume: DiskVolume {
     // MARK: - Reading
 
     var volumeName: String { mdb.volumeName.string }
-    var freeBytes: UInt64 { UInt64(allocation.availableCount) * UInt64(blockSize) }
+    /// Room for new files: free space, less what the next save needs to write its trees safely.
+    var freeBytes: UInt64 { UInt64(max(0, allocation.availableCount - saveReserveBlocks)) * UInt64(blockSize) }
     var totalBytes: UInt64 { UInt64(blockCount) * UInt64(blockSize) }
 
     nonisolated func validName(from hostName: String) -> String {
@@ -280,12 +300,15 @@ actor HFSVolume: DiskVolume {
         try checkCanAdd(hfsName, to: parentID)
         let limit = UInt64(UInt32.max) / UInt64(blockSize) * UInt64(blockSize)
         guard dataFork.length <= limit, resourceFork.length <= limit else { throw HFSError.volumeFull }
+        // Before writing any data: has another program written the volume meanwhile?
+        try checkNotModifiedElsewhere()
         let allocationBefore = allocation
         let extentsBefore = extentsRecords
         let mdbBefore = mdb
         do {
-            let dataExtents = try writeNewFork(dataFork)
-            let resourceExtents = try writeNewFork(resourceFork)
+            let reserve = saveReserveBlocks
+            let dataExtents = try writeNewFork(dataFork, reserve: reserve)
+            let resourceExtents = try writeNewFork(resourceFork, reserve: reserve)
             let id = try allocateCatalogID()
             let now = HFSDate.now
             var file = FileRecord(id: id, date: now, type: metadata.fileType, creator: metadata.creator)
@@ -389,11 +412,29 @@ actor HFSVolume: DiskVolume {
         try checkOpen()
         guard dirty else { return }
         try checkWritable()
+        progress = .nothingWritten
         do {
             try commit()
         } catch {
-            rollBack()
-            throw error
+            switch progress {
+            case .rewritingInPlace:
+                // The old trees are partly overwritten: neither state is intact on disk, so
+                // rolling back would only pretend. Keep the intended state, refuse further
+                // writes, and tell the user the disk needs checking.
+                needsRepair = true
+                throw HFSError.saveIncomplete
+            case .markedInUse, .nothingWritten:
+                rollBack()
+                if progress == .markedInUse {
+                    // Nothing of the new state was committed: put the clean header back so
+                    // the volume doesn't look like it crashed.
+                    try? device.write(committed.mdb.raw, at: 1024)
+                    try? device.synchronize()
+                    lastKnownMDBSector = committed.mdb.raw
+                    markedInUse = false
+                }
+                throw error
+            }
         }
     }
 
@@ -406,58 +447,107 @@ actor HFSVolume: DiskVolume {
 
     // MARK: - Commit
 
-    private func commit() throws {
-        try checkNotModifiedElsewhere()
-        try markVolumeInUse()
-        recomputeCounts()
+    private enum CommitProgress {
+        case nothingWritten
+        case markedInUse
+        case rewritingInPlace
+    }
+    private var progress = CommitProgress.nothingWritten
 
+    private struct Layout {
+        var catalog: TreePlacement.Plan
+        var catalogRuns: [ExtentDescriptor]
+        var extents: TreePlacement.Plan
+        var extentsRuns: [ExtentDescriptor]
+        var catalogRecords: [BTree.BuildRecord]
+        var extentsBuild: [BTree.BuildRecord]
+    }
+
+    /// Chooses where both trees go: fresh copies at a roomy size, then fresh copies at the
+    /// exact size, and only then rewriting in place (when the volume has no room for a copy).
+    private func planLayout() throws -> Layout {
+        let allocationBefore = allocation
+        let extentsBefore = extentsRecords
+        var lastError: Error = HFSError.volumeFull
+        for (roomy, allowInPlace) in [(true, false), (false, false), (false, true)] {
+            allocation = allocationBefore
+            extentsRecords = extentsBefore
+            do {
+                return try planLayout(roomy: roomy, allowInPlace: allowInPlace)
+            } catch {
+                lastError = error
+            }
+        }
+        allocation = allocationBefore
+        extentsRecords = extentsBefore
+        throw lastError
+    }
+
+    private func planLayout(roomy: Bool, allowInPlace: Bool) throws -> Layout {
         let oldCatalog = Self.forkExtents(fileID: HFSCatalogID.catalogFile, fork: .data, first: committed.mdb.catalogFileExtents, overflow: committed.extentsRecords)
         let oldExtents = Self.extentList(committed.mdb.extentsFileExtents)
 
-        // 1. Place the catalog. Extents beyond the MDB's three go into the extents tree.
+        // The catalog; extents beyond the MDB's three go into the extents tree.
         let catalogRecords = catalog.map { BTree.BuildRecord(leafBytes: $0.key.leafEncoded + $0.data, indexKey: $0.key.indexEncoded) }
         let catalogPlan = try TreePlacement.plan(
             neededNodes: try BTree.minimumNodeCount(records: catalogRecords, nodeSize: BTree.nodeSize512),
             nodeSize: BTree.nodeSize512, blockSize: blockSize, clumpBytes: Int(mdb.catalogClumpSize),
             current: oldCatalog.map { (Int($0.startBlock), Int($0.blockCount)) }, currentNodes: Int(committed.mdb.catalogFileSize) / BTree.nodeSize512,
-            maxExtents: nil, map: &allocation, hint: Int(mdb.allocationPointer)
+            maxExtents: nil, roomy: roomy, allowInPlace: allowInPlace, map: &allocation, hint: Int(mdb.allocationPointer)
         )
         let catalogRuns = catalogPlan.runs.map { ExtentDescriptor(startBlock: UInt16($0.start), blockCount: UInt16($0.count)) }
         extentsRecords.removeAll { $0.key.fileID == HFSCatalogID.catalogFile && $0.key.fork == .data }
         addOverflow(Array(catalogRuns.dropFirst(3)), fork: .data, fileID: HFSCatalogID.catalogFile, startingAt: catalogRuns.prefix(3).reduce(0) { $0 + Int($1.blockCount) })
 
-        // 2. Place the extents tree; it can't overflow, so at most three extents.
+        // The extents tree; it can't overflow, so at most three extents.
         let extentsBuild = extentsRecords.map { BTree.BuildRecord(leafBytes: $0.key.encoded + $0.record.encoded, indexKey: $0.key.encoded) }
         let extentsPlan = try TreePlacement.plan(
             neededNodes: try BTree.minimumNodeCount(records: extentsBuild, nodeSize: BTree.nodeSize512),
             nodeSize: BTree.nodeSize512, blockSize: blockSize, clumpBytes: Int(mdb.extentsClumpSize),
             current: oldExtents.map { (Int($0.startBlock), Int($0.blockCount)) }, currentNodes: Int(committed.mdb.extentsFileSize) / BTree.nodeSize512,
-            maxExtents: 3, map: &allocation, hint: Int(mdb.allocationPointer)
+            maxExtents: 3, roomy: roomy, allowInPlace: allowInPlace, map: &allocation, hint: Int(mdb.allocationPointer)
         )
         guard extentsPlan.runs.count <= 3 else { throw HFSError.catalogFull }
         let extentsRuns = extentsPlan.runs.map { ExtentDescriptor(startBlock: UInt16($0.start), blockCount: UInt16($0.count)) }
 
-        // 3. Write both trees (to free space, unless the volume had no room for a copy).
-        let extentsNodes = try BTree.build(records: extentsBuild, nodeCount: extentsPlan.nodeCount, template: extentsHeader)
-        let catalogNodes = try BTree.build(records: catalogRecords, nodeCount: catalogPlan.nodeCount, template: catalogHeader)
-        try writeNodes(extentsNodes, to: extentsRuns)
-        try writeNodes(catalogNodes, to: catalogRuns)
-
-        // 4. The bitmap with old and new structures both in use, then the commit itself.
+        // Old trees are released in the working bitmap (still in use on disk until commit).
         if !catalogPlan.inPlace {
             for extent in oldCatalog { allocation.set(start: Int(extent.startBlock), count: Int(extent.blockCount), used: false) }
         }
         if !extentsPlan.inPlace {
             for extent in oldExtents { allocation.set(start: Int(extent.startBlock), count: Int(extent.blockCount), used: false) }
         }
-        try device.synchronize()
+        return Layout(catalog: catalogPlan, catalogRuns: catalogRuns, extents: extentsPlan, extentsRuns: extentsRuns,
+                      catalogRecords: catalogRecords, extentsBuild: extentsBuild)
+    }
+
+    private func commit() throws {
+        try checkNotModifiedElsewhere()
+        recomputeCounts()
+
+        // Everything that can fail for lack of space happens before anything is written.
+        let layout = try planLayout()
+        let extentsNodes = try BTree.build(records: layout.extentsBuild, nodeCount: layout.extents.nodeCount, template: extentsHeader)
+        let catalogNodes = try BTree.build(records: layout.catalogRecords, nodeCount: layout.catalog.nodeCount, template: catalogHeader)
+
+        // 1. Mark the volume in use. That header already carries the advanced next-ID, so IDs
+        //    handed out in this batch are never reused, whatever happens next.
+        try markVolumeInUse()
+        progress = .markedInUse
+        // 2. The bitmap with old structures, new trees and new file data all in use.
         try device.write(allocation.union, at: UInt64(mdb.bitmapStartSector) * 512)
         try device.synchronize()
+        // 3. The new trees: into free space, or over the old ones if there was no room.
+        if layout.catalog.inPlace || layout.extents.inPlace { progress = .rewritingInPlace }
+        try writeNodes(extentsNodes, to: layout.extentsRuns)
+        try writeNodes(catalogNodes, to: layout.catalogRuns)
+        try device.synchronize()
 
-        mdb.catalogFileExtents = ExtentRecord(extents: Array(catalogRuns.prefix(3)))
-        mdb.catalogFileSize = UInt32(catalogPlan.nodeCount * BTree.nodeSize512)
-        mdb.extentsFileExtents = ExtentRecord(extents: extentsRuns)
-        mdb.extentsFileSize = UInt32(extentsPlan.nodeCount * BTree.nodeSize512)
+        // 4. The commit: one MDB write switches to the new trees.
+        mdb.catalogFileExtents = ExtentRecord(extents: Array(layout.catalogRuns.prefix(3)))
+        mdb.catalogFileSize = UInt32(layout.catalog.nodeCount * BTree.nodeSize512)
+        mdb.extentsFileExtents = ExtentRecord(extents: layout.extentsRuns)
+        mdb.extentsFileSize = UInt32(layout.extents.nodeCount * BTree.nodeSize512)
         mdb.freeBlockCount = UInt16(allocation.freeCount)
         mdb.modifyDate = HFSDate.now
         mdb.writeCount &+= 1
@@ -466,19 +556,23 @@ actor HFSVolume: DiskVolume {
         try device.synchronize()
         lastKnownMDBSector = mdb.raw
         markedInUse = false
+        progress = .nothingWritten
 
-        // Committed. Bring the spare MDB in step at once (fsck consults it when it has a
-        // repair to make), then release the old trees' blocks on disk.
+        // Committed.
         extentsHeader = try BTree.Header(raw: try BTree.records(of: extentsNodes[0])[0])
         catalogHeader = try BTree.Header(raw: try BTree.records(of: catalogNodes[0])[0])
         allocation.commit()
         committed = Committed(mdb: mdb, bitmap: allocation.committed, catalog: catalog, extentsRecords: extentsRecords,
                               catalogHeader: catalogHeader, extentsHeader: extentsHeader, keyByID: keyByID)
         dirty = false
-        try writeAlternateMDB()
-        try device.synchronize()
-        try device.write(allocation.working, at: UInt64(mdb.bitmapStartSector) * 512)
-        try device.synchronize()
+
+        // Tidy-up. The changes are already saved, so a failure here isn't reported as one:
+        // it can only leave the spare MDB a commit behind or some blocks marked in use that
+        // nothing references, both of which the next flush (or Disk First Aid) puts right.
+        try? writeAlternateMDB()
+        try? device.synchronize()
+        try? device.write(allocation.working, at: UInt64(mdb.bitmapStartSector) * 512)
+        try? device.synchronize()
     }
 
     private func rollBack() {
@@ -505,6 +599,7 @@ actor HFSVolume: DiskVolume {
         guard !markedInUse else { return }
         var inUse = committed.mdb
         inUse.attributes &= ~MasterDirectoryBlock.unmountedCleanlyBit
+        inUse.nextCatalogID = max(committed.mdb.nextCatalogID, mdb.nextCatalogID)
         try device.write(inUse.raw, at: 1024)
         try device.synchronize()
         lastKnownMDBSector = inUse.raw
@@ -596,6 +691,7 @@ actor HFSVolume: DiskVolume {
     private func checkWritable() throws {
         try checkOpen()
         if isReadOnly { throw HFSError.readOnly }
+        if needsRepair { throw HFSError.saveIncomplete }
     }
 
     private func validated(_ name: String) throws -> HFSName {
@@ -655,9 +751,18 @@ actor HFSVolume: DiskVolume {
 
     // MARK: - Internals: allocation and fork data
 
-    private func writeNewFork(_ source: HFSForkSource) throws -> [ExtentDescriptor] {
+    /// Space new file data must leave free so the next save can write fresh copies of both
+    /// trees (with room for the catalog to grow) instead of overwriting them in place.
+    private var saveReserveBlocks: Int {
+        let catalogNodes = Int(committed.mdb.catalogFileSize) / BTree.nodeSize512
+        let extentsNodes = Int(committed.mdb.extentsFileSize) / BTree.nodeSize512
+        let growth = max(catalogNodes / 4, Int(mdb.catalogClumpSize) / BTree.nodeSize512, 4)
+        return TreePlacement.blocks(forNodes: catalogNodes + growth + extentsNodes, nodeSize: BTree.nodeSize512, blockSize: blockSize)
+    }
+
+    private func writeNewFork(_ source: HFSForkSource, reserve: Int) throws -> [ExtentDescriptor] {
         let blocks = Int((source.length + UInt64(blockSize) - 1) / UInt64(blockSize))
-        let extents = try allocation.allocate(blocks, hint: Int(mdb.allocationPointer))
+        let extents = try allocation.allocate(blocks, hint: Int(mdb.allocationPointer), reserve: reserve)
             .map { ExtentDescriptor(startBlock: UInt16($0.start), blockCount: UInt16($0.count)) }
         if let last = extents.last { mdb.allocationPointer = UInt16(clamping: Int(last.startBlock) + Int(last.blockCount)) }
         var offset: UInt64 = 0

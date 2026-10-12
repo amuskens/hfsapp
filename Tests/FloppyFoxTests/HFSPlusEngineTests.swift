@@ -242,6 +242,7 @@ final class HFSPlusEngineTests: XCTestCase {
             let names = Set(try await reopened.contents(ofFolder: HFSCatalogID.rootFolder).map(\.name))
             XCTAssertTrue(names == oldNames || names == newNames, "cut after \(cut) of \(total) writes: \(names)")
             await reopened.close()
+            try await assertCleanOrRepairsToKnownState(image, oneOf: [oldNames, newNames], context: "cut after \(cut) of \(total) writes")
             // Mounting works and shows the same state: the kernel accepts the volume.
             try HFSPlusFixtures.withMounted(image) { root in
                 let mounted = Set(try FileManager.default.contentsOfDirectory(atPath: root.path).filter { !$0.hasPrefix(".") })

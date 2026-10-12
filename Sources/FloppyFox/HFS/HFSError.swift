@@ -15,6 +15,7 @@ enum HFSError: LocalizedError, Equatable {
     case closed
     case modifiedElsewhere
     case inUse
+    case saveIncomplete
 
     var errorDescription: String? {
         switch self {
@@ -46,6 +47,8 @@ enum HFSError: LocalizedError, Equatable {
             return "The image was changed by another program while it was open here. To avoid overwriting those changes, nothing was saved; reopen the image to continue."
         case .inUse:
             return "Another program is using the image."
+        case .saveIncomplete:
+            return "Saving was interrupted while the disk's directory was being rewritten, so the disk may be damaged. Eject the image and check it with Disk First Aid (or fsck_hfs) before using it again."
         }
     }
 }

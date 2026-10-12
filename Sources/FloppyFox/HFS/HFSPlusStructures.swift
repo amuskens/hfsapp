@@ -208,7 +208,7 @@ struct HFSPlusFolderRecord {
         raw.put32(textEncoding, at: 80)
     }
 
-    var flags: UInt16 { (try? raw.u16(2)) ?? 0 }
+    var flags: UInt16 { get { (try? raw.u16(2)) ?? 0 } set { raw.put16(newValue, at: 2) } }
     var valence: UInt32 { get { (try? raw.u32(4)) ?? 0 } set { raw.put32(newValue, at: 4) } }
     var id: UInt32 { (try? raw.u32(8)) ?? 0 }
     var createDate: UInt32 { (try? raw.u32(12)) ?? 0 }
@@ -227,6 +227,8 @@ struct HFSPlusFileRecord {
     /// Set on every HFS Plus file: its thread record exists.
     static let threadExistsFlag: UInt16 = 0x0002
     static let hasAttributesFlag: UInt16 = 0x0004
+    /// kHFSHasLinkChainMask: a hard-link target or a directory hard link.
+    static let hasLinkChainFlag: UInt16 = 0x0020
 
     init(raw: [UInt8]) throws {
         guard raw.count >= HFSPlusCatalogRecord.fileRecordSize, (try raw.u16(0)) == HFSPlusRecordType.file.rawValue else { throw HFSError.corrupt("bad file record") }
@@ -308,23 +310,32 @@ enum HFSPlusName {
 
     /// The form HFS Plus stores: canonically decomposed, except the ranges Apple leaves
     /// alone (U+2000–U+2FFF, U+F900–U+FAFF, U+2F800–U+2FAFF), which keeps names created here
-    /// identical to those Mac OS would create.
+    /// identical to those Mac OS creates. The exclusion applies per *scalar*: an excluded
+    /// combining mark doesn't stop the letter it sits on from being decomposed.
     static func encode(_ string: String) throws -> [UInt16] {
-        var units: [UInt16] = []
-        for character in string {
-            let excluded = character.unicodeScalars.contains { scalar in
-                (0x2000...0x2FFF).contains(scalar.value) || (0xF900...0xFAFF).contains(scalar.value) || (0x2F800...0x2FAFF).contains(scalar.value)
+        func excluded(_ scalar: Unicode.Scalar) -> Bool {
+            (0x2000...0x2FFF).contains(scalar.value) || (0xF900...0xFAFF).contains(scalar.value) || (0x2F800...0x2FAFF).contains(scalar.value)
+        }
+        let units: [UInt16]
+        if !string.unicodeScalars.contains(where: excluded) {
+            units = Array(string.decomposedStringWithCanonicalMapping.utf16)
+        } else {
+            var result: [UInt16] = []
+            for scalar in string.unicodeScalars {
+                let piece = excluded(scalar) ? String(scalar) : String(scalar).decomposedStringWithCanonicalMapping
+                result += Array(piece.utf16)
             }
-            let piece = excluded ? String(character) : String(character).decomposedStringWithCanonicalMapping
-            units += Array(piece.utf16)
+            units = result
         }
         guard !units.isEmpty, units.count <= maxLength, !units.contains(0x3A /* ":" */) else { throw HFSError.invalidName(string) }
         if units == [0x2E] || units == [0x2E, 0x2E] { throw HFSError.invalidName(string) }
         return units
     }
 
+    /// The name as stored. Not recomposed: composition would also apply singleton mappings
+    /// (U+212B → U+00C5, U+F900 → U+8C48), giving a name that no longer finds the item.
     static func decode(_ units: [UInt16]) -> String {
-        String(decoding: units, as: UTF16.self).precomposedStringWithCanonicalMapping
+        String(decoding: units, as: UTF16.self)
     }
 
     /// The Mac OS text encoding classic Mac OS should use to display a name, and its bit in

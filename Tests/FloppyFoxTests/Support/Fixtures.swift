@@ -102,6 +102,38 @@ enum Fixtures {
         return (check.status == 0 && check.output.contains("appears to be OK"), check.output)
     }
 
+    /// Runs `fsck_hfs -fy` (check *and repair*, as Disk Utility's First Aid does).
+    @discardableResult
+    static func fsckRepair(_ image: URL) throws -> String {
+        let attach = run("/usr/bin/hdiutil", ["attach", "-nomount", "-noverify", "-imagekey", "diskimage-class=CRawDiskImage", image.path])
+        let lines = attach.output.split(separator: "\n").map(String.init)
+        func device(in line: String) -> String? {
+            line.split(whereSeparator: \.isWhitespace).first(where: { $0.hasPrefix("/dev/disk") }).map(String.init)
+        }
+        guard attach.status == 0, let wholeDisk = lines.lazy.compactMap(device).first else {
+            throw NSError(domain: "Fixtures", code: 2, userInfo: [NSLocalizedDescriptionKey: "hdiutil could not attach \(image.lastPathComponent): \(attach.output)"])
+        }
+        defer { _ = run("/usr/bin/hdiutil", ["detach", wholeDisk]) }
+        let target = lines.first(where: { $0.contains("Apple_HFS") }).flatMap(device) ?? wholeDisk
+        return run("/sbin/fsck_hfs", ["-fy", target.replacingOccurrences(of: "/dev/disk", with: "/dev/rdisk")]).output
+    }
+
+    /// fsck's complaints other than "blocks are marked in use that nothing references" —
+    /// the expected residue of a save cut off between its bitmap and header writes.
+    static func fsckProblems(_ image: URL) throws -> [String] {
+        let verdict = try fsck(image)
+        if verdict.clean { return [] }
+        let harmless = ["orphaned blocks", "Invalid volume free block count", "Checking", "Executing fsck_hfs", "volume name is",
+                        "Verify Status", "CBTStat", "found corrupt and needs to be repaired", "CheckHFS returned", "NO WRITE",
+                        "Can't open", "cacheBlockSize", "volume type", "MDB is at", "VHB is at", "sector size", "VolumeObject",
+                        "total sectors", "(", "Volume bitmap needs minor repair", "Checking multi-linked", "Trimming",
+                        "Checking non-journaled", "Checking Extended Attributes", "Volume bitmap needs repair for under-allocation"]
+        return verdict.output.split(separator: "\n").map(String.init).filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return !trimmed.isEmpty && !harmless.contains { trimmed.contains($0) }
+        }
+    }
+
     static func run(_ executable: String, _ arguments: [String]) -> (status: Int32, output: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
@@ -216,4 +248,24 @@ extension DiskVolume {
 func childItem(_ volume: any DiskVolume, _ name: String, in folder: UInt32, file: StaticString = #filePath, line: UInt = #line) async throws -> VolumeItem {
     let item = await volume.child(named: name, inFolder: folder)
     return try XCTUnwrap(item, "no \(name) in folder \(folder)", file: file, line: line)
+}
+
+/// The safety property of an interrupted save: fsck finds nothing worse than orphaned blocks,
+/// or — in the one-write window where the spare header lags the main one — a real repair
+/// (`fsck_hfs -fy`, as Disk First Aid runs) leaves a clean volume in exactly one of `states`.
+func assertCleanOrRepairsToKnownState(_ image: URL, oneOf states: [Set<String>], context: String,
+                                      file: StaticString = #filePath, line: UInt = #line) async throws {
+    let problems = try Fixtures.fsckProblems(image)
+    if problems.isEmpty { return }
+    let repaired = image.deletingLastPathComponent().appendingPathComponent("repaired-" + image.lastPathComponent)
+    try? FileManager.default.removeItem(at: repaired)
+    try FileManager.default.copyItem(at: image, to: repaired)
+    defer { try? FileManager.default.removeItem(at: repaired) }
+    let repairOutput = try Fixtures.fsckRepair(repaired)
+    let verdict = try Fixtures.fsck(repaired)
+    XCTAssertTrue(verdict.clean, "\(context): \(problems); after repair still damaged:\n\(repairOutput)\n\(verdict.output)", file: file, line: line)
+    let volume = try DiskImageLayout.openVolume(repaired, readOnly: true)
+    let names = Set(try await volume.contents(ofFolder: HFSCatalogID.rootFolder).map(\.name))
+    await volume.close()
+    XCTAssertTrue(states.contains(names), "\(context): after repair the volume holds \(names), neither the old nor the new state", file: file, line: line)
 }

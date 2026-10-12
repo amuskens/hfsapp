@@ -141,29 +141,40 @@ struct AllocationMap {
         map[block / 8] & (0x80 >> UInt8(block % 8)) != 0
     }
 
-    func isUsed(_ block: Int) -> Bool { Self.isSet(working, block) }
+    func isUsed(_ block: Int) -> Bool { block < blockCount && Self.isSet(working, block) }
 
     func isAvailable(_ block: Int) -> Bool {
         block < allocatableCount && !Self.isSet(working, block) && !Self.isSet(committed, block)
     }
 
+    /// Marks a run used or free. Runs reaching past the volume (only possible on a damaged
+    /// image) are clipped rather than trusted.
     mutating func set(start: Int, count: Int, used: Bool) {
+        guard start >= 0, count > 0, start < blockCount else { return }
         for block in start..<min(start + count, blockCount) {
             if used { working[block / 8] |= 0x80 >> UInt8(block % 8) } else { working[block / 8] &= ~(0x80 >> UInt8(block % 8)) }
         }
     }
 
-    /// Free blocks after the pending changes (what the volume header records).
-    var freeCount: Int {
+    /// Population count of `map` over blocks `0..<limit`.
+    private static func usedCount(_ map: [UInt8], limit: Int) -> Int {
+        let fullBytes = limit / 8
         var used = 0
-        for block in 0..<blockCount where Self.isSet(working, block) { used += 1 }
-        return blockCount - used
+        for index in 0..<fullBytes { used += map[index].nonzeroBitCount }
+        for block in (fullBytes * 8)..<limit where isSet(map, block) { used += 1 }
+        return used
     }
 
+    /// Free blocks after the pending changes (what the volume header records).
+    var freeCount: Int { blockCount - Self.usedCount(working, limit: blockCount) }
+
+    /// Blocks that new data may use right now.
     var availableCount: Int {
-        var count = 0
-        for block in 0..<allocatableCount where isAvailable(block) { count += 1 }
-        return count
+        let fullBytes = allocatableCount / 8
+        var used = 0
+        for index in 0..<fullBytes { used += (working[index] | committed[index]).nonzeroBitCount }
+        for block in (fullBytes * 8)..<allocatableCount where !isAvailable(block) { used += 1 }
+        return allocatableCount - used
     }
 
     /// Both versions combined: written before a commit so that neither the old nor the new
@@ -177,19 +188,38 @@ struct AllocationMap {
         committed = bitmap
     }
 
-    /// Allocates `count` blocks: one run if any is long enough (searching from `hint`), else
-    /// the largest runs first. At most `maxExtents` runs when given.
-    mutating func allocate(_ count: Int, hint: Int, maxExtents: Int? = nil) throws -> [(start: Int, count: Int)] {
-        guard count > 0 else { return [] }
-        guard count <= availableCount else { throw HFSError.volumeFull }
+    /// Free runs, skipping whole used bytes quickly.
+    private func freeRuns() -> [(start: Int, count: Int)] {
         var runs: [(start: Int, count: Int)] = []
         var block = 0
         while block < allocatableCount {
+            if block % 8 == 0, block + 8 <= allocatableCount, (working[block / 8] | committed[block / 8]) == 0xFF {
+                block += 8
+                continue
+            }
             if !isAvailable(block) { block += 1; continue }
             let start = block
-            while block < allocatableCount, isAvailable(block), block - start < maxRunLength { block += 1 }
+            while block < allocatableCount, block - start < maxRunLength {
+                if block % 8 == 0, block + 8 <= allocatableCount, block - start + 8 <= maxRunLength, (working[block / 8] | committed[block / 8]) == 0 {
+                    block += 8
+                    continue
+                }
+                if !isAvailable(block) { break }
+                block += 1
+            }
             runs.append((start, block - start))
         }
+        return runs
+    }
+
+    /// Allocates `count` blocks: one run if any is long enough (searching from `hint`), else
+    /// the largest runs first. At most `maxExtents` runs when given; at least `reserve` blocks
+    /// must remain available afterwards.
+    mutating func allocate(_ count: Int, hint: Int, maxExtents: Int? = nil, reserve: Int = 0) throws -> [(start: Int, count: Int)] {
+        guard count > 0 else { return [] }
+        let available = availableCount
+        guard count <= available, available - count >= reserve else { throw HFSError.volumeFull }
+        let runs = freeRuns()
         if let run = runs.first(where: { $0.start >= hint && $0.count >= count }) ?? runs.first(where: { $0.count >= count }) {
             set(start: run.start, count: count, used: true)
             return [(run.start, count)]
@@ -201,6 +231,7 @@ struct AllocationMap {
             result.append((run.start, take))
             needed -= take
         }
+        if needed > 0 { throw HFSError.volumeFull }
         if let maxExtents, result.count > maxExtents { throw HFSError.volumeFull }
         for run in result { set(start: run.start, count: run.count, used: true) }
         return result.sorted { $0.start < $1.start }
@@ -213,27 +244,30 @@ enum TreePlacement {
         var runs: [(start: Int, count: Int)]
         var nodeCount: Int
         /// True when there was no room for a fresh copy and the tree is rewritten over the
-        /// current file (not crash-atomic; only used on nearly full volumes).
+        /// current file (not crash-atomic; only used on volumes another system filled up).
         var inPlace: Bool
     }
 
-    /// Prefers a fresh copy in free space — at the file's current size plus room to grow, or
-    /// failing that the exact size needed — so the old tree stays valid until the volume
-    /// header switches over. Falls back to rewriting in place when the volume is too full for
-    /// a second copy and the current file is big enough.
+    static func blocks(forNodes nodes: Int, nodeSize: Int, blockSize: Int) -> Int {
+        (nodes * nodeSize + blockSize - 1) / blockSize
+    }
+
+    /// A fresh copy in free space — `roomy` sizes it at the file's current size plus room to
+    /// grow, otherwise exactly what's needed — so the old tree stays valid until the volume
+    /// header switches over. With `allowInPlace`, falls back to rewriting the current file
+    /// when it is big enough and there is no room for a copy.
     static func plan(neededNodes: Int, nodeSize: Int, blockSize: Int, clumpBytes: Int,
                      current: [(start: Int, count: Int)], currentNodes: Int, maxExtents: Int?,
-                     map: inout AllocationMap, hint: Int) throws -> Plan {
-        func blocks(forNodes nodes: Int) -> Int { (nodes * nodeSize + blockSize - 1) / blockSize }
+                     roomy: Bool, allowInPlace: Bool, map: inout AllocationMap, hint: Int) throws -> Plan {
         let clumpNodes = max(1, clumpBytes / nodeSize)
-        let roomy = max(currentNodes, neededNodes + max(neededNodes / 4, clumpNodes))
-        for nodes in [roomy, neededNodes] {
-            let count = blocks(forNodes: nodes)
+        let roomyNodes = max(currentNodes, neededNodes + max(neededNodes / 4, clumpNodes))
+        for nodes in roomy ? [roomyNodes, neededNodes] : [neededNodes] {
+            let count = blocks(forNodes: nodes, nodeSize: nodeSize, blockSize: blockSize)
             if let runs = try? map.allocate(count, hint: hint, maxExtents: maxExtents) {
                 return Plan(runs: runs, nodeCount: count * blockSize / nodeSize, inPlace: false)
             }
         }
-        guard currentNodes >= neededNodes else { throw HFSError.volumeFull }
+        guard allowInPlace, currentNodes >= neededNodes else { throw HFSError.volumeFull }
         return Plan(runs: current, nodeCount: currentNodes, inPlace: true)
     }
 }

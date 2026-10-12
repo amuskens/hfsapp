@@ -164,6 +164,23 @@ final class DiskImageManager: ObservableObject {
         ["dsk", "img", "hda", "vhd", "image", "dc42"].compactMap { UTType(filenameExtension: $0) }
     }
 
+    // MARK: - Serializing writes
+
+    private var writeQueueTail: Task<Void, Never>?
+
+    /// Runs write operations (import, delete, copy, move, new folder) one after another. A
+    /// failed save rolls back every pending change on the volume, so two operations must never
+    /// share an uncommitted batch — e.g. an import into a folder whose creation is undone.
+    private func serializedWrite(_ body: @escaping @MainActor () async -> Void) async {
+        let previous = writeQueueTail
+        let task = Task { @MainActor in
+            await previous?.value
+            await body()
+        }
+        writeQueueTail = task
+        await task.value
+    }
+
     // MARK: - Busy state and transfer progress
 
     /// Marks `isBusy` for the duration of `work`. Reentrant (depth-counted), so nested calls
@@ -440,7 +457,7 @@ final class DiskImageManager: ObservableObject {
         let trimmed = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let nameString = volume.validName(from: trimmed)
-        await withBusy {
+        await serializedWrite { [self] in await withBusy {
             do {
                 try await volume.createFolder(named: nameString, in: currentFolderID)
                 try await volume.flush()
@@ -449,7 +466,7 @@ final class DiskImageManager: ObservableObject {
             } catch {
                 errorMessage = "Could not create \(nameString): \(error.localizedDescription)"
             }
-        }
+        } }
     }
 
     func deleteSelected() {
@@ -471,7 +488,7 @@ final class DiskImageManager: ObservableObject {
                 : "This image is read-only, so these items can't be deleted."
             return
         }
-        await withBusy {
+        await serializedWrite { [self] in await withBusy {
             let transfer = beginTransfer(title: "Deleting Items", message: "Preparing to delete…")
             defer { endTransfer(transfer.id) }
             var deleted = 0
@@ -494,7 +511,7 @@ final class DiskImageManager: ObservableObject {
                 statusMessage = deleted == 1 ? "Deleted \(entries.first!.name)" : "Deleted \(deleted) items"
             }
             if let failure { errorMessage = failure }
-        }
+        } }
     }
 
     private func deleteRecursively(_ id: UInt32, on volume: any DiskVolume, flag: CancellationFlag, depth: Int = 0) async throws {
@@ -547,7 +564,7 @@ final class DiskImageManager: ObservableObject {
             errorMessage = "This image is read-only, so files can't be added to it."
             return
         }
-        await withBusy {
+        await serializedWrite { [self] in await withBusy {
             let transfer = beginTransfer(title: "Adding Items", message: "Preparing import…")
             defer { endTransfer(transfer.id) }
             let destination = currentFolderID
@@ -587,7 +604,7 @@ final class DiskImageManager: ObservableObject {
                     statusMessage += tally.skippedLinks == 1 ? " — skipped 1 symbolic link" : " — skipped \(tally.skippedLinks) symbolic links"
                 }
             }
-        }
+        } }
     }
 
     /// Counts reported after an import.
@@ -958,7 +975,7 @@ final class DiskImageManager: ObservableObject {
             errorMessage = "This image is read-only, so files can't be added to it."
             return
         }
-        await withBusy {
+        await serializedWrite { [self] in await withBusy {
             let transfer = beginTransfer(title: "Copying Items", message: "Preparing copy…")
             defer { endTransfer(transfer.id) }
             var copied = 0
@@ -979,7 +996,7 @@ final class DiskImageManager: ObservableObject {
             await finishWrite(on: volume)
             if copied > 0 { statusMessage = copied == 1 ? "Copied 1 item" : "Copied \(copied) items" }
             if let failure { errorMessage = failure }
-        }
+        } }
     }
 
     private func copyRecursively(_ id: UInt32, to folderID: UInt32, on volume: any DiskVolume, transfer: (id: UUID, flag: CancellationFlag), depth: Int = 0) async throws {
@@ -1027,7 +1044,7 @@ final class DiskImageManager: ObservableObject {
             errorMessage = "This image is read-only, so files can't be moved."
             return
         }
-        await withBusy {
+        await serializedWrite { [self] in await withBusy {
             var moved = 0
             var failure: String?
             for id in ids {
@@ -1046,7 +1063,7 @@ final class DiskImageManager: ObservableObject {
                 ? (moved == 1 ? "Moved 1 item" : "Moved \(moved) items")
                 : "Moved \(moved) of \(ids.count) items"
             if let failure { errorMessage = failure }
-        }
+        } }
     }
 
     // MARK: - Drag and drop

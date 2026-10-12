@@ -6,11 +6,12 @@ import XCTest
 enum HFSPlusFixtures {
     /// A blank, non-journaled HFS Plus volume (what Mac OS 8.1–9 writes), made by `newfs_hfs`
     /// on a raw image. `caseSensitive` makes an HFSX volume.
-    static func makeVolume(in directory: URL, name: String = "Plus.img", sizeMB: Int = 40, label: String = "Plus Test", caseSensitive: Bool = false) throws -> URL {
+    /// `extraBytes` makes the partition not a whole number of allocation blocks.
+    static func makeVolume(in directory: URL, name: String = "Plus.img", sizeMB: Int = 40, extraBytes: Int = 0, label: String = "Plus Test", caseSensitive: Bool = false) throws -> URL {
         let url = directory.appendingPathComponent(name)
         FileManager.default.createFile(atPath: url.path, contents: nil)
         let handle = try FileHandle(forWritingTo: url)
-        try handle.truncate(atOffset: UInt64(sizeMB) * 1024 * 1024)
+        try handle.truncate(atOffset: UInt64(sizeMB) * 1024 * 1024 + UInt64(extraBytes))
         try handle.close()
         let attach = Fixtures.run("/usr/bin/hdiutil", ["attach", "-nomount", "-noverify", "-imagekey", "diskimage-class=CRawDiskImage", url.path])
         guard attach.status == 0, let device = attach.output.split(whereSeparator: \.isWhitespace).first(where: { $0.hasPrefix("/dev/disk") }).map(String.init) else {

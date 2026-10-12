@@ -26,48 +26,6 @@ final class CrashSafetyTests: XCTestCase {
         Set(try await volume.contents(ofFolder: folder).map(\.name))
     }
 
-    /// fsck output problems that only mean "blocks are marked in use that nothing
-    /// references" — the expected residue of a commit interrupted between its bitmap and
-    /// header writes. Anything else is damage.
-    private func assertOnlyOrphanedBlocks(_ image: URL, context: String = "", file: StaticString = #filePath, line: UInt = #line) async throws {
-        let verdict = try Fixtures.fsck(image)
-        if verdict.clean { return }
-        // Between the primary and spare MDB writes the spare is one commit behind; when fsck
-        // also has orphaned blocks to repair it then flags the folder/file counts. That's only
-        // harmless if the *primary* MDB's counts really match the catalog, so check that here.
-        let primaryCountsCorrect = try await primaryMDBCountsMatchCatalog(image)
-        var harmless = ["orphaned blocks", "Invalid volume free block count", "Checking", "Executing fsck_hfs", "volume name is",
-                        "Verify Status", "CBTStat", "found corrupt and needs to be repaired", "CheckHFS returned", "NO WRITE",
-                        "Can't open", "cacheBlockSize", "volume type", "MDB is at", "VHB is at", "sector size", "VolumeObject",
-                        "total sectors", "(", "Volume bitmap needs minor repair"]
-        if primaryCountsCorrect {
-            harmless += ["Master Directory Block needs minor repair", "invalid MDB drNmRtDirs", "invalid MDB drDirCnt", "invalid MDB drNmFls", "invalid MDB drFilCnt"]
-        }
-        let problems = verdict.output.split(separator: "\n").map(String.init).filter { line in
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            return !trimmed.isEmpty && !harmless.contains { trimmed.contains($0) }
-        }
-        XCTAssertTrue(problems.isEmpty, "\(context) fsck found damage beyond orphaned blocks:\n\(verdict.output)", file: file, line: line)
-    }
-
-    private func primaryMDBCountsMatchCatalog(_ image: URL) async throws -> Bool {
-        let bytes = Array(try Data(contentsOf: image))
-        let rootFiles = Int(try bytes.u16(1024 + 12)), rootDirs = Int(try bytes.u16(1024 + 82))
-        let files = Int(try bytes.u32(1024 + 84)), dirs = Int(try bytes.u32(1024 + 88))
-        let volume = try open(image, allowUnclean: true)
-        var countedFiles = 0, countedDirs = 0
-        var pending: [UInt32] = [HFSCatalogID.rootFolder]
-        while let folder = pending.popLast() {
-            for item in try await volume.contents(ofFolder: folder) {
-                if item.isFolder { countedDirs += 1; pending.append(item.id) } else { countedFiles += 1 }
-            }
-        }
-        let root = try await volume.contents(ofFolder: HFSCatalogID.rootFolder)
-        await volume.close()
-        return rootFiles == root.filter { !$0.isFolder }.count && rootDirs == root.filter(\.isFolder).count
-            && files == countedFiles && dirs == countedDirs
-    }
-
     // MARK: Commit protocol
 
     /// Cuts the power (stops all writes) after every possible number of writes during a
@@ -124,6 +82,7 @@ final class CrashSafetyTests: XCTestCase {
             let root = try await names(reopened)
             if root == newNames {
                 sawNew = true
+                XCTAssertTrue(succeeded, "cut after \(cut) writes: the change was saved but reported as failed")
                 let item = try await childItem(reopened, "New File", in: HFSCatalogID.rootFolder)
                 let bytes = try await reopened.readForkBytes(item.id, fork: .data)
                 XCTAssertEqual(bytes, newData, "cut after \(cut) writes: new file's contents are wrong")
@@ -141,7 +100,7 @@ final class CrashSafetyTests: XCTestCase {
                 XCTAssertEqual(String(decoding: bytes, as: UTF8.self), "contents \(name.dropFirst(5))", "cut after \(cut) writes: \(name) damaged")
             }
             await reopened.close()
-            try await assertOnlyOrphanedBlocks(image, context: "cut after \(cut) of \(totalWrites) writes (\(root == newNames ? "new" : "old") state):")
+            try await assertCleanOrRepairsToKnownState(image, oneOf: [oldNames, newNames], context: "cut after \(cut) of \(totalWrites) writes")
         }
         XCTAssertTrue(sawOld && sawNew, "the sweep should cover cuts both before and after the commit point")
     }
@@ -195,6 +154,12 @@ final class CrashSafetyTests: XCTestCase {
             try await volume.flush()
             for (index, id) in fillers.enumerated() where index % 2 == 0 { try await volume.delete(id) }
             try await volume.flush()
+            // Use up the contiguous room the save reserve kept free, so the remaining free
+            // space is mostly one-block holes and the catalog has to be scattered over them.
+            let plug = Int(await volume.freeBytes)
+            try await volume.createFile(named: "plug", in: HFSCatalogID.rootFolder, type: [], creator: [],
+                                        dataFork: HFSForkSource(bytes: [UInt8](repeating: 0, count: plug)), resourceFork: .empty)
+            try await volume.flush()
             await volume.close()
         }
         try Fixtures.fsck(image).clean ? () : XCTFail("setup left the volume damaged")
@@ -204,7 +169,7 @@ final class CrashSafetyTests: XCTestCase {
         var sawCatalogOverflow = false
         for round in 0..<2 {
             let volume = try open(image)
-            for i in 0..<40 {
+            for i in 0..<10 {
                 try await volume.createFolder(named: String(format: "Round %d folder %02d padding", round, i), in: HFSCatalogID.rootFolder)
             }
             try await volume.flush()
@@ -217,7 +182,7 @@ final class CrashSafetyTests: XCTestCase {
         XCTAssertTrue(sawCatalogOverflow, "the test should have forced catalog overflow extents")
         let reopened = try open(image)
         let folders = try await reopened.contents(ofFolder: HFSCatalogID.rootFolder).filter(\.isFolder)
-        XCTAssertEqual(folders.count, 80)
+        XCTAssertEqual(folders.count, 20)
     }
 
     // MARK: Hostile images
