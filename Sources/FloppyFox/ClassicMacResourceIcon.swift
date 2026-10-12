@@ -17,7 +17,7 @@ enum ClassicMacResourceIcon {
         return iconPNG(fromResourceFork: file.subdata(in: resourceStart..<resourceEnd))
     }
 
-    private static func iconPNG(fromResourceFork fork: Data) -> Data? {
+    static func iconPNG(fromResourceFork fork: Data) -> Data? {
         guard fork.count >= 16,
               let dataOffset = fork.uint32BE(at: 0),
               let mapOffset = fork.uint32BE(at: 4) else { return nil }

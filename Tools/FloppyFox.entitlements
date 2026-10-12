@@ -2,5 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Required for the Mac App Store. All disk access is done in-process by the HFS
+	     engine, so the app needs no subprocesses, mounts or helper tools. -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<!-- Read and write the disk images, and the files added or exported, that the user
+	     picks in open/save panels, drags in, or opens from the Finder. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
 </dict>
 </plist>

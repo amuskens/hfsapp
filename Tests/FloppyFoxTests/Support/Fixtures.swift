@@ -70,8 +70,7 @@ enum Fixtures {
     }
 
     static func names(in hfsPath: String) throws -> Set<String> {
-        let out = try hfs("hls", ["-a1Q", hfsPath])
-        return Set(out.split(separator: "\n").compactMap { DiskImageManager.decodeHLSQuotedName(String($0)) })
+        Set(HLSOutput.names(try hfs("hls", ["-a1Q", hfsPath])))
     }
 
     static func readFile(_ hfsPath: String, scratch: URL) throws -> Data {
@@ -122,7 +121,9 @@ extension DiskImageManager {
     /// A manager wired to a private pasteboard, so tests never clobber the developer's real
     /// clipboard and never see stray contents from it.
     static func forTesting() -> DiskImageManager {
-        let manager = DiskImageManager()
+        // Private scratch space, so tests never sweep (or get swept by) a running app.
+        let storage = TemporaryStorage(root: FileManager.default.temporaryDirectory.appendingPathComponent("FloppyFoxTests-\(UUID().uuidString)"))
+        let manager = DiskImageManager(storage: storage)
         manager.pasteboard = NSPasteboard(name: NSPasteboard.Name("com.floppyfox.tests.\(UUID().uuidString)"))
         return manager
     }
@@ -143,5 +144,61 @@ func withTimeout<T: Sendable>(_ seconds: Double, _ operation: @escaping @Sendabl
         let result = try await group.next()!
         group.cancelAll()
         return result
+    }
+}
+
+/// Parsing of hfsutils' `hls -Q` output, used to read results back through the oracle.
+enum HLSOutput {
+    static func decodeQuotedName(_ line: String) -> String? {
+        guard line.first == "\"", line.last == "\"", line.count >= 2 else { return nil }
+        let contents = Array(line.dropFirst().dropLast())
+        var bytes: [UInt8] = []
+        var index = 0
+        while index < contents.count {
+            let character = contents[index]
+            guard character == "\\" else {
+                bytes += Array(String(character).data(using: .macOSRoman) ?? Data(String(character).utf8))
+                index += 1
+                continue
+            }
+            index += 1
+            guard index < contents.count else { return nil }
+            let escaped = contents[index]
+            switch escaped {
+            case "n": bytes.append(0x0A); index += 1
+            case "b": bytes.append(0x08); index += 1
+            case "r": bytes.append(0x0D); index += 1
+            case "t": bytes.append(0x09); index += 1
+            case "f": bytes.append(0x0C); index += 1
+            case "0"..."7":
+                var digits = ""
+                while digits.count < 3, index < contents.count, ("0"..."7").contains(contents[index]) {
+                    digits.append(contents[index])
+                    index += 1
+                }
+                guard let byte = UInt8(digits, radix: 8) else { return nil }
+                bytes.append(byte)
+            default:
+                bytes += Array(String(escaped).utf8)
+                index += 1
+            }
+        }
+        return String(data: Data(bytes), encoding: .macOSRoman)
+    }
+
+    /// hls wraps long escaped names over several lines, each fragment ending in `\`.
+    static func names(_ output: String) -> [String] {
+        var names: [String] = []
+        var pending = ""
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasSuffix("\\") {
+                pending += line.dropLast()
+                continue
+            }
+            let record = pending + line
+            pending = ""
+            if let name = decodeQuotedName(record) { names.append(name) }
+        }
+        return names
     }
 }

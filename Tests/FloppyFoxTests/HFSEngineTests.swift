@@ -174,6 +174,31 @@ final class HFSEngineTests: XCTestCase {
         XCTAssertEqual(readBack, payload)
     }
 
+    /// Volumes over 32 MB use allocation blocks larger than 512 bytes; a big file on one
+    /// exercises block-size arithmetic everywhere (allocation, fork lengths, node positions).
+    /// (A blank `hformat` volume of exactly 32 MB is itself rejected by fsck_hfs, so the
+    /// sizes here are 40 MB — 1 KB blocks — and 100 MB — 2 KB blocks.)
+    func testLargeFilesOnVolumesWithLargerAllocationBlocks() async throws {
+        for sizeMB in [40, 100] {
+            try await assertLargeFileRoundTrips(onVolumeOfMB: sizeMB)
+        }
+    }
+
+    private func assertLargeFileRoundTrips(onVolumeOfMB sizeMB: Int) async throws {
+        let image = try Fixtures.makeClassicHFSImage(in: work, name: "\(sizeMB)MB.dsk", sizeKB: sizeMB * 1024)
+        let payload = randomBytes(20 * 1024 * 1024 + 123, seed: UInt64(sizeMB))
+        do {
+            let volume = try HFSVolume.open(image, readOnly: false)
+            _ = try await volume.createFile(named: try name("Big"), in: HFSCatalogID.rootFolder, type: Array("BINA".utf8), creator: Array("????".utf8),
+                                            dataFork: HFSForkSource(bytes: payload), resourceFork: .empty)
+            try await volume.flush()
+        }
+        try assertFsckClean(image)
+        try Fixtures.withMounted(image) {
+            XCTAssertEqual(try Fixtures.readFile(":Big", scratch: work), Data(payload))
+        }
+    }
+
     /// Writes names covering every Mac Roman byte; Apple's checker rejects the catalog if our
     /// ordering differs from Mac OS's anywhere.
     func testNameOrderMatchesApplesCatalogChecker() async throws {

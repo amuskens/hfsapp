@@ -49,6 +49,9 @@ struct HFSForkSource: Sendable {
 /// interrupted import never leaves a catalog entry pointing at unwritten data.
 actor HFSVolume {
     nonisolated let isReadOnly: Bool
+    /// The volume's own lock (Get Info "Locked", or a locked floppy): Mac OS won't write to it,
+    /// and neither does this engine.
+    nonisolated let isLocked: Bool
     private let device: BlockDevice
     private var mdb: MasterDirectoryBlock
     private var bitmap: [UInt8]
@@ -66,9 +69,11 @@ actor HFSVolume {
 
     init(device: BlockDevice, readOnly: Bool) throws {
         self.device = device
-        self.isReadOnly = readOnly || !device.isWritable
         guard device.length >= 1536 else { throw HFSError.notHFS }
         let mdb = try MasterDirectoryBlock(sector: try device.read(at: 1024, count: 512))
+        let locked = mdb.attributes & (MasterDirectoryBlock.softwareLockBit | MasterDirectoryBlock.hardwareLockBit) != 0
+        self.isLocked = locked
+        self.isReadOnly = readOnly || !device.isWritable || locked
         guard mdb.embeddedSignature != MasterDirectoryBlock.embeddedHFSPlusSignature else {
             throw HFSError.unsupported("Mac OS Extended (HFS+) volumes")
         }
@@ -170,7 +175,7 @@ actor HFSVolume {
 
     /// Streams a fork to `sink` in chunks of at most `chunkSize` bytes. `sink` may throw (for
     /// example `CancellationError`) to stop early.
-    func readFork(_ id: UInt32, fork: HFSFork, chunkSize: Int = 1 << 20, sink: ([UInt8]) throws -> Void) throws {
+    func readFork(_ id: UInt32, fork: HFSFork, chunkSize: Int = 1 << 20, sink: @Sendable ([UInt8]) throws -> Void) throws {
         let file = try fileRecord(id)
         let length = UInt64(file.logicalLength(fork))
         let extents = Self.forkExtents(fileID: id, fork: fork, first: file.extents(fork), overflow: extentsRecords)
@@ -192,9 +197,11 @@ actor HFSVolume {
     }
 
     func readForkBytes(_ id: UInt32, fork: HFSFork) throws -> [UInt8] {
-        var result: [UInt8] = []
-        try readFork(id, fork: fork) { result += $0 }
-        return result
+        let file = try fileRecord(id)
+        let collected = ByteCollector()
+        collected.reserve(Int(file.logicalLength(fork)))
+        try readFork(id, fork: fork) { collected.append($0) }
+        return collected.bytes
     }
 
     /// The raw 16-byte FInfo and FXInfo of a file (for MacBinary and Finder metadata export).
@@ -717,6 +724,12 @@ actor HFSVolume {
             try device.write(mdb.raw, at: alternate)
         }
     }
+}
+
+private final class ByteCollector: @unchecked Sendable {
+    private(set) var bytes: [UInt8] = []
+    func reserve(_ count: Int) { bytes.reserveCapacity(count) }
+    func append(_ chunk: [UInt8]) { bytes += chunk }
 }
 
 /// HFS timestamps: seconds since midnight 1 January 1904, *local* time.

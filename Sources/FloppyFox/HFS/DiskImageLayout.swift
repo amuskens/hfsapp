@@ -16,7 +16,12 @@ enum DiskImageLayout {
     /// `.hda` files), or the payload of a DiskCopy 4.2 image.
     static func volumes(in url: URL) throws -> [HFSVolumeLocation] {
         let device = try BlockDevice(url: url, writable: false)
-        let length = device.length
+        var length = device.length
+        // A fixed-size VHD is a raw disk followed by a 512-byte "conectix" footer, which is
+        // not part of the disk (and must never be mistaken for its last sector).
+        if length >= 1024, let footer = try? device.read(at: length - 512, count: 8), footer == Array("conectix".utf8) {
+            length -= 512
+        }
 
         func signature(at position: UInt64) -> UInt16? {
             guard position + 2 <= length, let bytes = try? device.read(at: position, count: 2) else { return nil }
@@ -27,8 +32,42 @@ enum DiskImageLayout {
         if signature(at: 1024) == MasterDirectoryBlock.signature {
             return [HFSVolumeLocation(offset: 0, length: length, partitionName: nil, readOnlyReason: nil)]
         }
-        if signature(at: 1024) == 0x482B { // "H+"
+        if let sig = signature(at: 1024), hfsPlusSignatures.contains(sig) {
             throw HFSError.unsupported("Mac OS Extended (HFS+) volumes")
+        }
+
+        // GUID Partition Table (what `hdiutil create` and modern Disk Utility make).
+        if length > 1024, let header = try? device.read(at: 512, count: 92), header.prefix(8).elementsEqual("EFI PART".utf8) {
+            let entriesStart = littleEndian(header, 72, 8) * 512
+            let entryCount = min(littleEndian(header, 80, 4), 256)
+            let entrySize = littleEndian(header, 84, 4)
+            var result: [HFSVolumeLocation] = []
+            var sawHFSPlus = false
+            if entrySize >= 128, entrySize <= 4096 {
+                for index in 0..<entryCount {
+                    let position = entriesStart + index * entrySize
+                    guard position + 128 <= length, let entry = try? device.read(at: position, count: 128) else { break }
+                    guard entry[0..<16].contains(where: { $0 != 0 }) else { continue }
+                    let start = littleEndian(entry, 32, 8) * 512
+                    let end = (littleEndian(entry, 40, 8) + 1) * 512
+                    guard start < length, end > start else { continue }
+                    switch signature(at: start + 1024) {
+                    case MasterDirectoryBlock.signature?:
+                        if let mdb = try? MasterDirectoryBlock(sector: try device.read(at: start + 1024, count: 512)),
+                           mdb.embeddedSignature == MasterDirectoryBlock.embeddedHFSPlusSignature {
+                            sawHFSPlus = true
+                        } else {
+                            result.append(HFSVolumeLocation(offset: start, length: min(end, length) - start, partitionName: nil, readOnlyReason: nil))
+                        }
+                    case let sig? where hfsPlusSignatures.contains(sig):
+                        sawHFSPlus = true
+                    default:
+                        continue
+                    }
+                }
+            }
+            if !result.isEmpty { return result }
+            if sawHFSPlus { throw HFSError.unsupported("Mac OS Extended (HFS+) volumes") }
         }
 
         // Apple Partition Map: driver descriptor "ER" in block 0 (optional), entries "PM"
@@ -62,7 +101,7 @@ enum DiskImageLayout {
                         continue
                     }
                     result.append(HFSVolumeLocation(offset: start, length: partitionLength, partitionName: cString(try entry.bytes(16, 32)), readOnlyReason: nil))
-                case 0x482B?:
+                case let sig? where hfsPlusSignatures.contains(sig):
                     sawHFSPlus = true
                 default:
                     continue
@@ -81,6 +120,13 @@ enum DiskImageLayout {
             }
         }
         throw HFSError.notHFS
+    }
+
+    /// "H+" (HFS+) and "HX" (case-sensitive HFSX).
+    private static let hfsPlusSignatures: Set<UInt16> = [0x482B, 0x4858]
+
+    private static func littleEndian(_ bytes: [UInt8], _ offset: Int, _ count: Int) -> UInt64 {
+        (0..<count).reversed().reduce(UInt64(0)) { $0 << 8 | UInt64(bytes[offset + $1]) }
     }
 
     private static func cString(_ bytes: [UInt8]) -> String {

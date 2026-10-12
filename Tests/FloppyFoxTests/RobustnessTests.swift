@@ -27,25 +27,6 @@ final class RobustnessTests: XCTestCase {
         XCTAssertFalse(err.isEmpty)
     }
 
-    // MARK: Drag and drop
-
-    /// `handleDroppedFiles` used to call `DispatchGroup.leave()` for providers without a file
-    /// URL even though it never `enter()`ed for them — an unbalanced leave traps immediately.
-    func testDroppingNonFileItemsDoesNotCrash() async throws {
-        let work = try Fixtures.makeWorkDirectory("drop")
-        defer { try? FileManager.default.removeItem(at: work) }
-        let image = try Fixtures.makeHFSPlusImage(in: work)
-        let manager = DiskImageManager.forTesting()
-        await manager.attachImage(imageURL: image)
-        addTeardownBlock { await manager.ejectImage() }
-        XCTAssertTrue(manager.isMounted)
-
-        let textOnly = NSItemProvider(object: "just some text" as NSString)
-        XCTAssertTrue(manager.handleDroppedFiles(providers: [textOnly]))
-        try await Task.sleep(for: .milliseconds(200))
-        XCTAssertNil(manager.errorMessage)
-    }
-
     // MARK: Hostile image contents
 
     func testVHDParserRejectsCorruptContainersWithoutCrashing() async throws {

@@ -3,19 +3,9 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     private struct FolderPathItem: Identifiable {
-        enum Destination {
-            case mounted(URL)
-            case hfs(String)
-        }
-
         let label: String
-        let destination: Destination
-        var id: String {
-            switch destination {
-            case .mounted(let url): "mounted:\(url.path)"
-            case .hfs(let path): "hfs:\(path)"
-            }
-        }
+        let folderID: UInt32
+        var id: UInt32 { folderID }
     }
 
     private enum BrowserViewStyle: String, CaseIterable, Identifiable {
@@ -53,7 +43,7 @@ struct ContentView: View {
 
             Divider()
 
-            if manager.isMounted || manager.usingHFSUtils {
+            if manager.isOpen {
                 mountedContent
             } else {
                 placeholderView
@@ -140,11 +130,6 @@ struct ContentView: View {
                 Text("Are you sure you want to delete these \(deleteConfirmationEntries.count) items? This action cannot be undone.")
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .didCreateDiagnosticsFile)) { note in
-            if let url = note.object as? URL {
-                NSWorkspace.shared.open(url)
-            }
-        }
         .onAppear {
             quickLook.attach(to: manager)
         }
@@ -201,7 +186,7 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.large)
-            .disabled(!manager.isMounted && !manager.usingHFSUtils)
+            .disabled(!manager.isOpen)
 
             Button {
                 Task { await manager.ejectImage() }
@@ -211,7 +196,7 @@ struct ContentView: View {
             .buttonStyle(.bordered)
             .controlSize(.large)
             .tint(.orange)
-            .disabled(!manager.isMounted && !manager.usingHFSUtils)
+            .disabled(!manager.isOpen)
         }
     }
 
@@ -257,7 +242,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             VStack(spacing: 10) {
                 ZStack {
-                    Text(manager.imageURL?.lastPathComponent ?? manager.mountPoint?.lastPathComponent ?? "Mounted Volume")
+                    Text(manager.volumeName ?? manager.imageURL?.lastPathComponent ?? "Volume")
                         .font(.title.bold())
                         .frame(maxWidth: .infinity)
                         .multilineTextAlignment(.center)
@@ -273,25 +258,23 @@ struct ContentView: View {
                         }
                     }
                 }
-                if let directory = manager.currentDirectory {
-                    Text(directory.path)
+                HStack(spacing: 8) {
+                    Text(currentHFSPath)
                         .font(.system(.caption, design: .monospaced))
                         .foregroundColor(.secondary)
-                        .multilineTextAlignment(.center)
                         .lineLimit(1)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Capsule().fill(Color(nsColor: .controlBackgroundColor)))
-                } else if manager.usingHFSUtils, let hfsPath = manager.currentHFSPath {
-                    Text(hfsPath)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .multilineTextAlignment(.center)
-                        .lineLimit(1)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Capsule().fill(Color(nsColor: .controlBackgroundColor)))
+                        .truncationMode(.head)
+                    if let free = manager.freeSpaceDescription {
+                        Text("·")
+                            .foregroundColor(.secondary)
+                        Text(free)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(Color(nsColor: .controlBackgroundColor)))
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 18)
@@ -317,7 +300,7 @@ struct ContentView: View {
                 Menu {
                     ForEach(folderPathItems) { item in
                         Button {
-                            navigate(to: item.destination)
+                            Task { await manager.navigate(toFolder: item.folderID) }
                         } label: {
                             Label(item.label, systemImage: "folder")
                         }
@@ -464,7 +447,7 @@ struct ContentView: View {
         } label: {
             Label(isPartOfSelection ? "Delete \(manager.selectedEntries.count) Items" : "Delete", systemImage: "trash")
         }
-        .disabled(entry.url == manager.currentDirectory || manager.isReadOnly)
+        .disabled(manager.isReadOnly)
     }
 
     private func row(for entry: FileEntry) -> some View {
@@ -551,8 +534,8 @@ struct ContentView: View {
             } else if let entry = manager.selectedEntry {
                 Text(entry.name)
                     .font(.headline)
-                Text(entry.url.path)
-                    .font(.caption)
+                Text(hfsPath(of: entry))
+                    .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.secondary)
                     .lineLimit(3)
                 Text(entry.isDirectory ? "Folder" : "File")
@@ -579,6 +562,8 @@ struct ContentView: View {
                             }
                             inspectorRow("Locked", value: entry.isLocked ? "Yes" : "No")
                             inspectorRow("Invisible", value: entry.isInvisible ? "Yes" : "No")
+                            inspectorRow("Created", value: entry.item.createDate.formatted(date: .abbreviated, time: .shortened))
+                            inspectorRow("Modified", value: entry.item.modifyDate.formatted(date: .abbreviated, time: .shortened))
                         }
                         .padding(.top, 8)
                     }
@@ -619,49 +604,22 @@ struct ContentView: View {
     }
 
     private var currentFolderName: String {
-        if let currentDirectory = manager.currentDirectory {
-            return currentDirectory.lastPathComponent
-        }
-        guard let path = manager.currentHFSPath, path != ":" else {
-            return manager.imageURL?.deletingPathExtension().lastPathComponent ?? "Volume"
-        }
-        return path.split(separator: ":").last.map(String.init) ?? "Volume"
+        manager.folderPath.last?.name.string ?? manager.volumeName ?? "Volume"
+    }
+
+    /// The classic colon-separated path, e.g. `Macintosh HD:System Folder:Extensions`.
+    private var currentHFSPath: String {
+        ([manager.volumeName ?? "Volume"] + manager.folderPath.map(\.name.string)).joined(separator: ":")
+    }
+
+    private func hfsPath(of entry: FileEntry) -> String {
+        currentHFSPath + ":" + entry.name
     }
 
     private var folderPathItems: [FolderPathItem] {
-        if let current = manager.currentDirectory, let root = manager.mountPoint {
-            var items: [FolderPathItem] = []
-            var cursor = current
-            while cursor.path.hasPrefix(root.path) {
-                let label = cursor == root ? root.lastPathComponent : cursor.lastPathComponent
-                items.append(FolderPathItem(label: label, destination: .mounted(cursor)))
-                if cursor == root { break }
-                let parent = cursor.deletingLastPathComponent()
-                guard parent != cursor else { break }
-                cursor = parent
-            }
-            return items
-        }
-
-        guard manager.usingHFSUtils else { return [] }
-        let volumeName = manager.imageURL?.deletingPathExtension().lastPathComponent ?? "Volume"
-        let components = (manager.currentHFSPath ?? ":").split(separator: ":").map(String.init)
-        var items: [FolderPathItem] = []
-        for count in stride(from: components.count, through: 1, by: -1) {
-            let path = ":" + components.prefix(count).joined(separator: ":")
-            items.append(FolderPathItem(label: components[count - 1], destination: .hfs(path)))
-        }
-        items.append(FolderPathItem(label: volumeName, destination: .hfs(":")))
+        var items = manager.folderPath.reversed().map { FolderPathItem(label: $0.name.string, folderID: $0.id) }
+        items.append(FolderPathItem(label: manager.volumeName ?? "Volume", folderID: HFSCatalogID.rootFolder))
         return items
-    }
-
-    private func navigate(to destination: FolderPathItem.Destination) {
-        switch destination {
-        case .mounted(let url):
-            Task { await manager.navigate(toMountedDirectory: url) }
-        case .hfs(let path):
-            Task { await manager.navigate(toHFSDirectory: path) }
-        }
     }
 
     private func presentNewFolderPrompt() {

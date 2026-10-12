@@ -82,6 +82,11 @@ final class QuickLookController: NSObject {
         // hfsutils-backed entries aren't real files on disk, so materialize a temp copy first
         // (same mechanism as drag-out and double-click-open) — Quick Look needs a real URL.
         guard let url = await manager?.materializeForPreview(entry) else { return }
+        // Each preview is a fresh export; drop the previous one so arrowing through large
+        // files doesn't accumulate copies.
+        if let previewURL {
+            TemporaryStorage.shared.remove(previewURL.deletingLastPathComponent())
+        }
         previewURL = url
         panel.dataSource = self
         if makeKey {

@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# build-app.sh: Builds the FloppyFox app bundle and generates an .icns icon
+# build-app.sh: builds Build/FloppyFox.app (universal, sandboxed) and optionally signs it for
+# distribution.
+#
+#   VERSION=1.0 BUILD_NUMBER=7 ./Tools/build-app.sh          ad-hoc signed local build
+#   RELEASE_CHANNEL=beta ...                                   shows "beta" in About
+#   SIGN_IDENTITY="Developer ID Application: …" [NOTARY_PROFILE=…]   notarized, outside the store
+#   DISTRIBUTION=appstore SIGN_IDENTITY="Apple Distribution: …" \
+#     INSTALLER_IDENTITY="3rd Party Mac Developer Installer: …" \
+#     PROVISIONING_PROFILE=path/to/FloppyFox.provisionprofile ./Tools/build-app.sh
+#                                                              Build/FloppyFox.pkg for App Store Connect
+VERSION=${VERSION:-0.1}
+BUILD_NUMBER=${BUILD_NUMBER:-1}
+RELEASE_CHANNEL=${RELEASE_CHANNEL:-}
+BUNDLE_ID=com.andersmuskens.FloppyFox
+ENTITLEMENTS=Tools/FloppyFox.entitlements
 OUTDIR=./Build/FloppyFox.app
 ICONSET=./Build/FloppyFox.iconset
 ICON=./Build/FloppyFox.icns
@@ -83,7 +97,7 @@ cat > "$OUTDIR/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key>
   <string>FloppyFox</string>
   <key>CFBundleIdentifier</key>
-  <string>com.andersmuskens.FloppyFox</string>
+  <string>$BUNDLE_ID</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -91,9 +105,13 @@ cat > "$OUTDIR/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1</string>
+  <string>$VERSION</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>$BUILD_NUMBER</string>
+  <key>FloppyFoxReleaseChannel</key>
+  <string>$RELEASE_CHANNEL</string>
+  <key>ITSAppUsesNonExemptEncryption</key>
+  <false/>
   <key>NSHumanReadableCopyright</key>
   <string>(C) 2026 Anders Muskens</string>
   <key>LSApplicationCategoryType</key>
@@ -119,6 +137,8 @@ cat > "$OUTDIR/Contents/Info.plist" <<PLIST
       <array>
         <string>dsk</string>
         <string>img</string>
+        <string>image</string>
+        <string>dc42</string>
       </array>
       <key>CFBundleTypeIconFile</key>
       <string>DiskImageDocument.icns</string>
@@ -146,8 +166,38 @@ PLIST
 echo Built app bundle at $OUTDIR
 chmod +x "$OUTDIR/Contents/MacOS/FloppyFox"
 
-# Signing and notarization only run when the caller opts in, so plain dev builds
-# (no Developer ID cert / keychain profile available) keep working untouched.
+if [ "${DISTRIBUTION:-}" = "appstore" ]; then
+  : "${SIGN_IDENTITY:?Set SIGN_IDENTITY to your Apple Distribution signing identity}"
+  : "${INSTALLER_IDENTITY:?Set INSTALLER_IDENTITY to your 3rd Party Mac Developer Installer identity}"
+  : "${PROVISIONING_PROFILE:?Set PROVISIONING_PROFILE to the Mac App Store provisioning profile of the app}"
+  cp "$PROVISIONING_PROFILE" "$OUTDIR/Contents/embedded.provisionprofile"
+
+  # App Store builds must carry the application and team identifiers from the profile.
+  PROFILE_PLIST=$(mktemp)
+  MERGED_ENTITLEMENTS=$(mktemp)
+  security cms -D -i "$PROVISIONING_PROFILE" > "$PROFILE_PLIST"
+  cp "$ENTITLEMENTS" "$MERGED_ENTITLEMENTS"
+  for key in com.apple.application-identifier com.apple.developer.team-identifier; do
+    value=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:$key" "$PROFILE_PLIST")
+    /usr/libexec/PlistBuddy -c "Add :$key string $value" "$MERGED_ENTITLEMENTS"
+  done
+
+  echo "Signing for the Mac App Store with: $SIGN_IDENTITY"
+  codesign --force --sign "$SIGN_IDENTITY" --entitlements "$MERGED_ENTITLEMENTS" "$OUTDIR"
+  codesign --verify --deep --strict --verbose=2 "$OUTDIR"
+  rm -f "$PROFILE_PLIST" "$MERGED_ENTITLEMENTS"
+
+  PKG=./Build/FloppyFox.pkg
+  rm -f "$PKG"
+  productbuild --component "$OUTDIR" /Applications --sign "$INSTALLER_IDENTITY" "$PKG"
+  echo "Built $PKG — upload it with Transporter, or:"
+  echo "  xcrun altool --upload-app -t macos -f $PKG --apiKey <key id> --apiIssuer <issuer id>"
+  exit 0
+fi
+
+# Signing and notarization only run when the caller opts in. Otherwise the app is ad-hoc
+# signed with its sandbox entitlements, so local builds run under the same App Sandbox as
+# the store build and sandbox problems show up during development.
 if [ -n "${SIGN_IDENTITY:-}" ]; then
   echo "Code signing with identity: $SIGN_IDENTITY"
   codesign --force --deep --options runtime --timestamp \
@@ -174,7 +224,8 @@ if [ -n "${SIGN_IDENTITY:-}" ]; then
     echo "NOTARY_PROFILE not set; skipping notarization. Set it to notarize and staple."
   fi
 else
-  echo "SIGN_IDENTITY not set; skipping code signing and notarization."
+  codesign --force --sign - --entitlements "$ENTITLEMENTS" "$OUTDIR"
+  echo "SIGN_IDENTITY not set; ad-hoc signed with the sandbox entitlements (not distributable)."
   echo "Set SIGN_IDENTITY=\"Developer ID Application: Your Name (TEAMID)\" to sign,"
   echo "and NOTARY_PROFILE=<keychain profile name> to also notarize."
 fi
