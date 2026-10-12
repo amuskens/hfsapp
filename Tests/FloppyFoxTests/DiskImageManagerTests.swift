@@ -408,12 +408,85 @@ final class DiskImageManagerTests: XCTestCase {
         XCTAssertNoThrow(try reopened.entry(named: "In VHD"))
     }
 
-    func testHFSPlusImagesReportAClearError() async throws {
-        let image = try Fixtures.makeHFSPlusImage(in: work)
-        let manager = DiskImageManager.forTesting()
-        await manager.attachImage(imageURL: image)
+    /// Mac OS Extended volumes go through the same app paths as classic HFS: here import,
+    /// copy, rename-free paste, delete and export on a fresh HFS Plus volume.
+    func testHFSPlusVolumesWorkThroughTheApp() async throws {
+        let image = try HFSPlusFixtures.makeVolume(in: work)
+        let manager = try await open(image)
+        XCTAssertFalse(manager.isReadOnly)
+        XCTAssertEqual(manager.formatName, "Mac OS Extended")
+        let long = String(repeating: "Long name ", count: 8) + ".txt" // fine on HFS Plus, not on HFS
+        await manager.importFiles(urls: [try hostFile(long, "long"), try hostFile("Café.txt", "café")])
+        XCTAssertNil(manager.errorMessage)
+        XCTAssertTrue(manager.entries.contains { $0.name == long })
+        manager.copyEntry(try manager.entry(named: "Café.txt"))
+        await manager.performPaste()
+        await manager.deleteEntries([try manager.entry(named: long)])
+        XCTAssertEqual(Set(manager.entries.map(\.name)), ["Café.txt", "Café.txt copy"])
+        await manager.ejectImage()
+        let verdict = try Fixtures.fsck(image)
+        XCTAssertTrue(verdict.clean, verdict.output)
+        try HFSPlusFixtures.withMounted(image) { root in
+            XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("Café.txt copy"), encoding: .utf8), "café")
+        }
+    }
+
+    func testJournaledVolumesOpenReadOnlyWithAReason() async throws {
+        let image = try Fixtures.makeHFSPlusImage(in: work, fileSystem: "JHFS+")
+        let manager = try await open(image)
+        XCTAssertTrue(manager.isReadOnly)
+        XCTAssertTrue(manager.readOnlyReason?.contains("journaled") == true, manager.readOnlyReason ?? "no reason")
+    }
+
+    func testVolumeThatWasNotEjectedCleanlyCanBeOpenedForWritingOnRequest() async throws {
+        let image = try Fixtures.makeClassicHFSImage(in: work)
+        var bytes = Array(try Data(contentsOf: image))
+        bytes[1024 + 10] &= ~0x01
+        try Data(bytes).write(to: image)
+        let manager = try await open(image)
+        XCTAssertTrue(manager.isReadOnly)
+        XCTAssertTrue(manager.canOpenForWritingAnyway)
+        await manager.reopenAllowingWrites()
+        XCTAssertFalse(manager.isReadOnly)
+        await manager.createFolder(named: "Now Writable")
+        XCTAssertNil(manager.errorMessage)
+    }
+
+    /// Review finding: a symlink in an imported folder was stored as a truncated file.
+    func testSymbolicLinksAreSkippedNotTruncated() async throws {
+        let image = try Fixtures.makeClassicHFSImage(in: work)
+        let folder = work.appendingPathComponent("WithLink", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let target = work.appendingPathComponent("target.bin")
+        try Data(repeating: 7, count: 100_000).write(to: target)
+        try FileManager.default.createSymbolicLink(at: folder.appendingPathComponent("link"), withDestinationURL: target)
+        try Data("real".utf8).write(to: folder.appendingPathComponent("real.txt"))
+        let manager = try await open(image)
+        await manager.importFiles(urls: [folder])
+        XCTAssertNil(manager.errorMessage)
+        XCTAssertTrue(manager.statusMessage.contains("symbolic link"), manager.statusMessage)
+        await manager.navigate(into: try manager.entry(named: "WithLink"))
+        XCTAssertEqual(manager.entries.map(\.name), ["real.txt"])
+    }
+
+    /// Review finding: an import kept writing through the old engine after Eject.
+    func testEjectingDuringAnImportStopsItAndLeavesAConsistentVolume() async throws {
+        let image = try Fixtures.makeClassicHFSImage(in: work, sizeKB: 40 * 1024)
+        let files = try (0..<30).map { try hostFile("file \($0).txt", String(repeating: "x", count: 50_000)) }
+        let manager = try await open(image)
+        manager.transferProgressObserver = { [weak manager] message in
+            if message.contains("file 5.txt") { Task { await manager?.ejectImage() } }
+        }
+        await manager.importFiles(urls: files)
+        try await Task.sleep(for: .milliseconds(300))
         XCTAssertFalse(manager.isOpen)
-        XCTAssertTrue(manager.errorMessage?.contains("HFS+") == true, manager.errorMessage ?? "no error")
+        let before = try Data(contentsOf: image)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(try Data(contentsOf: image), before, "the image changed after Eject")
+        let verdict = try Fixtures.fsck(image)
+        XCTAssertTrue(verdict.clean, verdict.output)
+        let reopened = try await open(image)
+        XCTAssertLessThan(reopened.entries.count, 30)
     }
 
     // MARK: Drag and drop, temporary files

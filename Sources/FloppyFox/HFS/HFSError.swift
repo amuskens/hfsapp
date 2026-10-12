@@ -12,6 +12,9 @@ enum HFSError: LocalizedError, Equatable {
     case catalogFull
     case readOnly
     case invalidMove(String)
+    case closed
+    case modifiedElsewhere
+    case inUse
 
     var errorDescription: String? {
         switch self {
@@ -37,6 +40,12 @@ enum HFSError: LocalizedError, Equatable {
             return "The volume is read-only."
         case .invalidMove(let detail):
             return detail
+        case .closed:
+            return "The image was closed."
+        case .modifiedElsewhere:
+            return "The image was changed by another program while it was open here. To avoid overwriting those changes, nothing was saved; reopen the image to continue."
+        case .inUse:
+            return "Another program is using the image."
         }
     }
 }

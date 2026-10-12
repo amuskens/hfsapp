@@ -4,17 +4,18 @@ A macOS app project for browsing and editing Apple HFS disk images (`.hda`, `.ds
 
 It allows you to:
 
-- open classic HFS volumes: floppy images, partitioned hard-disk images (BlueSCSI `.hda`),
-  and fixed or dynamic VHD containers
+- open Mac OS Standard (HFS) and Mac OS Extended (HFS+) volumes: floppy images, partitioned
+  hard-disk images (BlueSCSI `.hda`), Mac OS 8.1–9 disks, and fixed or dynamic VHD containers
 - explore folders and files inside the volume
 - copy, move and delete files and folders inside the image
 - add files by dragging from Finder or pasting; MacBinary `.bin` files are unpacked
 - copy files out by dragging, the clipboard, or Export, with resource forks and Finder
   type/creator preserved
 
-FloppyFox reads and writes HFS with its own engine (`Sources/FloppyFox/HFS/`): no `hdiutil`
-mounts and no external tools, so it runs inside the App Sandbox and can ship on the Mac App
-Store. Mac OS Extended (HFS+) volumes aren't supported yet.
+FloppyFox reads and writes HFS and HFS+ with its own engine (`Sources/FloppyFox/HFS/`): no
+`hdiutil` mounts and no external tools, so it runs inside the App Sandbox and can ship on the
+Mac App Store. Saving is crash-safe: new B-trees are written to free space and a single
+volume-header write commits them, so an interrupted save leaves the old or the new volume.
 
 ## Prerequisites
 
@@ -72,16 +73,23 @@ Tests that need it are skipped when it's missing.
 
 - **Unit tests** (`ParsingTests`, `RobustnessTests`) cover name conversion and ordering,
   subprocess plumbing, and fuzzed VHD and resource-fork input.
-- **Engine tests** (`HFSEngineTests`) drive `HFSVolume` directly: multi-level catalog growth,
-  extents-overflow files, large allocation blocks, cancelled writes, corrupted images.
+- **Engine tests** (`HFSEngineTests`, `HFSPlusEngineTests`) drive the engines directly:
+  multi-level catalog growth, extents-overflow files, large allocation blocks, Unicode names,
+  case-sensitive HFSX, cancelled writes, corrupted images. HFS+ results are also mounted with
+  macOS's own driver.
+- **Crash-safety tests** (`CrashSafetyTests`, plus a sweep in `HFSPlusEngineTests`) cut off a
+  save after every possible number of writes and check the volume is the old or the new one;
+  they also cover freed-block reuse, fragmented catalog growth, hostile partition tables and
+  catalogs, file locking and changes made by other programs.
 - **App tests** (`DiskImageManagerTests`) cover what the window does: import, export,
   copy/cut/paste, delete, read-only cases and cancellation.
 
 Every test that writes a volume also runs Apple's `fsck_hfs -n` on the result. It checks
 B-tree structure, catalog key order, valences, the allocation bitmap and the MDB totals.
 
-Set `FLOPPYFOX_REAL_HDA=/path/to/image.hda` to also edit a clone of a real Mac OS-written
-hard-disk image and fsck it (the original is never modified).
+Set `FLOPPYFOX_REAL_HDA=/path/to/image.hda` (a System 6/7 disk) and
+`FLOPPYFOX_REAL_HFSPLUS_HDA=/path/to/image.hda` (a Mac OS 8.1–9 disk) to also edit clones of
+real Mac OS-written hard-disk images and fsck them (the originals are never modified).
 
 If the command-line tools are not using the full Xcode SDK, specify it explicitly:
 
@@ -131,3 +139,10 @@ notarytool keychain profile instead.
 - `Sources/FloppyFox/ContentView.swift` and `HFSApp.swift` are the SwiftUI interface and menus
 - `Tools/` has the build script, sandbox entitlements and icon generators
 - `Package.swift` defines the macOS platform target and test target
+
+## Third-party code
+
+`Sources/FloppyFox/HFS/HFSPlusCaseFolding.swift` contains Apple's HFS Plus case-folding
+tables, generated from `UCStringCompareData.h` in Apple's open-source
+[hfs](https://github.com/apple-oss-distributions/hfs) project. That file is covered by the
+Apple Public Source License 2.0, whose notice it carries; the rest of FloppyFox is MIT-licensed.

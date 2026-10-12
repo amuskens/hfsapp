@@ -27,9 +27,9 @@ enum Fixtures {
         return url
     }
 
-    static func makeHFSPlusImage(in directory: URL, name: String = "Plus.dmg", sizeMB: Int = 32, label: String = "FloppyFoxPlus") throws -> URL {
+    static func makeHFSPlusImage(in directory: URL, name: String = "Plus.dmg", sizeMB: Int = 32, label: String = "FloppyFoxPlus", fileSystem: String = "HFS+") throws -> URL {
         let url = directory.appendingPathComponent(name)
-        let result = run("/usr/bin/hdiutil", ["create", "-size", "\(sizeMB)m", "-fs", "HFS+", "-volname", label, url.path])
+        let result = run("/usr/bin/hdiutil", ["create", "-size", "\(sizeMB)m", "-fs", fileSystem, "-volname", label, url.path])
         guard result.status == 0 else { throw XCTSkip("hdiutil create is unavailable here: \(result.output)") }
         return url
     }
@@ -92,7 +92,8 @@ enum Fixtures {
             line.split(whereSeparator: \.isWhitespace).first(where: { $0.hasPrefix("/dev/disk") }).map(String.init)
         }
         guard attach.status == 0, let wholeDisk = lines.lazy.compactMap(device).first else {
-            throw XCTSkip("hdiutil could not attach \(image.lastPathComponent) for fsck: \(attach.output)")
+            // A failure, not a skip: a skipped fsck would hide exactly the problems it checks for.
+            throw NSError(domain: "Fixtures", code: 2, userInfo: [NSLocalizedDescriptionKey: "hdiutil could not attach \(image.lastPathComponent) for fsck (is it still open?): \(attach.output)"])
         }
         defer { _ = run("/usr/bin/hdiutil", ["detach", wholeDisk]) }
         // A partitioned image: check its HFS partition rather than the whole disk.
@@ -201,4 +202,18 @@ enum HLSOutput {
         }
         return names
     }
+}
+
+extension DiskVolume {
+    /// The pre-`NewFileMetadata` shape of `createFile`, for brevity in tests.
+    @discardableResult
+    func createFile(named name: String, in parentID: UInt32, type: [UInt8], creator: [UInt8], dataFork: HFSForkSource, resourceFork: HFSForkSource) throws -> UInt32 {
+        try createFile(named: name, in: parentID, metadata: NewFileMetadata(fileType: type, creator: creator), dataFork: dataFork, resourceFork: resourceFork)
+    }
+}
+
+/// `volume.child(named:inFolder:)`, unwrapped (await can't appear inside XCTUnwrap).
+func childItem(_ volume: any DiskVolume, _ name: String, in folder: UInt32, file: StaticString = #filePath, line: UInt = #line) async throws -> VolumeItem {
+    let item = await volume.child(named: name, inFolder: folder)
+    return try XCTUnwrap(item, "no \(name) in folder \(folder)", file: file, line: line)
 }

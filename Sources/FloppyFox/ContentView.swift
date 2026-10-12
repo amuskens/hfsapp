@@ -89,6 +89,12 @@ struct ContentView: View {
             Text(message)
         }
         .alert("Opened Read-Only", isPresented: .constant(manager.warningMessage != nil), presenting: manager.warningMessage) { message in
+            if manager.canOpenForWritingAnyway {
+                Button("Open for Writing Anyway") {
+                    manager.warningMessage = nil
+                    Task { await manager.reopenAllowingWrites() }
+                }
+            }
             Button("OK", role: .cancel) {
                 manager.warningMessage = nil
             }
@@ -604,12 +610,12 @@ struct ContentView: View {
     }
 
     private var currentFolderName: String {
-        manager.folderPath.last?.name.string ?? manager.volumeName ?? "Volume"
+        manager.folderPath.last?.name ?? manager.volumeName ?? "Volume"
     }
 
     /// The classic colon-separated path, e.g. `Macintosh HD:System Folder:Extensions`.
     private var currentHFSPath: String {
-        ([manager.volumeName ?? "Volume"] + manager.folderPath.map(\.name.string)).joined(separator: ":")
+        ([manager.volumeName ?? "Volume"] + manager.folderPath.map(\.name)).joined(separator: ":")
     }
 
     private func hfsPath(of entry: FileEntry) -> String {
@@ -617,7 +623,7 @@ struct ContentView: View {
     }
 
     private var folderPathItems: [FolderPathItem] {
-        var items = manager.folderPath.reversed().map { FolderPathItem(label: $0.name.string, folderID: $0.id) }
+        var items = manager.folderPath.reversed().map { FolderPathItem(label: $0.name, folderID: $0.id) }
         items.append(FolderPathItem(label: manager.volumeName ?? "Volume", folderID: HFSCatalogID.rootFolder))
         return items
     }

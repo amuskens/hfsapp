@@ -6,7 +6,7 @@ FloppyFox reads and writes HFS volumes itself. It doesn't mount images in macOS 
 
 ## Features
 
-- Open classic HFS (Mac OS Standard) volumes: floppy images, partitioned hard-disk images such as BlueSCSI `.hda` files, and fixed or dynamic VHD containers.
+- Open Mac OS Standard (HFS) and Mac OS Extended (HFS+) volumes: floppy images, partitioned hard-disk images such as BlueSCSI `.hda` files, Mac OS 8.1–9 disks, and fixed or dynamic VHD containers.
 - Browse folders and files in list or icon view.
 - Add files and folders by dragging from Finder or pasting from the clipboard. MacBinary (`.bin`) files are unpacked automatically.
 - Copy files and folders to Finder using drag and drop, the clipboard, or Export. Resource forks and Finder type/creator codes come along, so classic applications keep working when copied back.
@@ -29,12 +29,16 @@ Some images open read-only. FloppyFox tells you why when it opens one:
 
 - The image file's permissions don't allow writing, or the volume itself is locked.
 - Another program, such as an emulator, has the image open.
+- The volume wasn't ejected properly (for example, an emulator crashed while using it). If nothing else is using the image, choose **Open for Writing Anyway**.
+- Journaled Mac OS Extended volumes (from Mac OS X) are read-only.
 - Dynamic VHD and DiskCopy 4.2 images: changes can't be written back to these containers.
+
+Changes are saved safely: if your Mac loses power while FloppyFox is saving, the disk keeps either its previous contents or the new ones.
 
 ## Not supported yet
 
-- Mac OS Extended (HFS+) volumes, used by Mac OS 8.1 and later.
-- When a hard-disk image has several HFS partitions, only the first one is shown.
+- When a hard-disk image has several partitions, only the first one is shown.
+- On Mac OS Extended volumes, hard links and files with extended attributes can't be deleted.
 
 ## Support
 

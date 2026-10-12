@@ -22,10 +22,11 @@ final class HFSEngineTests: XCTestCase {
         XCTAssertTrue(verdict.clean, "fsck_hfs rejected the volume:\n\(verdict.output)", file: file, line: line)
     }
 
-    private func name(_ string: String) throws -> HFSName { try HFSName(string) }
+    /// Names are plain strings; the volume validates them.
+    private func name(_ string: String) throws -> String { string }
 
-    private func child(_ volume: HFSVolume, _ name: String, in folder: UInt32, file: StaticString = #filePath, line: UInt = #line) async throws -> HFSItem {
-        let item = await volume.child(named: try HFSName(name), inFolder: folder)
+    private func child(_ volume: HFSVolume, _ name: String, in folder: UInt32, file: StaticString = #filePath, line: UInt = #line) async throws -> VolumeItem {
+        let item = await volume.child(named: name, inFolder: folder)
         return try XCTUnwrap(item, "no \(name) in folder \(folder)", file: file, line: line)
     }
 
@@ -40,7 +41,7 @@ final class HFSEngineTests: XCTestCase {
         let image = try Fixtures.makeClassicHFSImage(in: work)
         let data = randomBytes(5000, seed: 1)
         let resource = randomBytes(700, seed: 2)
-        let macBinary = MacBinaryFile(name: try name("Both Forks"), fileType: Array("APPL".utf8), creator: Array("TEST".utf8), finderFlags: 0, dataFork: data, resourceFork: resource)
+        let macBinary = MacBinaryFile(name: try HFSName("Both Forks"), fileType: Array("APPL".utf8), creator: Array("TEST".utf8), finderFlags: 0, dataFork: data, resourceFork: resource)
         let binURL = work.appendingPathComponent("both.bin")
         try Data(macBinary.encoded()).write(to: binURL)
         try Fixtures.withMounted(image) {
@@ -52,21 +53,21 @@ final class HFSEngineTests: XCTestCase {
 
         let volume = try HFSVolume.open(image, readOnly: true)
         let root = try await volume.contents(ofFolder: HFSCatalogID.rootFolder)
-        XCTAssertEqual(Set(root.map(\.name.string)), ["Folder", "Plain"])
-        let plain = try XCTUnwrap(root.first { $0.name.string == "Plain" })
+        XCTAssertEqual(Set(root.map(\.name)), ["Folder", "Plain"])
+        let plain = try XCTUnwrap(root.first { $0.name == "Plain" })
         XCTAssertEqual(plain.fileType, Array("TEXT".utf8))
         XCTAssertEqual(plain.creator, Array("ttxt".utf8))
         let folder = try XCTUnwrap(root.first { $0.isFolder })
         XCTAssertEqual(folder.valence, 2)
 
         let inner = try await volume.contents(ofFolder: folder.id)
-        let both = try XCTUnwrap(inner.first { $0.name.string == "Both Forks" })
+        let both = try XCTUnwrap(inner.first { $0.name == "Both Forks" })
         XCTAssertEqual(both.fileType, Array("APPL".utf8))
         let readData = try await volume.readForkBytes(both.id, fork: .data)
         let readResource = try await volume.readForkBytes(both.id, fork: .resource)
         XCTAssertEqual(readData, data)
         XCTAssertEqual(readResource, resource)
-        let path = try await volume.path(of: both.id).map(\.name.string)
+        let path = try await volume.path(of: both.id).map(\.name)
         XCTAssertEqual(path, ["Folder", "Both Forks"])
     }
 
@@ -209,7 +210,7 @@ final class HFSEngineTests: XCTestCase {
             for byte in UInt8(1)...UInt8(255) where byte != UInt8(ascii: ":") {
                 for bytes in [[byte], [UInt8(ascii: "a"), byte], [byte, UInt8(ascii: "z"), byte]] {
                     do {
-                        _ = try await volume.createFolder(named: HFSName(bytes: bytes), in: HFSCatalogID.rootFolder)
+                        _ = try await volume.createFolder(named: HFSName(bytes: bytes).string, in: HFSCatalogID.rootFolder)
                         created += 1
                     } catch HFSError.alreadyExists, HFSError.invalidName {
                         // Case-insensitively equal to a name already present (e.g. "a" vs "A"),
@@ -242,6 +243,7 @@ final class HFSEngineTests: XCTestCase {
         // A case-only rename is allowed.
         try await volume.move(folder, to: HFSCatalogID.rootFolder, newName: try name("README"))
         try await volume.flush()
+        await volume.close()
         try assertFsckClean(image)
         try Fixtures.withMounted(image) { XCTAssertEqual(try Fixtures.names(in: ":"), ["README"]) }
     }
@@ -275,6 +277,7 @@ final class HFSEngineTests: XCTestCase {
         // space; the structures must be byte-identical.
         let after = try Data(contentsOf: image)
         XCTAssertEqual(after.prefix(1536), before.prefix(1536), "boot blocks and MDB changed")
+        await volume.close()
         try assertFsckClean(image)
     }
 
@@ -348,7 +351,7 @@ final class HFSEngineTests: XCTestCase {
         let url = URL(fileURLWithPath: "/Users/amuskens/Downloads/ PreInstalled MacOS Images/HD0-OpenRetroSCSI-7.1.hda")
         guard FileManager.default.fileExists(atPath: url.path) else { throw XCTSkip("real HDA fixture not present") }
         let volume = try HFSVolume.open(url, readOnly: true)
-        let names = Set(try await volume.contents(ofFolder: HFSCatalogID.rootFolder).map(\.name.string))
+        let names = Set(try await volume.contents(ofFolder: HFSCatalogID.rootFolder).map(\.name))
         XCTAssertTrue(names.contains("System Folder 7.1"), "\(names)")
         XCTAssertTrue(names.contains("SimpleText"))
     }
@@ -374,13 +377,13 @@ final class HFSEngineTests: XCTestCase {
             // Any root file with a resource fork (an application or document) to duplicate,
             // and any other root item to move.
             let simpleText = try XCTUnwrap(root.first { !$0.isFolder && $0.resourceLength > 0 }, "no root file with a resource fork")
-            sourceName = simpleText.name.string
+            sourceName = simpleText.name
             let folder = try await volume.createFolder(named: try name("FloppyFox Test"), in: HFSCatalogID.rootFolder)
             _ = try await volume.createFile(named: try name("Imported"), in: folder, type: Array("APPL".utf8), creator: Array("FFOX".utf8),
                                             dataFork: HFSForkSource(bytes: payload), resourceFork: HFSForkSource(bytes: resource))
             _ = try await volume.copyFile(simpleText.id, to: folder, name: try name("SimpleText Copy"))
             let movable = try XCTUnwrap(root.first { $0.id != simpleText.id && !$0.isLocked })
-            movedName = movable.name.string
+            movedName = movable.name
             try await volume.move(movable.id, to: folder, newName: try name("Moved Item"))
             try await volume.flush()
         }
@@ -400,7 +403,7 @@ final class HFSEngineTests: XCTestCase {
         let imported = try await child(volume, "Imported", in: folder.id)
         let importedData = try await volume.readForkBytes(imported.id, fork: .data)
         XCTAssertEqual(importedData, payload)
-        let rootNames = Set(try await volume.contents(ofFolder: HFSCatalogID.rootFolder).map(\.name.string))
+        let rootNames = Set(try await volume.contents(ofFolder: HFSCatalogID.rootFolder).map(\.name))
         XCTAssertFalse(rootNames.contains(movedName))
         _ = try await child(volume, "Moved Item", in: folder.id)
     }
@@ -408,7 +411,7 @@ final class HFSEngineTests: XCTestCase {
     // MARK: MacBinary
 
     func testMacBinaryRoundTripsAndInteroperatesWithHFSUtils() throws {
-        let file = MacBinaryFile(name: try name("Round Trip"), fileType: Array("PICT".utf8), creator: Array("MDRW".utf8), finderFlags: 0x4100,
+        let file = MacBinaryFile(name: try HFSName("Round Trip"), fileType: Array("PICT".utf8), creator: Array("MDRW".utf8), finderFlags: 0x4100,
                                  dataFork: randomBytes(333, seed: 6), resourceFork: randomBytes(129, seed: 7))
         XCTAssertEqual(MacBinaryFile.decode(file.encoded()), file)
         XCTAssertNil(MacBinaryFile.decode(Array("definitely not macbinary, just text".utf8) + [UInt8](repeating: 0, count: 200)))

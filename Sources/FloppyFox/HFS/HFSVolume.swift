@@ -1,25 +1,5 @@
 import Foundation
 
-/// One catalog item as the rest of the app sees it.
-struct HFSItem: Sendable, Hashable, Identifiable {
-    let id: UInt32
-    let parentID: UInt32
-    let name: HFSName
-    let isFolder: Bool
-    let dataLength: UInt32
-    let resourceLength: UInt32
-    let fileType: [UInt8]
-    let creator: [UInt8]
-    let finderFlags: UInt16
-    let isLocked: Bool
-    let createDate: Date
-    let modifyDate: Date
-    let valence: Int
-
-    static let invisibleFlag: UInt16 = 0x4000
-    var isInvisible: Bool { finderFlags & Self.invisibleFlag != 0 }
-}
-
 /// Where a fork's bytes come from when writing a file: its length and a reader for ranges.
 struct HFSForkSource: Sendable {
     let length: UInt64
@@ -39,41 +19,66 @@ struct HFSForkSource: Sendable {
     }
 }
 
-/// A classic HFS volume opened read/write (or read-only) directly from an image file — no
-/// kernel filesystem, no external tools, so it works inside the App Sandbox.
+/// A classic HFS (Mac OS Standard) volume opened directly from an image file — no kernel
+/// filesystem, no external tools, so it works inside the App Sandbox.
 ///
-/// The whole catalog and extents-overflow tree are held in memory as sorted record arrays.
-/// Mutations edit those arrays and the allocation bitmap; `flush()` writes freshly built
-/// B-trees, the bitmap and the master directory block back to the image. File data is
-/// written to newly allocated blocks *before* any catalog change refers to them, so an
-/// interrupted import never leaves a catalog entry pointing at unwritten data.
-actor HFSVolume {
+/// The catalog and extents-overflow trees are held in memory as sorted record arrays, along
+/// with the allocation bitmap. Mutations edit those; `flush()` commits them atomically:
+///
+/// 1. new file data is already in blocks that were free on disk (`AllocationMap`);
+/// 2. freshly built B-trees are written to *other* free blocks;
+/// 3. the bitmap is written with both old and new structures marked in use;
+/// 4. one write of the master directory block switches to the new trees — the commit;
+/// 5. the bitmap is rewritten with the old trees' blocks released.
+///
+/// A crash at any point leaves either the old or the new volume, at worst with some blocks
+/// marked in use that nothing references (which fsck / Disk First Aid tidies up). If a flush
+/// fails, the in-memory state rolls back to the last commit.
+actor HFSVolume: DiskVolume {
     nonisolated let isReadOnly: Bool
-    /// The volume's own lock (Get Info "Locked", or a locked floppy): Mac OS won't write to it,
-    /// and neither does this engine.
-    nonisolated let isLocked: Bool
+    nonisolated let readOnlyCause: ReadOnlyCause?
+    nonisolated let formatName = "Mac OS Standard"
+    nonisolated var isLocked: Bool { readOnlyCause == .locked }
+
     private let device: BlockDevice
+    private let blockSize: Int
+    private let blockCount: Int
+    private let firstBlockOffset: UInt64
+
     private var mdb: MasterDirectoryBlock
-    private var bitmap: [UInt8]
+    private var allocation: AllocationMap
     private var catalog: [CatalogRecord]
     private var extentsRecords: [(key: ExtentsKey, record: ExtentRecord)]
     private var catalogHeader: BTree.Header
     private var extentsHeader: BTree.Header
     private var keyByID: [UInt32: CatalogKey] = [:]
+
+    /// Everything as of the last commit, for rollback.
+    private struct Committed {
+        var mdb: MasterDirectoryBlock
+        var bitmap: [UInt8]
+        var catalog: [CatalogRecord]
+        var extentsRecords: [(key: ExtentsKey, record: ExtentRecord)]
+        var catalogHeader: BTree.Header
+        var extentsHeader: BTree.Header
+        var keyByID: [UInt32: CatalogKey]
+    }
+    private var committed: Committed!
+    /// The MDB sector as this engine last saw or wrote it; anything else on disk means
+    /// another program wrote to the volume.
+    private var lastKnownMDBSector: [UInt8]
     private var dirty = false
     private var markedInUse = false
+    private var isClosed = false
 
-    private let blockSize: Int
-    private let blockCount: Int
-    private let firstBlockOffset: UInt64
-
-    init(device: BlockDevice, readOnly: Bool) throws {
+    /// `forcedReadOnly` opens the volume without write access for that reason; otherwise it is
+    /// writable unless locked or not cleanly unmounted (`allowUncleanVolume` overrides the
+    /// latter, at the user's request).
+    init(device: BlockDevice, forcedReadOnly: ReadOnlyCause? = nil, allowUncleanVolume: Bool = false) throws {
         self.device = device
         guard device.length >= 1536 else { throw HFSError.notHFS }
-        let mdb = try MasterDirectoryBlock(sector: try device.read(at: 1024, count: 512))
-        let locked = mdb.attributes & (MasterDirectoryBlock.softwareLockBit | MasterDirectoryBlock.hardwareLockBit) != 0
-        self.isLocked = locked
-        self.isReadOnly = readOnly || !device.isWritable || locked
+        let sector = try device.read(at: 1024, count: 512)
+        let mdb = try MasterDirectoryBlock(sector: sector)
         guard mdb.embeddedSignature != MasterDirectoryBlock.embeddedHFSPlusSignature else {
             throw HFSError.unsupported("Mac OS Extended (HFS+) volumes")
         }
@@ -85,15 +90,30 @@ actor HFSVolume {
         guard firstBlockOffset + UInt64(mdb.allocationBlockCount) * UInt64(blockSize) <= device.length else {
             throw HFSError.corrupt("volume is larger than its image")
         }
+
+        var cause: ReadOnlyCause?
+        if let forcedReadOnly {
+            cause = forcedReadOnly
+        } else if !device.isWritable {
+            cause = .requested
+        } else if mdb.attributes & (MasterDirectoryBlock.softwareLockBit | MasterDirectoryBlock.hardwareLockBit) != 0 {
+            cause = .locked
+        } else if mdb.attributes & MasterDirectoryBlock.unmountedCleanlyBit == 0 && !allowUncleanVolume {
+            cause = .notCleanlyUnmounted
+        }
+        self.readOnlyCause = cause
+        self.isReadOnly = cause != nil
         self.mdb = mdb
+        self.lastKnownMDBSector = sector
         self.blockSize = blockSize
         self.blockCount = Int(mdb.allocationBlockCount)
         self.firstBlockOffset = firstBlockOffset
 
-        let bitmapBytes = (blockCount + 7) / 8
-        bitmap = try device.read(at: UInt64(mdb.bitmapStartSector) * 512, count: bitmapBytes)
+        let bitmap = try device.read(at: UInt64(mdb.bitmapStartSector) * 512, count: (Int(mdb.allocationBlockCount) + 7) / 8)
+        // Apple's HFS never allocates a volume's final allocation block, and fsck_hfs flags any
+        // extent that reaches it, although the MDB still counts it as free.
+        self.allocation = AllocationMap(bitmap: bitmap, blockCount: Int(mdb.allocationBlockCount), allocatableCount: Int(mdb.allocationBlockCount) - 1, maxRunLength: Int(UInt16.max))
 
-        // The extents file can't overflow, so its extents are entirely in the MDB.
         let extentsFork = Self.extentList(mdb.extentsFileExtents)
         let extentsSize = Int(mdb.extentsFileSize)
         let (extentsHeader, extentsRaw) = try BTree.readLeafRecords { node in
@@ -107,7 +127,6 @@ actor HFSVolume {
         self.extentsHeader = extentsHeader
         self.extentsRecords = extentsRecords
 
-        // The catalog may continue in the extents-overflow file.
         let catalogFork = Self.forkExtents(fileID: HFSCatalogID.catalogFile, fork: .data, first: mdb.catalogFileExtents, overflow: extentsRecords)
         let catalogSize = Int(mdb.catalogFileSize)
         let (catalogHeader, catalogRaw) = try BTree.readLeafRecords { node in
@@ -125,62 +144,81 @@ actor HFSVolume {
         }
         self.catalogHeader = catalogHeader
         self.catalog = catalog
+
+        // Every ID must be unique and no folder may be its own parent; otherwise walking the
+        // hierarchy (moves, recursive copies and deletes) could loop forever.
+        var keyByID: [UInt32: CatalogKey] = [:]
         for record in catalog {
+            let id: UInt32
             switch record.type {
-            case .folder: if let folder = try? FolderRecord(raw: record.data) { keyByID[folder.id] = record.key }
-            case .file: if let file = try? FileRecord(raw: record.data) { keyByID[file.id] = record.key }
-            default: break
+            case .folder:
+                guard let folder = try? FolderRecord(raw: record.data) else { continue }
+                id = folder.id
+                guard id != record.key.parentID else { throw HFSError.corrupt("a folder is its own parent") }
+            case .file:
+                guard let file = try? FileRecord(raw: record.data) else { continue }
+                id = file.id
+            default:
+                continue
             }
+            guard keyByID.updateValue(record.key, forKey: id) == nil else { throw HFSError.corrupt("two catalog entries share ID \(id)") }
         }
-        guard keyByID[HFSCatalogID.rootFolder] != nil else { throw HFSError.corrupt("root folder is missing") }
+        guard let rootKey = keyByID[HFSCatalogID.rootFolder], rootKey.parentID == HFSCatalogID.rootParent else {
+            throw HFSError.corrupt("root folder is missing")
+        }
+        self.keyByID = keyByID
+        self.committed = Committed(mdb: mdb, bitmap: bitmap, catalog: catalog, extentsRecords: extentsRecords,
+                                   catalogHeader: catalogHeader, extentsHeader: extentsHeader, keyByID: keyByID)
     }
 
     // MARK: - Reading
 
-    var volumeName: HFSName { mdb.volumeName }
-    /// Space available for new files (see `allocatableBlockCount`).
-    var freeBytes: UInt64 { UInt64(allocatableFreeBlockCount) * UInt64(blockSize) }
+    var volumeName: String { mdb.volumeName.string }
+    var freeBytes: UInt64 { UInt64(allocation.availableCount) * UInt64(blockSize) }
     var totalBytes: UInt64 { UInt64(blockCount) * UInt64(blockSize) }
 
-    func item(_ id: UInt32) throws -> HFSItem {
+    nonisolated func validName(from hostName: String) -> String {
+        DiskImageManager.classicHFSName(from: hostName)
+    }
+
+    func item(_ id: UInt32) throws -> VolumeItem {
+        try checkOpen()
         guard let key = keyByID[id], let index = index(of: key) else { throw HFSError.notFound("Item \(id)") }
         return try makeItem(catalog[index])
     }
 
-    func contents(ofFolder folderID: UInt32) throws -> [HFSItem] {
+    func contents(ofFolder folderID: UInt32) throws -> [VolumeItem] {
         let folder = try item(folderID)
         guard folder.isFolder else { throw HFSError.notFound("Folder \(folder.name)") }
         return try childRecordIndices(of: folderID).map { try makeItem(catalog[$0]) }
     }
 
-    /// Folder names from the volume root down to `id` (excluding the root itself).
-    func path(of id: UInt32) throws -> [HFSItem] {
-        var result: [HFSItem] = []
+    /// Folders from the volume root down to `id` (excluding the root itself).
+    func path(of id: UInt32) throws -> [VolumeItem] {
+        var result: [VolumeItem] = []
         var current = id
-        var guardCount = 0
         while current != HFSCatalogID.rootFolder {
             let item = try item(current)
             result.insert(item, at: 0)
             current = item.parentID
-            guardCount += 1
-            if guardCount > 10_000 { throw HFSError.corrupt("folder hierarchy has a cycle") }
+            if result.count > keyByID.count { throw HFSError.corrupt("folder hierarchy has a cycle") }
         }
         return result
     }
 
-    func child(named name: HFSName, inFolder folderID: UInt32) -> HFSItem? {
-        guard let index = index(of: CatalogKey(parentID: folderID, name: name.bytes)) else { return nil }
+    func child(named name: String, inFolder folderID: UInt32) -> VolumeItem? {
+        guard !isClosed, let hfsName = try? HFSName(name), let index = index(of: CatalogKey(parentID: folderID, name: hfsName.bytes)) else { return nil }
         return try? makeItem(catalog[index])
     }
 
     /// Streams a fork to `sink` in chunks of at most `chunkSize` bytes. `sink` may throw (for
     /// example `CancellationError`) to stop early.
-    func readFork(_ id: UInt32, fork: HFSFork, chunkSize: Int = 1 << 20, sink: @Sendable ([UInt8]) throws -> Void) throws {
+    func readFork(_ id: UInt32, fork: HFSFork, chunkSize: Int, sink: @Sendable ([UInt8]) throws -> Void) throws {
         let file = try fileRecord(id)
         let length = UInt64(file.logicalLength(fork))
         let extents = Self.forkExtents(fileID: id, fork: fork, first: file.extents(fork), overflow: extentsRecords)
         guard UInt64(extents.reduce(0) { $0 + Int($1.blockCount) }) * UInt64(blockSize) >= length else {
-            throw HFSError.corrupt("\(try item(id).name) is shorter on disk than its catalog entry says")
+            throw HFSError.corrupt("a file is shorter on disk than its catalog entry says")
         }
         var remaining = length
         for extent in extents where remaining > 0 {
@@ -197,14 +235,11 @@ actor HFSVolume {
     }
 
     func readForkBytes(_ id: UInt32, fork: HFSFork) throws -> [UInt8] {
-        let file = try fileRecord(id)
         let collected = ByteCollector()
-        collected.reserve(Int(file.logicalLength(fork)))
-        try readFork(id, fork: fork) { collected.append($0) }
+        try readFork(id, fork: fork, chunkSize: 1 << 20) { collected.append($0) }
         return collected.bytes
     }
 
-    /// The raw 16-byte FInfo and FXInfo of a file (for MacBinary and Finder metadata export).
     func finderInfo(_ id: UInt32) throws -> (finderInfo: [UInt8], extended: [UInt8]) {
         let file = try fileRecord(id)
         return (file.finderInfo, file.extendedFinderInfo)
@@ -221,60 +256,61 @@ actor HFSVolume {
     // MARK: - Writing
 
     @discardableResult
-    func createFolder(named name: HFSName, in parentID: UInt32) throws -> UInt32 {
+    func createFolder(named name: String, in parentID: UInt32) throws -> UInt32 {
         try checkWritable()
-        try checkCanAdd(name, to: parentID)
+        let hfsName = try validated(name)
+        try checkCanAdd(hfsName, to: parentID)
         let id = try allocateCatalogID()
         let now = HFSDate.now
-        insert(CatalogRecord(key: CatalogKey(parentID: parentID, name: name.bytes), data: FolderRecord(id: id, date: now).raw))
-        insert(CatalogRecord(key: CatalogKey(parentID: id, name: []), data: ThreadRecord.make(type: .folderThread, parentID: parentID, name: name.bytes)))
-        keyByID[id] = CatalogKey(parentID: parentID, name: name.bytes)
+        insert(CatalogRecord(key: CatalogKey(parentID: parentID, name: hfsName.bytes), data: FolderRecord(id: id, date: now).raw))
+        insert(CatalogRecord(key: CatalogKey(parentID: id, name: []), data: ThreadRecord.make(type: .folderThread, parentID: parentID, name: hfsName.bytes)))
+        keyByID[id] = CatalogKey(parentID: parentID, name: hfsName.bytes)
         touchFolder(parentID, date: now)
         dirty = true
         return id
     }
 
-    /// Writes both forks to freshly allocated blocks, then adds the catalog entry. On any
+    /// Writes both forks to blocks that are free on disk, then adds the catalog entry. On any
     /// failure (including cancellation thrown by a fork reader) the blocks are released and
-    /// the catalog is untouched.
+    /// nothing else changes.
     @discardableResult
-    func createFile(
-        named name: HFSName,
-        in parentID: UInt32,
-        type: [UInt8],
-        creator: [UInt8],
-        finderInfo: [UInt8]? = nil,
-        extendedFinderInfo: [UInt8]? = nil,
-        dataFork: HFSForkSource,
-        resourceFork: HFSForkSource
-    ) throws -> UInt32 {
+    func createFile(named name: String, in parentID: UInt32, metadata: NewFileMetadata, dataFork: HFSForkSource, resourceFork: HFSForkSource) throws -> UInt32 {
         try checkWritable()
-        try checkCanAdd(name, to: parentID)
-        guard dataFork.length <= UInt64(UInt32.max), resourceFork.length <= UInt64(UInt32.max) else { throw HFSError.volumeFull }
-        let bitmapBefore = bitmap
+        let hfsName = try validated(name)
+        try checkCanAdd(hfsName, to: parentID)
+        let limit = UInt64(UInt32.max) / UInt64(blockSize) * UInt64(blockSize)
+        guard dataFork.length <= limit, resourceFork.length <= limit else { throw HFSError.volumeFull }
+        let allocationBefore = allocation
+        let extentsBefore = extentsRecords
+        let mdbBefore = mdb
         do {
             let dataExtents = try writeNewFork(dataFork)
             let resourceExtents = try writeNewFork(resourceFork)
             let id = try allocateCatalogID()
             let now = HFSDate.now
-            var file = FileRecord(id: id, date: now, type: type, creator: creator)
-            if let finderInfo { file.finderInfo = finderInfo }
-            if let extendedFinderInfo { file.extendedFinderInfo = extendedFinderInfo }
-            try store(dataExtents, fork: .data, length: dataFork.length, fileID: id, in: &file)
-            try store(resourceExtents, fork: .resource, length: resourceFork.length, fileID: id, in: &file)
-            let key = CatalogKey(parentID: parentID, name: name.bytes)
+            var file = FileRecord(id: id, date: now, type: metadata.fileType, creator: metadata.creator)
+            file.finderInfo = metadata.resolvedFinderInfo()
+            if let extended = metadata.extendedFinderInfo { file.extendedFinderInfo = extended }
+            if let created = metadata.createDate { file.createDate = HFSDate.encode(created) }
+            if let modified = metadata.modifyDate { file.modifyDate = HFSDate.encode(modified) }
+            store(dataExtents, fork: .data, length: dataFork.length, fileID: id, in: &file)
+            store(resourceExtents, fork: .resource, length: resourceFork.length, fileID: id, in: &file)
+            let key = CatalogKey(parentID: parentID, name: hfsName.bytes)
             insert(CatalogRecord(key: key, data: file.raw))
             keyByID[id] = key
             touchFolder(parentID, date: now)
             dirty = true
             return id
         } catch {
-            bitmap = bitmapBefore
+            allocation = allocationBefore
+            extentsRecords = extentsBefore
+            mdb = mdbBefore
             throw error
         }
     }
 
-    /// Deletes a file, or a folder that is already empty.
+    /// Deletes a file, or a folder that is already empty. Its blocks stay reserved until the
+    /// next commit, so the deleted data can't be overwritten before the delete is durable.
     func delete(_ id: UInt32) throws {
         try checkWritable()
         guard id != HFSCatalogID.rootFolder, let key = keyByID[id], let index = index(of: key) else { throw HFSError.notFound("Item \(id)") }
@@ -284,7 +320,7 @@ actor HFSVolume {
             let file = try FileRecord(raw: record.data)
             for fork in [HFSFork.data, .resource] {
                 for extent in Self.forkExtents(fileID: id, fork: fork, first: file.extents(fork), overflow: extentsRecords) {
-                    setBlocks(extent, allocated: false)
+                    allocation.set(start: Int(extent.startBlock), count: Int(extent.blockCount), used: false)
                 }
             }
             extentsRecords.removeAll { $0.key.fileID == id }
@@ -308,18 +344,14 @@ actor HFSVolume {
 
     /// Moves and/or renames an item. A folder can't move into itself or one of its own
     /// subfolders (that would detach it from the tree).
-    func move(_ id: UInt32, to newParentID: UInt32, newName: HFSName? = nil) throws {
+    func move(_ id: UInt32, to newParentID: UInt32, newName: String?) throws {
         try checkWritable()
         guard id != HFSCatalogID.rootFolder, let oldKey = keyByID[id], let oldIndex = index(of: oldKey) else { throw HFSError.notFound("Item \(id)") }
-        let name = newName ?? HFSName(bytes: oldKey.name)
+        let name = try newName.map(validated) ?? HFSName(bytes: oldKey.name)
         guard try item(newParentID).isFolder else { throw HFSError.invalidMove("The destination is not a folder.") }
         let record = catalog[oldIndex]
-        if record.type == .folder {
-            var ancestor = newParentID
-            while ancestor != HFSCatalogID.rootParent {
-                if ancestor == id { throw HFSError.invalidMove("A folder can't be moved into itself.") }
-                ancestor = try item(ancestor).parentID
-            }
+        if record.type == .folder, try newParentID == id || path(of: newParentID).contains(where: { $0.id == id }) {
+            throw HFSError.invalidMove("A folder can't be moved into itself.")
         }
         let newKey = CatalogKey(parentID: newParentID, name: name.bytes)
         if newKey == oldKey { return }
@@ -341,45 +373,159 @@ actor HFSVolume {
 
     /// Duplicates a file within the volume (both forks and all Finder info).
     @discardableResult
-    func copyFile(_ id: UInt32, to parentID: UInt32, name: HFSName) throws -> UInt32 {
+    func copyFile(_ id: UInt32, to parentID: UInt32, name: String) throws -> UInt32 {
         let source = try fileRecord(id)
         let data = try readForkBytes(id, fork: .data)
         let resource = try readForkBytes(id, fork: .resource)
-        return try createFile(
-            named: name, in: parentID,
-            type: source.fileType, creator: source.creator,
-            finderInfo: source.finderInfo, extendedFinderInfo: source.extendedFinderInfo,
-            dataFork: HFSForkSource(bytes: data), resourceFork: HFSForkSource(bytes: resource)
-        )
+        let metadata = NewFileMetadata(fileType: source.fileType, creator: source.creator, finderInfo: source.finderInfo,
+                                       extendedFinderInfo: source.extendedFinderInfo,
+                                       createDate: HFSDate.date(source.createDate), modifyDate: HFSDate.date(source.modifyDate))
+        return try createFile(named: name, in: parentID, metadata: metadata, dataFork: HFSForkSource(bytes: data), resourceFork: HFSForkSource(bytes: resource))
     }
 
-    /// Writes all pending changes to the image.
+    /// Commits all pending changes (see the type's documentation). On failure the pending
+    /// changes are discarded and the volume is back at its last committed state.
     func flush() throws {
+        try checkOpen()
         guard dirty else { return }
         try checkWritable()
+        do {
+            try commit()
+        } catch {
+            rollBack()
+            throw error
+        }
+    }
+
+    /// Releases the image. Every later call throws `HFSError.closed`, so an operation that
+    /// was still in flight when the image was ejected can't write to it afterwards.
+    func close() {
+        isClosed = true
+        device.close()
+    }
+
+    // MARK: - Commit
+
+    private func commit() throws {
+        try checkNotModifiedElsewhere()
         try markVolumeInUse()
         recomputeCounts()
 
-        try writeTree(
-            records: extentsRecords.map { BTree.BuildRecord(leafBytes: $0.key.encoded + $0.record.encoded, indexKey: $0.key.encoded) },
-            header: &extentsHeader,
-            isCatalog: false
-        )
-        try writeTree(
-            records: catalog.map { BTree.BuildRecord(leafBytes: $0.key.leafEncoded + $0.data, indexKey: $0.key.indexEncoded) },
-            header: &catalogHeader,
-            isCatalog: true
-        )
-        try device.write(bitmap, at: UInt64(mdb.bitmapStartSector) * 512)
+        let oldCatalog = Self.forkExtents(fileID: HFSCatalogID.catalogFile, fork: .data, first: committed.mdb.catalogFileExtents, overflow: committed.extentsRecords)
+        let oldExtents = Self.extentList(committed.mdb.extentsFileExtents)
 
-        mdb.freeBlockCount = UInt16(freeBlockCount)
+        // 1. Place the catalog. Extents beyond the MDB's three go into the extents tree.
+        let catalogRecords = catalog.map { BTree.BuildRecord(leafBytes: $0.key.leafEncoded + $0.data, indexKey: $0.key.indexEncoded) }
+        let catalogPlan = try TreePlacement.plan(
+            neededNodes: try BTree.minimumNodeCount(records: catalogRecords, nodeSize: BTree.nodeSize512),
+            nodeSize: BTree.nodeSize512, blockSize: blockSize, clumpBytes: Int(mdb.catalogClumpSize),
+            current: oldCatalog.map { (Int($0.startBlock), Int($0.blockCount)) }, currentNodes: Int(committed.mdb.catalogFileSize) / BTree.nodeSize512,
+            maxExtents: nil, map: &allocation, hint: Int(mdb.allocationPointer)
+        )
+        let catalogRuns = catalogPlan.runs.map { ExtentDescriptor(startBlock: UInt16($0.start), blockCount: UInt16($0.count)) }
+        extentsRecords.removeAll { $0.key.fileID == HFSCatalogID.catalogFile && $0.key.fork == .data }
+        addOverflow(Array(catalogRuns.dropFirst(3)), fork: .data, fileID: HFSCatalogID.catalogFile, startingAt: catalogRuns.prefix(3).reduce(0) { $0 + Int($1.blockCount) })
+
+        // 2. Place the extents tree; it can't overflow, so at most three extents.
+        let extentsBuild = extentsRecords.map { BTree.BuildRecord(leafBytes: $0.key.encoded + $0.record.encoded, indexKey: $0.key.encoded) }
+        let extentsPlan = try TreePlacement.plan(
+            neededNodes: try BTree.minimumNodeCount(records: extentsBuild, nodeSize: BTree.nodeSize512),
+            nodeSize: BTree.nodeSize512, blockSize: blockSize, clumpBytes: Int(mdb.extentsClumpSize),
+            current: oldExtents.map { (Int($0.startBlock), Int($0.blockCount)) }, currentNodes: Int(committed.mdb.extentsFileSize) / BTree.nodeSize512,
+            maxExtents: 3, map: &allocation, hint: Int(mdb.allocationPointer)
+        )
+        guard extentsPlan.runs.count <= 3 else { throw HFSError.catalogFull }
+        let extentsRuns = extentsPlan.runs.map { ExtentDescriptor(startBlock: UInt16($0.start), blockCount: UInt16($0.count)) }
+
+        // 3. Write both trees (to free space, unless the volume had no room for a copy).
+        let extentsNodes = try BTree.build(records: extentsBuild, nodeCount: extentsPlan.nodeCount, template: extentsHeader)
+        let catalogNodes = try BTree.build(records: catalogRecords, nodeCount: catalogPlan.nodeCount, template: catalogHeader)
+        try writeNodes(extentsNodes, to: extentsRuns)
+        try writeNodes(catalogNodes, to: catalogRuns)
+
+        // 4. The bitmap with old and new structures both in use, then the commit itself.
+        if !catalogPlan.inPlace {
+            for extent in oldCatalog { allocation.set(start: Int(extent.startBlock), count: Int(extent.blockCount), used: false) }
+        }
+        if !extentsPlan.inPlace {
+            for extent in oldExtents { allocation.set(start: Int(extent.startBlock), count: Int(extent.blockCount), used: false) }
+        }
+        try device.synchronize()
+        try device.write(allocation.union, at: UInt64(mdb.bitmapStartSector) * 512)
+        try device.synchronize()
+
+        mdb.catalogFileExtents = ExtentRecord(extents: Array(catalogRuns.prefix(3)))
+        mdb.catalogFileSize = UInt32(catalogPlan.nodeCount * BTree.nodeSize512)
+        mdb.extentsFileExtents = ExtentRecord(extents: extentsRuns)
+        mdb.extentsFileSize = UInt32(extentsPlan.nodeCount * BTree.nodeSize512)
+        mdb.freeBlockCount = UInt16(allocation.freeCount)
         mdb.modifyDate = HFSDate.now
         mdb.writeCount &+= 1
         mdb.attributes |= MasterDirectoryBlock.unmountedCleanlyBit
-        try writeMDB()
+        try device.write(mdb.raw, at: 1024)
         try device.synchronize()
+        lastKnownMDBSector = mdb.raw
         markedInUse = false
+
+        // Committed. Bring the spare MDB in step at once (fsck consults it when it has a
+        // repair to make), then release the old trees' blocks on disk.
+        extentsHeader = try BTree.Header(raw: try BTree.records(of: extentsNodes[0])[0])
+        catalogHeader = try BTree.Header(raw: try BTree.records(of: catalogNodes[0])[0])
+        allocation.commit()
+        committed = Committed(mdb: mdb, bitmap: allocation.committed, catalog: catalog, extentsRecords: extentsRecords,
+                              catalogHeader: catalogHeader, extentsHeader: extentsHeader, keyByID: keyByID)
         dirty = false
+        try writeAlternateMDB()
+        try device.synchronize()
+        try device.write(allocation.working, at: UInt64(mdb.bitmapStartSector) * 512)
+        try device.synchronize()
+    }
+
+    private func rollBack() {
+        mdb = committed.mdb
+        allocation.rollBack(to: committed.bitmap)
+        catalog = committed.catalog
+        extentsRecords = committed.extentsRecords
+        catalogHeader = committed.catalogHeader
+        extentsHeader = committed.extentsHeader
+        keyByID = committed.keyByID
+        dirty = false
+    }
+
+    /// Refuses to write if the MDB on disk isn't the one this engine last saw: some other
+    /// program (an emulator, another app) changed the volume meanwhile.
+    private func checkNotModifiedElsewhere() throws {
+        let onDisk = try device.read(at: 1024, count: 512)
+        guard onDisk == lastKnownMDBSector else { throw HFSError.modifiedElsewhere }
+    }
+
+    /// Clears the "unmounted cleanly" bit on disk before the first write of a batch, so a
+    /// crash midway leaves Mac OS (and fsck) a signal to check the volume.
+    private func markVolumeInUse() throws {
+        guard !markedInUse else { return }
+        var inUse = committed.mdb
+        inUse.attributes &= ~MasterDirectoryBlock.unmountedCleanlyBit
+        try device.write(inUse.raw, at: 1024)
+        try device.synchronize()
+        lastKnownMDBSector = inUse.raw
+        markedInUse = true
+    }
+
+    private func writeAlternateMDB() throws {
+        // The spare MDB lives in the second-to-last sector — but only touch it where one exists.
+        let alternate = device.length / 512 * 512 - 1024
+        if alternate > 1024, let sector = try? device.read(at: alternate, count: 512), (try? sector.u16(0)) == MasterDirectoryBlock.signature {
+            try device.write(mdb.raw, at: alternate)
+        }
+    }
+
+    private func writeNodes(_ nodes: [[UInt8]], to extents: [ExtentDescriptor]) throws {
+        for (number, node) in nodes.enumerated() {
+            guard let position = Self.forkPosition(number * BTree.nodeSize512, extents: extents, firstBlockOffset: firstBlockOffset, blockSize: blockSize) else {
+                throw HFSError.corrupt("B-tree file is shorter than its size")
+            }
+            try device.write(node, at: position)
+        }
     }
 
     // MARK: - Internals: catalog
@@ -414,25 +560,27 @@ actor HFSVolume {
     }
 
     private func fileRecord(_ id: UInt32) throws -> FileRecord {
+        try checkOpen()
         guard let key = keyByID[id], let index = index(of: key), catalog[index].type == .file else { throw HFSError.notFound("File \(id)") }
         return try FileRecord(raw: catalog[index].data)
     }
 
-    private func makeItem(_ record: CatalogRecord) throws -> HFSItem {
+    private func makeItem(_ record: CatalogRecord) throws -> VolumeItem {
+        let name = HFSName(bytes: record.key.name).string
         switch record.type {
         case .folder:
             let folder = try FolderRecord(raw: record.data)
-            return HFSItem(
-                id: folder.id, parentID: record.key.parentID, name: HFSName(bytes: record.key.name), isFolder: true,
+            return VolumeItem(
+                id: folder.id, parentID: record.key.parentID, name: name, isFolder: true,
                 dataLength: 0, resourceLength: 0, fileType: [], creator: [], finderFlags: folder.finderFlags, isLocked: false,
                 createDate: HFSDate.date(folder.createDate), modifyDate: HFSDate.date(folder.modifyDate),
                 valence: childRecordIndices(of: folder.id).count
             )
         case .file:
             let file = try FileRecord(raw: record.data)
-            return HFSItem(
-                id: file.id, parentID: record.key.parentID, name: HFSName(bytes: record.key.name), isFolder: false,
-                dataLength: file.logicalLength(.data), resourceLength: file.logicalLength(.resource),
+            return VolumeItem(
+                id: file.id, parentID: record.key.parentID, name: name, isFolder: false,
+                dataLength: UInt64(file.logicalLength(.data)), resourceLength: UInt64(file.logicalLength(.resource)),
                 fileType: file.fileType, creator: file.creator, finderFlags: file.finderFlags, isLocked: file.isLocked,
                 createDate: HFSDate.date(file.createDate), modifyDate: HFSDate.date(file.modifyDate), valence: 0
             )
@@ -441,13 +589,23 @@ actor HFSVolume {
         }
     }
 
+    private func checkOpen() throws {
+        if isClosed { throw HFSError.closed }
+    }
+
     private func checkWritable() throws {
+        try checkOpen()
         if isReadOnly { throw HFSError.readOnly }
     }
 
-    private func checkCanAdd(_ name: HFSName, to parentID: UInt32) throws {
+    private func validated(_ name: String) throws -> HFSName {
+        let hfsName = try HFSName(name)
         // Apple's fsck_hfs treats "." and ".." as illegal names (it renames them).
-        if name.bytes == [0x2E] || name.bytes == [0x2E, 0x2E] { throw HFSError.invalidName(name.string) }
+        if hfsName.bytes == [0x2E] || hfsName.bytes == [0x2E, 0x2E] { throw HFSError.invalidName(name) }
+        return hfsName
+    }
+
+    private func checkCanAdd(_ name: HFSName, to parentID: UInt32) throws {
         guard try item(parentID).isFolder else { throw HFSError.notFound("Folder \(parentID)") }
         if index(of: CatalogKey(parentID: parentID, name: name.bytes)) != nil { throw HFSError.alreadyExists(name.string) }
     }
@@ -495,73 +653,13 @@ actor HFSVolume {
         mdb.rootFolderCount = UInt16(clamping: rootFolders)
     }
 
-    // MARK: - Internals: allocation
-
-    /// Free blocks as the MDB counts them (all of them).
-    private var freeBlockCount: Int {
-        var used = 0
-        for block in 0..<blockCount where isAllocated(block) { used += 1 }
-        return blockCount - used
-    }
-
-    /// Apple's HFS code never allocates a volume's final allocation block, and fsck_hfs flags
-    /// any extent that reaches it ("Invalid extent entry … blockCount > maxBlocks −
-    /// startBlock") — even though the MDB still counts it as free (`hformat` does too).
-    /// So the allocator stops one block short.
-    private var allocatableBlockCount: Int { blockCount - 1 }
-
-    private var allocatableFreeBlockCount: Int {
-        var used = 0
-        for block in 0..<allocatableBlockCount where isAllocated(block) { used += 1 }
-        return allocatableBlockCount - used
-    }
-
-    private func isAllocated(_ block: Int) -> Bool {
-        bitmap[block / 8] & (0x80 >> UInt8(block % 8)) != 0
-    }
-
-    private func setBlocks(_ extent: ExtentDescriptor, allocated: Bool) {
-        for block in Int(extent.startBlock)..<(Int(extent.startBlock) + Int(extent.blockCount)) where block < blockCount {
-            if allocated { bitmap[block / 8] |= 0x80 >> UInt8(block % 8) } else { bitmap[block / 8] &= ~(0x80 >> UInt8(block % 8)) }
-        }
-    }
-
-    /// Allocates `count` blocks, contiguously if any free run is long enough, otherwise from
-    /// the largest free runs first (fewest extents).
-    private func allocate(_ count: Int) throws -> [ExtentDescriptor] {
-        guard count > 0 else { return [] }
-        guard count <= allocatableFreeBlockCount else { throw HFSError.volumeFull }
-        var runs: [ExtentDescriptor] = []
-        var block = 0
-        while block < allocatableBlockCount {
-            if isAllocated(block) { block += 1; continue }
-            let start = block
-            while block < allocatableBlockCount, !isAllocated(block), block - start < Int(UInt16.max) { block += 1 }
-            runs.append(ExtentDescriptor(startBlock: UInt16(start), blockCount: UInt16(block - start)))
-        }
-        let hint = Int(mdb.allocationPointer)
-        if let run = runs.first(where: { Int($0.startBlock) >= hint && Int($0.blockCount) >= count })
-            ?? runs.first(where: { Int($0.blockCount) >= count }) {
-            let extent = ExtentDescriptor(startBlock: run.startBlock, blockCount: UInt16(count))
-            setBlocks(extent, allocated: true)
-            mdb.allocationPointer = UInt16(clamping: Int(run.startBlock) + count)
-            return [extent]
-        }
-        var result: [ExtentDescriptor] = []
-        var needed = count
-        for run in runs.sorted(by: { $0.blockCount > $1.blockCount }) where needed > 0 {
-            let take = min(Int(run.blockCount), needed)
-            let extent = ExtentDescriptor(startBlock: run.startBlock, blockCount: UInt16(take))
-            setBlocks(extent, allocated: true)
-            result.append(extent)
-            needed -= take
-        }
-        return result.sorted { $0.startBlock < $1.startBlock }
-    }
+    // MARK: - Internals: allocation and fork data
 
     private func writeNewFork(_ source: HFSForkSource) throws -> [ExtentDescriptor] {
         let blocks = Int((source.length + UInt64(blockSize) - 1) / UInt64(blockSize))
-        let extents = try allocate(blocks)
+        let extents = try allocation.allocate(blocks, hint: Int(mdb.allocationPointer))
+            .map { ExtentDescriptor(startBlock: UInt16($0.start), blockCount: UInt16($0.count)) }
+        if let last = extents.last { mdb.allocationPointer = UInt16(clamping: Int(last.startBlock) + Int(last.blockCount)) }
         var offset: UInt64 = 0
         let chunk = max(blockSize, (1 << 20) / blockSize * blockSize)
         for extent in extents {
@@ -571,7 +669,7 @@ actor HFSVolume {
                 let count = Int(min(UInt64(chunk), remaining))
                 let available = Int(min(UInt64(count), source.length - min(offset, source.length)))
                 var bytes = available > 0 ? try source.read(offset, available) : []
-                guard bytes.count == available else { throw HFSError.corrupt("source file changed while it was being copied") }
+                guard bytes.count == available else { throw HFSError.corrupt("the source file changed while it was being copied") }
                 if bytes.count < count { bytes += [UInt8](repeating: 0, count: count - bytes.count) }
                 try device.write(bytes, at: position)
                 position += UInt64(count)
@@ -583,15 +681,19 @@ actor HFSVolume {
     }
 
     /// Puts a fork's first three extents in the file record and the rest in overflow records.
-    private func store(_ extents: [ExtentDescriptor], fork: HFSFork, length: UInt64, fileID: UInt32, in file: inout FileRecord) throws {
+    private func store(_ extents: [ExtentDescriptor], fork: HFSFork, length: UInt64, fileID: UInt32, in file: inout FileRecord) {
         let blocks = extents.reduce(0) { $0 + Int($1.blockCount) }
         file.setFork(fork, logicalLength: UInt32(length), physicalLength: UInt32(blocks * blockSize), extents: ExtentRecord(extents: Array(extents.prefix(3))))
-        var forkBlock = extents.prefix(3).reduce(0) { $0 + Int($1.blockCount) }
-        var rest = Array(extents.dropFirst(3))
+        addOverflow(Array(extents.dropFirst(3)), fork: fork, fileID: fileID, startingAt: extents.prefix(3).reduce(0) { $0 + Int($1.blockCount) })
+    }
+
+    private func addOverflow(_ extents: [ExtentDescriptor], fork: HFSFork, fileID: UInt32, startingAt firstBlock: Int) {
+        var forkBlock = firstBlock
+        var rest = extents
         while !rest.isEmpty {
             let group = Array(rest.prefix(3))
             rest.removeFirst(group.count)
-            let key = ExtentsKey(fork: fork, fileID: fileID, startBlock: UInt16(forkBlock))
+            let key = ExtentsKey(fork: fork, fileID: fileID, startBlock: UInt16(clamping: forkBlock))
             let position = extentsRecords.firstIndex { ExtentsKey.compare($0.key, key) > 0 } ?? extentsRecords.count
             extentsRecords.insert((key, ExtentRecord(extents: group)), at: position)
             forkBlock += group.reduce(0) { $0 + Int($1.blockCount) }
@@ -601,8 +703,6 @@ actor HFSVolume {
     private func blockPosition(_ block: UInt16) -> UInt64 {
         firstBlockOffset + UInt64(block) * UInt64(blockSize)
     }
-
-    // MARK: - Internals: trees and MDB
 
     private static func extentList(_ record: ExtentRecord) -> [ExtentDescriptor] {
         record.extents.filter { $0.blockCount > 0 }
@@ -623,12 +723,12 @@ actor HFSVolume {
     }
 
     private static func readTreeNode(_ node: UInt32, fork: [ExtentDescriptor], forkSize: Int, device: BlockDevice, firstBlockOffset: UInt64, blockSize: Int) throws -> [UInt8] {
-        let offset = Int(node) * BTree.nodeSize
-        guard offset + BTree.nodeSize <= forkSize else { throw HFSError.corrupt("B-tree node \(node) is outside its file") }
+        let offset = Int(node) * BTree.nodeSize512
+        guard offset + BTree.nodeSize512 <= forkSize else { throw HFSError.corrupt("B-tree node \(node) is outside its file") }
         guard let position = forkPosition(offset, extents: fork, firstBlockOffset: firstBlockOffset, blockSize: blockSize) else {
             throw HFSError.corrupt("B-tree node \(node) is not covered by the file's extents")
         }
-        return try device.read(at: position, count: BTree.nodeSize)
+        return try device.read(at: position, count: BTree.nodeSize512)
     }
 
     /// Device position of a fork-relative byte offset (nodes never straddle blocks since
@@ -644,91 +744,15 @@ actor HFSVolume {
         }
         return nil
     }
+}
 
-    private func writeTree(records: [BTree.BuildRecord], header: inout BTree.Header, isCatalog: Bool) throws {
-        while true {
-            let first = isCatalog ? mdb.catalogFileExtents : mdb.extentsFileExtents
-            let fork = isCatalog
-                ? Self.forkExtents(fileID: HFSCatalogID.catalogFile, fork: .data, first: first, overflow: extentsRecords)
-                : Self.extentList(first)
-            let size = Int(isCatalog ? mdb.catalogFileSize : mdb.extentsFileSize)
-            do {
-                let nodes = try BTree.build(records: records, nodeCount: size / BTree.nodeSize, template: header)
-                for (number, node) in nodes.enumerated() {
-                    guard let position = Self.forkPosition(number * BTree.nodeSize, extents: fork, firstBlockOffset: firstBlockOffset, blockSize: blockSize) else {
-                        throw HFSError.corrupt("B-tree file is shorter than its size")
-                    }
-                    try device.write(node, at: position)
-                }
-                header = try BTree.Header(raw: try BTree.records(of: nodes[0])[0])
-                return
-            } catch HFSError.catalogFull {
-                try growTreeFile(isCatalog: isCatalog)
-            }
-        }
-    }
-
-    /// Extends the catalog or extents file by one clump, in place if the blocks right after
-    /// its last extent are free, otherwise as a new extent (at most three, all in the MDB).
-    private func growTreeFile(isCatalog: Bool) throws {
-        var record = isCatalog ? mdb.catalogFileExtents : mdb.extentsFileExtents
-        let clump = Int(isCatalog ? mdb.catalogClumpSize : mdb.extentsClumpSize)
-        let blocks = max(1, (max(clump, 4 * blockSize) + blockSize - 1) / blockSize)
-        var used = record.extents.filter { $0.blockCount > 0 }
-        if let last = used.last {
-            let next = Int(last.startBlock) + Int(last.blockCount)
-            if next + blocks <= allocatableBlockCount, (next..<(next + blocks)).allSatisfy({ !isAllocated($0) }), Int(last.blockCount) + blocks <= Int(UInt16.max) {
-                setBlocks(ExtentDescriptor(startBlock: UInt16(next), blockCount: UInt16(blocks)), allocated: true)
-                used[used.count - 1].blockCount += UInt16(blocks)
-                record = ExtentRecord(extents: used)
-                try commitTreeExtents(record, isCatalog: isCatalog)
-                return
-            }
-        }
-        guard used.count < 3 else { throw HFSError.catalogFull }
-        let added = try allocate(blocks)
-        guard added.count == 1 else {
-            for extent in added { setBlocks(extent, allocated: false) }
-            throw HFSError.catalogFull
-        }
-        record = ExtentRecord(extents: used + added)
-        try commitTreeExtents(record, isCatalog: isCatalog)
-    }
-
-    private func commitTreeExtents(_ record: ExtentRecord, isCatalog: Bool) throws {
-        let size = UInt32(record.blockCount * blockSize)
-        if isCatalog {
-            mdb.catalogFileExtents = record
-            mdb.catalogFileSize = size
-        } else {
-            mdb.extentsFileExtents = record
-            mdb.extentsFileSize = size
-        }
-    }
-
-    /// Clears the "unmounted cleanly" bit on disk before the first write of a batch, so a
-    /// crash midway leaves Mac OS (and fsck) a signal to check the volume.
-    private func markVolumeInUse() throws {
-        guard !markedInUse else { return }
-        mdb.attributes &= ~MasterDirectoryBlock.unmountedCleanlyBit
-        try device.write(mdb.raw, at: 1024)
-        try device.synchronize()
-        markedInUse = true
-    }
-
-    private func writeMDB() throws {
-        try device.write(mdb.raw, at: 1024)
-        // Keep the alternate MDB (second-to-last sector) in step — but only where one exists.
-        let alternate = device.length / 512 * 512 - 1024
-        if alternate > 1024, let sector = try? device.read(at: alternate, count: 512), (try? sector.u16(0)) == MasterDirectoryBlock.signature {
-            try device.write(mdb.raw, at: alternate)
-        }
-    }
+extension BTree {
+    /// Classic HFS B-trees always use 512-byte nodes.
+    static let nodeSize512 = 512
 }
 
 private final class ByteCollector: @unchecked Sendable {
     private(set) var bytes: [UInt8] = []
-    func reserve(_ count: Int) { bytes.reserveCapacity(count) }
     func append(_ chunk: [UInt8]) { bytes += chunk }
 }
 

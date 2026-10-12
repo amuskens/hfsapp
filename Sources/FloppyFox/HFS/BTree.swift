@@ -1,20 +1,19 @@
 import Foundation
 
-/// HFS B-tree reading and (re)building. HFS stores the catalog and the extents-overflow file
-/// as B*-trees of 512-byte nodes: a header node (node 0) holding the tree header and a node
-/// allocation bitmap, optional map nodes continuing that bitmap, index nodes, and doubly
-/// linked leaf nodes holding the actual records in key order.
+/// B-tree reading and (re)building for HFS and HFS Plus. Both store their catalog and
+/// extents-overflow files as B*-trees: a header node (node 0) holding the tree header and a
+/// node-allocation bitmap, optional map nodes continuing that bitmap, index nodes, and doubly
+/// linked leaf nodes holding the records in key order. HFS nodes are always 512 bytes; HFS
+/// Plus trees choose their node size (typically 4 KB for the catalog).
 ///
-/// Rather than splitting and merging nodes in place, the volume keeps every leaf record in a
-/// sorted array and writes a freshly packed tree on each flush (`build`). Whole-tree rebuilds
-/// can't leave half-split nodes or dangling index keys, and for HFS-sized catalogs (a few MB
-/// at most) they cost milliseconds.
+/// Rather than splitting and merging nodes in place, the volumes keep every leaf record in a
+/// sorted array and write a freshly packed tree on each flush (`build`). Whole-tree rebuilds
+/// can't leave half-split nodes or dangling index keys; the volumes write the new tree to
+/// free space and switch to it with a single volume-header write (see their `flush`).
 enum BTree {
-    static let nodeSize = 512
     static let descriptorSize = 14
     static let headerRecordSize = 106
-    static let headerNodeMapBytes = 256
-    static let mapNodeMapBytes = nodeSize - descriptorSize - 4 // one record, two offsets
+    static let userDataRecordSize = 128
 
     enum NodeKind: UInt8 {
         case index = 0x00
@@ -23,8 +22,26 @@ enum BTree {
         case leaf = 0xFF
     }
 
-    /// The fields of the header record (BTHdrRec) this code needs, plus the raw record so
-    /// reserved bytes survive a rebuild.
+    /// The header node's map record fills the rest of the node after the header record, the
+    /// 128-byte user data record, and four record offsets.
+    static func headerMapBytes(nodeSize: Int) -> Int {
+        nodeSize - descriptorSize - headerRecordSize - userDataRecordSize - 8
+    }
+
+    /// A map node holds one record (and two offsets).
+    static func mapNodeBytes(nodeSize: Int) -> Int {
+        nodeSize - descriptorSize - 4
+    }
+
+    static func mapNodeCount(totalNodes: Int, nodeSize: Int) -> Int {
+        let inHeader = headerMapBytes(nodeSize: nodeSize) * 8
+        guard totalNodes > inHeader else { return 0 }
+        let perMapNode = mapNodeBytes(nodeSize: nodeSize) * 8
+        return (totalNodes - inHeader + perMapNode - 1) / perMapNode
+    }
+
+    /// The fields of the header record (BTHdrRec / BTHeaderRec) this code needs, plus the raw
+    /// record so everything else (clump size, key compare type, attributes) survives.
     struct Header {
         var raw: [UInt8]
 
@@ -45,7 +62,7 @@ enum BTree {
     }
 
     /// The records of a node, as raw byte slices (key followed by data).
-    static func records(of node: [UInt8]) throws -> [[UInt8]] {
+    static func records(of node: [UInt8], nodeSize: Int = 512) throws -> [[UInt8]] {
         guard node.count == nodeSize else { throw HFSError.corrupt("bad B-tree node size") }
         let count = Int(try node.u16(10))
         guard count <= (nodeSize - descriptorSize) / 2 else { throw HFSError.corrupt("too many records in node") }
@@ -65,12 +82,12 @@ enum BTree {
     }
 
     /// Walks the leaf chain from the header's first leaf, returning every leaf record in order.
-    /// `readNode` maps a node number to its 512 bytes.
-    static func readLeafRecords(readNode: (UInt32) throws -> [UInt8]) throws -> (header: Header, records: [[UInt8]]) {
+    /// `readNode` maps a node number to its bytes.
+    static func readLeafRecords(nodeSize: Int = 512, readNode: (UInt32) throws -> [UInt8]) throws -> (header: Header, records: [[UInt8]]) {
         let headerNode = try readNode(0)
         guard try headerNode.u8(8) == NodeKind.header.rawValue else { throw HFSError.corrupt("missing B-tree header node") }
-        let header = try Header(raw: try records(of: headerNode).first ?? [])
-        guard header.nodeSize == UInt16(nodeSize) else { throw HFSError.unsupported("B-tree node size \(header.nodeSize)") }
+        let header = try Header(raw: try records(of: headerNode, nodeSize: nodeSize).first ?? [])
+        guard Int(header.nodeSize) == nodeSize else { throw HFSError.unsupported("B-tree node size \(header.nodeSize)") }
 
         var result: [[UInt8]] = []
         var nodeNumber = header.firstLeaf
@@ -81,7 +98,7 @@ enum BTree {
             }
             let node = try readNode(nodeNumber)
             guard try node.u8(8) == NodeKind.leaf.rawValue else { throw HFSError.corrupt("B-tree leaf chain reaches a non-leaf node") }
-            result += try records(of: node)
+            result += try records(of: node, nodeSize: nodeSize)
             nodeNumber = try node.u32(0)
         }
         guard result.count == Int(header.leafRecords) else {
@@ -90,40 +107,74 @@ enum BTree {
         return (header, result)
     }
 
-    /// A leaf record ready for packing: its encoded leaf key + data, and the key in the form
-    /// index nodes store.
+    /// A leaf record ready for packing: its encoded key + data, and the key in the form index
+    /// nodes store.
     struct BuildRecord {
         var leafBytes: [UInt8]
         var indexKey: [UInt8]
     }
 
-    /// Packs `records` (already in key order) into a complete tree of exactly `nodeCount`
-    /// nodes. Throws `catalogFull` when they don't fit; the caller grows the file and retries.
-    static func build(records: [BuildRecord], nodeCount: Int, template: Header) throws -> [[UInt8]] {
-        let mapNodeCount = nodeCount > headerNodeMapBytes * 8
-            ? (nodeCount - headerNodeMapBytes * 8 + mapNodeMapBytes * 8 - 1) / (mapNodeMapBytes * 8)
-            : 0
-        var nodes: [[UInt8]] = []
-        var nextNumber = UInt32(1 + mapNodeCount)
-
-        func packed(_ items: [[UInt8]]) throws -> [[[UInt8]]] {
-            var groups: [[[UInt8]]] = []
-            var current: [[UInt8]] = []
-            var used = descriptorSize + 2 // the trailing free-space offset
-            for item in items {
-                let cost = item.count + 2
-                guard descriptorSize + 2 + cost <= nodeSize else { throw HFSError.corrupt("B-tree record too large") }
-                if used + cost > nodeSize {
-                    groups.append(current)
-                    current = []
-                    used = descriptorSize + 2
-                }
-                current.append(item)
-                used += cost
+    /// Groups items into nodes in order, as many per node as fit.
+    private static func pack(_ items: [[UInt8]], nodeSize: Int) throws -> [[[UInt8]]] {
+        var groups: [[[UInt8]]] = []
+        var current: [[UInt8]] = []
+        var used = descriptorSize + 2 // the trailing free-space offset
+        for item in items {
+            let cost = item.count + 2
+            guard descriptorSize + 2 + cost <= nodeSize else { throw HFSError.corrupt("B-tree record too large") }
+            if used + cost > nodeSize {
+                groups.append(current)
+                current = []
+                used = descriptorSize + 2
             }
-            if !current.isEmpty { groups.append(current) }
-            return groups
+            current.append(item)
+            used += cost
         }
+        if !current.isEmpty { groups.append(current) }
+        return groups
+    }
+
+    /// Leaf and index nodes the records need (excluding the header and map nodes).
+    static func treeNodeCount(records: [BuildRecord], nodeSize: Int) throws -> Int {
+        guard !records.isEmpty else { return 0 }
+        let leafGroups = try pack(records.map(\.leafBytes), nodeSize: nodeSize)
+        var keys: [[UInt8]] = []
+        var index = 0
+        for group in leafGroups {
+            keys.append(records[index].indexKey)
+            index += group.count
+        }
+        var total = leafGroups.count
+        while keys.count > 1 {
+            let groups = try pack(keys.map { $0 + [0, 0, 0, 0] }, nodeSize: nodeSize)
+            var next: [[UInt8]] = []
+            var position = 0
+            for group in groups {
+                next.append(keys[position])
+                position += group.count
+            }
+            keys = next
+            total += groups.count
+        }
+        return total
+    }
+
+    /// The smallest node count a tree file must have to hold `records`: header, map nodes
+    /// (which depend on the total), leaves and index nodes.
+    static func minimumNodeCount(records: [BuildRecord], nodeSize: Int) throws -> Int {
+        let tree = try treeNodeCount(records: records, nodeSize: nodeSize)
+        var total = tree + 1
+        while 1 + mapNodeCount(totalNodes: total, nodeSize: nodeSize) + tree > total {
+            total = 1 + mapNodeCount(totalNodes: total, nodeSize: nodeSize) + tree
+        }
+        return total
+    }
+
+    /// Packs `records` (already in key order) into a complete tree of exactly `nodeCount`
+    /// nodes. Throws `catalogFull` when they don't fit.
+    static func build(records: [BuildRecord], nodeCount: Int, template: Header, nodeSize: Int = 512) throws -> [[UInt8]] {
+        let mapNodes = mapNodeCount(totalNodes: nodeCount, nodeSize: nodeSize)
+        var nextNumber = UInt32(1 + mapNodes)
 
         func makeNode(kind: NodeKind, height: UInt8, records: [[UInt8]]) -> [UInt8] {
             var node = [UInt8](repeating: 0, count: nodeSize)
@@ -142,6 +193,7 @@ enum BTree {
 
         var header = template
         header.leafRecords = UInt32(records.count)
+        var treeNodes: [[UInt8]] = []
 
         if records.isEmpty {
             header.depth = 0
@@ -149,21 +201,19 @@ enum BTree {
             header.firstLeaf = 0
             header.lastLeaf = 0
         } else {
-            // Leaves.
-            let leafGroups = try packed(records.map(\.leafBytes))
+            typealias Built = (number: UInt32, node: [UInt8], firstKey: [UInt8])
             var recordIndex = 0
             var height: UInt8 = 1
-            var level: [(number: UInt32, node: [UInt8], firstKey: [UInt8])] = []
-            for group in leafGroups {
+            var level: [Built] = []
+            for group in try pack(records.map(\.leafBytes), nodeSize: nodeSize) {
                 level.append((nextNumber, makeNode(kind: .leaf, height: height, records: group), records[recordIndex].indexKey))
                 recordIndex += group.count
                 nextNumber += 1
             }
             header.firstLeaf = level.first!.number
             header.lastLeaf = level.last!.number
-            var allLevels: [[(number: UInt32, node: [UInt8], firstKey: [UInt8])]] = [level]
+            var allLevels: [[Built]] = [level]
 
-            // Index levels, until a single root remains.
             while level.count > 1 {
                 height += 1
                 let entries = level.map { child -> [UInt8] in
@@ -171,10 +221,9 @@ enum BTree {
                     entry.put32(child.number, at: child.firstKey.count)
                     return entry
                 }
-                let groups = try packed(entries)
-                var next: [(number: UInt32, node: [UInt8], firstKey: [UInt8])] = []
+                var next: [Built] = []
                 var childIndex = 0
-                for group in groups {
+                for group in try pack(entries, nodeSize: nodeSize) {
                     next.append((nextNumber, makeNode(kind: .index, height: height, records: group), level[childIndex].firstKey))
                     childIndex += group.count
                     nextNumber += 1
@@ -185,7 +234,6 @@ enum BTree {
             header.depth = UInt16(height)
             header.root = level[0].number
 
-            // Sibling links within every level.
             for levelIndex in allLevels.indices {
                 let row = allLevels[levelIndex]
                 for i in row.indices {
@@ -195,7 +243,7 @@ enum BTree {
                     allLevels[levelIndex][i].node = node
                 }
             }
-            nodes = allLevels.flatMap { $0.map(\.node) }
+            treeNodes = allLevels.flatMap { $0.map(\.node) }
         }
 
         let usedCount = Int(nextNumber)
@@ -203,25 +251,26 @@ enum BTree {
         header.totalNodes = UInt32(nodeCount)
         header.freeNodes = UInt32(nodeCount - usedCount)
 
-        // Node allocation bitmap: nodes 0..<usedCount are in use (header, maps, tree nodes).
-        var bitmap = [UInt8](repeating: 0, count: headerNodeMapBytes + mapNodeCount * mapNodeMapBytes)
+        let headerMap = headerMapBytes(nodeSize: nodeSize)
+        let mapBytes = mapNodeBytes(nodeSize: nodeSize)
+        var bitmap = [UInt8](repeating: 0, count: headerMap + mapNodes * mapBytes)
         for node in 0..<usedCount { bitmap[node / 8] |= 0x80 >> UInt8(node % 8) }
 
         var headerNode = makeNode(kind: .header, height: 0, records: [
             header.raw,
-            [UInt8](repeating: 0, count: 128),
-            Array(bitmap[0..<headerNodeMapBytes]),
+            [UInt8](repeating: 0, count: userDataRecordSize),
+            Array(bitmap[0..<headerMap]),
         ])
-        headerNode.put32(mapNodeCount > 0 ? 1 : 0, at: 0)
+        headerNode.put32(mapNodes > 0 ? 1 : 0, at: 0)
 
         var result = [headerNode]
-        for mapIndex in 0..<mapNodeCount {
-            let start = headerNodeMapBytes + mapIndex * mapNodeMapBytes
-            var mapNode = makeNode(kind: .map, height: 0, records: [Array(bitmap[start..<(start + mapNodeMapBytes)])])
-            mapNode.put32(mapIndex + 1 < mapNodeCount ? UInt32(mapIndex + 2) : 0, at: 0)
+        for mapIndex in 0..<mapNodes {
+            let start = headerMap + mapIndex * mapBytes
+            var mapNode = makeNode(kind: .map, height: 0, records: [Array(bitmap[start..<(start + mapBytes)])])
+            mapNode.put32(mapIndex + 1 < mapNodes ? UInt32(mapIndex + 2) : 0, at: 0)
             result.append(mapNode)
         }
-        result += nodes
+        result += treeNodes
         result += Array(repeating: [UInt8](repeating: 0, count: nodeSize), count: nodeCount - usedCount)
         return result
     }

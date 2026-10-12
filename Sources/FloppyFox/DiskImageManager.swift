@@ -10,11 +10,11 @@ enum ClipboardOperation {
 
 /// One row of the browser: a catalog item plus its decoded classic icon, if it has one.
 struct FileEntry: Identifiable, Hashable, Sendable {
-    let item: HFSItem
+    let item: VolumeItem
     /// PNG of the item's own `ICN#` icon (applications only — see `DiskImageManager.reload`).
     let resourceIconPNG: Data?
 
-    init(item: HFSItem, resourceIconPNG: Data? = nil) {
+    init(item: VolumeItem, resourceIconPNG: Data? = nil) {
         self.item = item
         self.resourceIconPNG = resourceIconPNG
     }
@@ -22,7 +22,7 @@ struct FileEntry: Identifiable, Hashable, Sendable {
     // Identity is the catalog node ID: stable across refreshes and renames, which keeps List
     // selection intact when the listing is rebuilt.
     var id: UInt32 { item.id }
-    var name: String { item.name.string }
+    var name: String { item.name }
     var isDirectory: Bool { item.isFolder }
     var size: Int? { item.isFolder ? nil : Int(item.dataLength) + Int(item.resourceLength) }
     var dataForkSize: Int? { item.isFolder ? nil : Int(item.dataLength) }
@@ -80,16 +80,16 @@ private actor URLCollector {
 
 /// Owns the open disk image and everything the window shows about it.
 ///
-/// All disk access goes through the in-process `HFSVolume` engine — no kernel mounts and no
-/// external tools — so the app works inside the App Sandbox. The volume is an actor, which
-/// also serializes every operation against the image.
+/// All disk access goes through the in-process engines (`HFSVolume`, `HFSPlusVolume`) — no
+/// kernel mounts and no external tools — so the app works inside the App Sandbox. Volumes are
+/// actors, which also serializes every operation against the image.
 @MainActor
 final class DiskImageManager: ObservableObject {
     @Published private(set) var imageURL: URL?
     @Published private(set) var volumeName: String?
     @Published private(set) var currentFolderID: UInt32 = HFSCatalogID.rootFolder
     /// Folders from just below the volume root down to the current folder.
-    @Published private(set) var folderPath: [HFSItem] = []
+    @Published private(set) var folderPath: [VolumeItem] = []
     @Published var entries: [FileEntry] = []
     @Published var selectedEntries: Set<FileEntry> = []
     @Published var errorMessage: String?
@@ -101,6 +101,10 @@ final class DiskImageManager: ObservableObject {
     // program using it, or a container format that is read-only). Writes check this.
     @Published private(set) var isReadOnly: Bool = false
     @Published private(set) var readOnlyReason: String?
+    /// True when the image opened read-only only because its volume wasn't cleanly ejected
+    /// (see `reopenAllowingWrites`).
+    @Published private(set) var canOpenForWritingAnyway = false
+    @Published private(set) var formatName: String?
     // One-shot informational warning (distinct from `errorMessage`, which represents a failed
     // action) — e.g. why an image was opened read-only.
     @Published var warningMessage: String?
@@ -116,7 +120,7 @@ final class DiskImageManager: ObservableObject {
 
     private let fileManager = FileManager.default
     private let storage: TemporaryStorage
-    private var volume: HFSVolume?
+    private var volume: (any DiskVolume)?
     private var vhdExpandedCopy: URL?
 
     // Bumped every time an image is opened or closed. Operations capture it before awaiting
@@ -233,6 +237,17 @@ final class DiskImageManager: ObservableObject {
     }
 
     func attachImage(imageURL url: URL) async {
+        await attachImage(imageURL: url, allowUncleanVolume: false)
+    }
+
+    /// Reopens the current image for writing even though its volume wasn't cleanly ejected —
+    /// for an image the user knows nothing else is using (e.g. an emulator crashed).
+    func reopenAllowingWrites() async {
+        guard let url = imageURL, canOpenForWritingAnyway else { return }
+        await attachImage(imageURL: url, allowUncleanVolume: true)
+    }
+
+    private func attachImage(imageURL url: URL, allowUncleanVolume: Bool) async {
         await withBusy {
             await closeImage(status: "Image closed")
             let session = sessionID
@@ -259,18 +274,23 @@ final class DiskImageManager: ObservableObject {
                 }
                 let readOnly = !reasons.isEmpty
                 let volume = try await Task.detached(priority: .userInitiated) { [source] in
-                    try HFSVolume.open(source, at: location, readOnly: readOnly)
+                    try DiskImageLayout.openVolume(source, at: location, readOnly: readOnly, allowUncleanVolume: allowUncleanVolume)
                 }.value
-                if volume.isLocked {
-                    reasons.append("This volume is locked, so it was opened read-only.")
+                if let cause = volume.readOnlyCause, let message = Self.message(for: cause) {
+                    reasons.append(message)
                 }
-                guard session == sessionID else { return }
+                guard session == sessionID else {
+                    await volume.close()
+                    return
+                }
 
                 self.volume = volume
                 self.imageURL = url
-                self.volumeName = await volume.volumeName.string
+                self.volumeName = await volume.volumeName
+                self.formatName = volume.formatName
                 self.isReadOnly = volume.isReadOnly
                 self.readOnlyReason = reasons.first
+                self.canOpenForWritingAnyway = reasons.count == 1 && volume.readOnlyCause == .notCleanlyUnmounted
                 self.currentFolderID = HFSCatalogID.rootFolder
                 try await reload()
                 var status = isReadOnly ? "Opened \(volumeName ?? url.lastPathComponent) (read-only)" : "Opened \(volumeName ?? url.lastPathComponent)"
@@ -299,14 +319,19 @@ final class DiskImageManager: ObservableObject {
     /// Writes out anything pending and returns to the no-image state. Everything that refers to
     /// the old image goes with it: previews, the expanded VHD copy, and the internal clipboard.
     private func closeImage(status: String) async {
+        // Stop whatever is in flight first. Bumping the session makes its loops stop at the
+        // next step, and closing the volume makes any call it still makes fail — so nothing
+        // can write to the image after this returns.
+        activeTransfer?.flag.cancel()
+        sessionID = UUID()
         if let volume {
             do {
                 try await volume.flush()
             } catch {
-                errorMessage = "Some changes could not be saved: \(error.localizedDescription)"
+                errorMessage = "Some changes could not be saved and were discarded: \(error.localizedDescription)"
             }
+            await volume.close()
         }
-        sessionID = UUID()
         volume = nil
         imageURL = nil
         volumeName = nil
@@ -316,6 +341,8 @@ final class DiskImageManager: ObservableObject {
         selectedEntries = []
         isReadOnly = false
         readOnlyReason = nil
+        canOpenForWritingAnyway = false
+        formatName = nil
         freeSpaceDescription = nil
         if let vhdExpandedCopy {
             try? fileManager.removeItem(at: vhdExpandedCopy)
@@ -358,7 +385,7 @@ final class DiskImageManager: ObservableObject {
 
     /// Applications usually carry their own icon in the resource fork; decoding it is cheap
     /// in-process. Very large forks are skipped to keep listings fast.
-    private static func applicationIcon(of item: HFSItem, on volume: HFSVolume) async -> Data? {
+    private static func applicationIcon(of item: VolumeItem, on volume: any DiskVolume) async -> Data? {
         guard !item.isFolder, item.fileType == Array("APPL".utf8), item.resourceLength > 0, item.resourceLength <= 4 << 20 else { return nil }
         guard let fork = try? await volume.readForkBytes(item.id, fork: .resource) else { return nil }
         return ClassicMacResourceIcon.iconPNG(fromResourceFork: Data(fork))
@@ -412,11 +439,10 @@ final class DiskImageManager: ObservableObject {
         }
         let trimmed = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        let nameString = Self.classicHFSName(from: trimmed)
+        let nameString = volume.validName(from: trimmed)
         await withBusy {
             do {
-                let name = try HFSName(nameString)
-                try await volume.createFolder(named: name, in: currentFolderID)
+                try await volume.createFolder(named: nameString, in: currentFolderID)
                 try await volume.flush()
                 try await reload()
                 statusMessage = nameString == trimmed ? "Created \(nameString)" : "Created \(nameString) (renamed for classic HFS compatibility)"
@@ -471,24 +497,28 @@ final class DiskImageManager: ObservableObject {
         }
     }
 
-    private func deleteRecursively(_ id: UInt32, on volume: HFSVolume, flag: CancellationFlag) async throws {
+    private func deleteRecursively(_ id: UInt32, on volume: any DiskVolume, flag: CancellationFlag, depth: Int = 0) async throws {
         try flag.check()
+        guard depth < Self.maximumFolderDepth else { throw HFSError.corrupt("folders are nested too deeply") }
         let item = try await volume.item(id)
         if item.isFolder {
             for child in try await volume.contents(ofFolder: id) {
-                try await deleteRecursively(child.id, on: volume, flag: flag)
+                try await deleteRecursively(child.id, on: volume, flag: flag, depth: depth + 1)
             }
         }
         try await volume.delete(id)
     }
 
+    /// Recursive walks stop here; a damaged catalog can't make them run forever.
+    private static let maximumFolderDepth = 512
+
     /// Flushes pending changes and refreshes the listing. A refresh error is not reported on
     /// top of the operation's own result.
-    private func finishWrite(on volume: HFSVolume) async {
+    private func finishWrite(on volume: any DiskVolume) async {
         do {
             try await volume.flush()
         } catch {
-            errorMessage = "Changes could not be written to the image: \(error.localizedDescription)"
+            errorMessage = "The changes could not be saved, so they were discarded: \(error.localizedDescription)"
         }
         try? await reload()
     }
@@ -521,13 +551,15 @@ final class DiskImageManager: ObservableObject {
             let transfer = beginTransfer(title: "Adding Items", message: "Preparing import…")
             defer { endTransfer(transfer.id) }
             let destination = currentFolderID
-            var renamed = 0
+            let session = sessionID
+            var tally = ImportTally()
             var cancelled = false
             var failure: String?
             for url in urls {
                 do {
                     try transfer.flag.check()
-                    renamed += try await importHostItem(url, into: destination, on: volume, transfer: transfer)
+                    guard session == sessionID else { throw CancellationError() }
+                    try await importHostItem(url, into: destination, on: volume, transfer: transfer, tally: &tally)
                     try await volume.flush()
                 } catch is CancellationError {
                     cancelled = true
@@ -537,6 +569,8 @@ final class DiskImageManager: ObservableObject {
                     break
                 }
             }
+            // The image was closed meanwhile: nothing more to do or report.
+            guard session == sessionID else { return }
             // Whatever finished before the stop is real content: flush and show it. The final
             // status/error is set after the refresh, which would otherwise clear it.
             await finishWrite(on: volume)
@@ -546,44 +580,65 @@ final class DiskImageManager: ObservableObject {
                 errorMessage = failure
             } else {
                 statusMessage = urls.count == 1 ? "Added \(urls[0].lastPathComponent)" : "Added \(urls.count) items"
-                if renamed > 0 {
-                    statusMessage += " (renamed \(renamed) for classic HFS compatibility)"
+                if tally.renamed > 0 {
+                    statusMessage += " (renamed \(tally.renamed) to fit the disk's naming rules)"
+                }
+                if tally.skippedLinks > 0 {
+                    statusMessage += tally.skippedLinks == 1 ? " — skipped 1 symbolic link" : " — skipped \(tally.skippedLinks) symbolic links"
                 }
             }
         }
     }
 
-    /// Returns how many names had to change for classic HFS.
-    private func importHostItem(_ url: URL, into folderID: UInt32, on volume: HFSVolume, transfer: (id: UUID, flag: CancellationFlag)) async throws -> Int {
+    /// Counts reported after an import.
+    private struct ImportTally {
+        var renamed = 0
+        var skippedLinks = 0
+    }
+
+    private func importHostItem(_ url: URL, into folderID: UInt32, on volume: any DiskVolume, transfer: (id: UUID, flag: CancellationFlag), tally: inout ImportTally, depth: Int = 0) async throws {
         try transfer.flag.check()
+        guard depth < Self.maximumFolderDepth else { throw HFSError.invalidMove("Folders are nested too deeply to copy.") }
         updateTransfer(transfer.id, message: "Adding \(url.lastPathComponent)…")
-        let isDirectory = (try url.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true
+        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .creationDateKey, .contentModificationDateKey])
+        // Classic Mac OS has no symbolic links, and following them could copy something far
+        // outside the chosen folder (or loop). They're skipped and counted.
+        if values.isSymbolicLink == true {
+            tally.skippedLinks += 1
+            return
+        }
         let hostName = url.lastPathComponent
 
-        if isDirectory {
-            let nameString = Self.classicHFSName(from: hostName)
-            var renamed = nameString == hostName ? 0 : 1
-            let folder = try await volume.createFolder(named: try HFSName(nameString), in: folderID)
-            let children = try fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
+        if values.isDirectory == true {
+            let name = volume.validName(from: hostName)
+            if name != hostName { tally.renamed += 1 }
+            let folder = try await volume.createFolder(named: name, in: folderID)
+            let children = try fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles])
             for child in children {
-                renamed += try await importHostItem(child, into: folder, on: volume, transfer: transfer)
+                try await importHostItem(child, into: folder, on: volume, transfer: transfer, tally: &tally, depth: depth + 1)
             }
-            return renamed
+            return
         }
 
-        // MacBinary (.bin) downloads hold a complete classic file: unpack it.
+        // MacBinary (.bin) downloads hold a complete classic file: unpack it, Finder flags
+        // and dates included.
         if url.pathExtension.lowercased() == "bin",
            let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size < 256 << 20,
            let macBinary = MacBinaryFile.decode(Array(try Data(contentsOf: url))) {
-            try await volume.createFile(
-                named: macBinary.name, in: folderID,
-                type: macBinary.fileType, creator: macBinary.creator,
-                dataFork: HFSForkSource(bytes: macBinary.dataFork), resourceFork: HFSForkSource(bytes: macBinary.resourceFork)
+            var info = [UInt8](repeating: 0, count: 16)
+            info.put16(macBinary.finderFlags, at: 8)
+            let metadata = NewFileMetadata(
+                fileType: macBinary.fileType, creator: macBinary.creator, finderInfo: info,
+                createDate: macBinary.createDate == 0 ? nil : HFSDate.date(macBinary.createDate),
+                modifyDate: macBinary.modifyDate == 0 ? nil : HFSDate.date(macBinary.modifyDate)
             )
-            return 0
+            try await volume.createFile(named: volume.validName(from: macBinary.name.string), in: folderID, metadata: metadata,
+                                        dataFork: HFSForkSource(bytes: macBinary.dataFork), resourceFork: HFSForkSource(bytes: macBinary.resourceFork))
+            return
         }
 
-        let nameString = Self.classicHFSName(from: hostName)
+        let name = volume.validName(from: hostName)
+        if name != hostName { tally.renamed += 1 }
         let metadata = try HostFiles.metadata(of: url)
         let resource = try HostFiles.readResourceFork(of: url)
         let reader = try HostFileReader(url: url)
@@ -593,14 +648,10 @@ final class DiskImageManager: ObservableObject {
             return try reader.read(at: offset, count: count)
         }
         let (type, creator) = Self.typeAndCreator(for: url, finderInfo: metadata.finderInfo)
-        try await volume.createFile(
-            named: try HFSName(nameString), in: folderID,
-            type: type, creator: creator,
-            finderInfo: metadata.finderInfo.map { Self.finderInfo($0, type: type, creator: creator) },
-            extendedFinderInfo: metadata.extendedFinderInfo,
-            dataFork: data, resourceFork: HFSForkSource(bytes: resource)
-        )
-        return nameString == hostName ? 0 : 1
+        let fileMetadata = NewFileMetadata(fileType: type, creator: creator, finderInfo: metadata.finderInfo,
+                                           extendedFinderInfo: metadata.extendedFinderInfo,
+                                           createDate: values.creationDate, modifyDate: values.contentModificationDate)
+        try await volume.createFile(named: name, in: folderID, metadata: fileMetadata, dataFork: data, resourceFork: HFSForkSource(bytes: resource))
     }
 
     /// Type and creator from the host file's Finder info when it has them, otherwise a
@@ -619,15 +670,6 @@ final class DiskImageManager: ObservableObject {
         ]
         let (type, creator) = guesses[url.pathExtension.lowercased()] ?? ("????", "????")
         return (Array(type.utf8), Array(creator.utf8))
-    }
-
-    private static func finderInfo(_ info: [UInt8], type: [UInt8], creator: [UInt8]) -> [UInt8] {
-        var result = Array(info.prefix(16)) + [UInt8](repeating: 0, count: max(0, 16 - info.count))
-        result.put(type, at: 0)
-        result.put(creator, at: 4)
-        // Host icon positions mean nothing on the classic desktop; let the Finder place it.
-        for i in 10..<16 { result[i] = 0 }
-        return result
     }
 
     // MARK: - Exporting to the Mac
@@ -715,13 +757,14 @@ final class DiskImageManager: ObservableObject {
 
     /// Writes a file (data fork, resource fork, Finder info, dates) or a whole folder tree to
     /// `destination`. A partially written file is removed if the copy doesn't finish.
-    private func exportItem(_ item: HFSItem, to destination: URL, from volume: HFSVolume, transfer: (id: UUID, flag: CancellationFlag)) async throws {
+    private func exportItem(_ item: VolumeItem, to destination: URL, from volume: any DiskVolume, transfer: (id: UUID, flag: CancellationFlag), depth: Int = 0) async throws {
         try transfer.flag.check()
-        updateTransfer(transfer.id, message: "Copying \(item.name.string)…")
+        guard depth < Self.maximumFolderDepth else { throw HFSError.corrupt("folders are nested too deeply") }
+        updateTransfer(transfer.id, message: "Copying \(item.name)…")
         if item.isFolder {
             try fileManager.createDirectory(at: destination, withIntermediateDirectories: false)
             for child in try await volume.contents(ofFolder: item.id) {
-                try await exportItem(child, to: destination.appendingPathComponent(Self.hostName(fromClassicHFSName: child.name.string)), from: volume, transfer: transfer)
+                try await exportItem(child, to: destination.appendingPathComponent(Self.hostName(fromClassicHFSName: child.name)), from: volume, transfer: transfer, depth: depth + 1)
             }
             var values = URLResourceValues()
             values.creationDate = item.createDate
@@ -923,11 +966,6 @@ final class DiskImageManager: ObservableObject {
             for id in ids {
                 do {
                     try transfer.flag.check()
-                    // Pasting a folder into itself (or below itself) would never finish.
-                    let destinationPath = try await volume.path(of: folderID).map(\.id)
-                    if folderID == id || destinationPath.contains(id) {
-                        throw HFSError.invalidMove("A folder can't be copied into itself.")
-                    }
                     try await copyRecursively(id, to: folderID, on: volume, transfer: transfer)
                     try await volume.flush()
                     copied += 1
@@ -944,32 +982,42 @@ final class DiskImageManager: ObservableObject {
         }
     }
 
-    private func copyRecursively(_ id: UInt32, to folderID: UInt32, on volume: HFSVolume, transfer: (id: UUID, flag: CancellationFlag)) async throws {
+    private func copyRecursively(_ id: UInt32, to folderID: UInt32, on volume: any DiskVolume, transfer: (id: UUID, flag: CancellationFlag), depth: Int = 0) async throws {
         try transfer.flag.check()
+        guard depth < Self.maximumFolderDepth else { throw HFSError.invalidMove("Folders are nested too deeply to copy.") }
         let item = try await volume.item(id)
-        updateTransfer(transfer.id, message: "Copying \(item.name.string)…")
+        updateTransfer(transfer.id, message: "Copying \(item.name)…")
         let name = try await availableName(for: item.name, in: folderID, on: volume)
         if item.isFolder {
+            // Re-checked at every level, against the volume as it is now: copying a folder into
+            // itself (or below itself) would never finish — including when a Cut and Paste
+            // moved the destination while this copy was running.
+            let destinationPath = try await volume.path(of: folderID)
+            if folderID == id || destinationPath.contains(where: { $0.id == id }) {
+                throw HFSError.invalidMove("A folder can't be copied into itself.")
+            }
             let children = try await volume.contents(ofFolder: id)
             let folder = try await volume.createFolder(named: name, in: folderID)
             for child in children {
-                try await copyRecursively(child.id, to: folder, on: volume, transfer: transfer)
+                try await copyRecursively(child.id, to: folder, on: volume, transfer: transfer, depth: depth + 1)
             }
         } else {
             try await volume.copyFile(id, to: folderID, name: name)
         }
     }
 
-    /// `name` if it's free in the folder, otherwise "name copy", "name copy 2", …, shortened
-    /// to fit the 31-byte limit.
-    private func availableName(for name: HFSName, in folderID: UInt32, on volume: HFSVolume) async throws -> HFSName {
+    /// `name` if it's free in the folder, otherwise "name copy", "name copy 2", …, with the
+    /// original part shortened as needed to fit the volume's name length limit.
+    private func availableName(for name: String, in folderID: UInt32, on volume: any DiskVolume) async throws -> String {
         if await volume.child(named: name, inFolder: folderID) == nil { return name }
         for attempt in 1...999 {
-            let suffix = Array((attempt == 1 ? " copy" : " copy \(attempt)").utf8)
-            let candidate = HFSName(bytes: Array(name.bytes.prefix(HFSName.maxLength - suffix.count)) + suffix)
+            let suffix = attempt == 1 ? " copy" : " copy \(attempt)"
+            var base = name
+            while !base.isEmpty, volume.validName(from: base + suffix) != base + suffix { base.removeLast() }
+            let candidate = base + suffix
             if await volume.child(named: candidate, inFolder: folderID) == nil { return candidate }
         }
-        throw HFSError.alreadyExists(name.string)
+        throw HFSError.alreadyExists(name)
     }
 
     /// Moves items into `folderID` within the image (Cut, then Paste).
@@ -1063,6 +1111,22 @@ final class DiskImageManager: ObservableObject {
     func prepareForTermination() async {
         if let volume { try? await volume.flush() }
         storage.removeLaunchDirectory()
+    }
+
+    /// What the user is told when a volume opens read-only for a reason of its own.
+    private static func message(for cause: ReadOnlyCause) -> String? {
+        switch cause {
+        case .requested:
+            return nil // the specific reason (permissions, container format) is added separately
+        case .locked:
+            return "This volume is locked, so it was opened read-only."
+        case .notCleanlyUnmounted:
+            return "This volume wasn't ejected properly, or another computer or emulator is using it right now, so it was opened read-only. If nothing else is using it, you can open it for writing anyway; Mac OS will check the disk the next time it mounts it."
+        case .journaled:
+            return "This is a journaled Mac OS Extended volume (from Mac OS X), which FloppyFox can open read-only."
+        case .inUse:
+            return "Another program is writing to this image, so it was opened read-only."
+        }
     }
 
     // MARK: - Names
