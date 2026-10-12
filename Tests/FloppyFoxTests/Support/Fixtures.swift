@@ -81,6 +81,27 @@ enum Fixtures {
         return try Data(contentsOf: host)
     }
 
+    /// Runs Apple's `fsck_hfs -n` (check only, never repair) on a bare HFS volume image and
+    /// returns its verdict. Apple's checker validates catalog key order, B-tree structure,
+    /// valences, the allocation bitmap and the MDB totals — an oracle independent of both this
+    /// app and hfsutils. (It also flags reserved catalog fields hfsutils leaves non-zero, so
+    /// only use it on volumes this app alone has written to after `hformat`.)
+    static func fsck(_ image: URL) throws -> (clean: Bool, output: String) {
+        let attach = run("/usr/bin/hdiutil", ["attach", "-nomount", "-readonly", "-noverify", "-imagekey", "diskimage-class=CRawDiskImage", image.path])
+        let lines = attach.output.split(separator: "\n").map(String.init)
+        func device(in line: String) -> String? {
+            line.split(whereSeparator: \.isWhitespace).first(where: { $0.hasPrefix("/dev/disk") }).map(String.init)
+        }
+        guard attach.status == 0, let wholeDisk = lines.lazy.compactMap(device).first else {
+            throw XCTSkip("hdiutil could not attach \(image.lastPathComponent) for fsck: \(attach.output)")
+        }
+        defer { _ = run("/usr/bin/hdiutil", ["detach", wholeDisk]) }
+        // A partitioned image: check its HFS partition rather than the whole disk.
+        let target = lines.first(where: { $0.contains("Apple_HFS") }).flatMap(device) ?? wholeDisk
+        let check = run("/sbin/fsck_hfs", ["-n", "-d", target.replacingOccurrences(of: "/dev/disk", with: "/dev/rdisk")])
+        return (check.status == 0 && check.output.contains("appears to be OK"), check.output)
+    }
+
     static func run(_ executable: String, _ arguments: [String]) -> (status: Int32, output: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
