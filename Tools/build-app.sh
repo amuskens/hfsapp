@@ -86,12 +86,65 @@ if [ ! -d "$RESOURCE_BUNDLE" ]; then
   exit 1
 fi
 cp -R "$RESOURCE_BUNDLE" "$OUTDIR/Contents/Resources/"
+# SwiftPM leaves the bundle without an Info.plist (or with one naming an executable it doesn't
+# have); App Store validation wants every nested bundle identified, and resources-only.
+cat > "$OUTDIR/Contents/Resources/FloppyFox_FloppyFox.bundle/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleIdentifier</key>
+  <string>$BUNDLE_ID.resources</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>FloppyFox Resources</string>
+  <key>CFBundlePackageType</key>
+  <string>BNDL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>$VERSION</string>
+  <key>CFBundleVersion</key>
+  <string>$BUILD_NUMBER</string>
+</dict>
+</plist>
+PLIST
+
+# The build environment, as Xcode records it (App Store Connect reads these).
+SDK_VERSION=$(xcrun --sdk macosx --show-sdk-version)
+SDK_BUILD=$(xcrun --sdk macosx --show-sdk-build-version)
+XCODE_VERSION=$(xcodebuild -version | awk '/^Xcode/ { split($2, v, "."); printf "%d%d%d", v[1], v[2], (v[3] == "" ? 0 : v[3]) }')
+XCODE_BUILD=$(xcodebuild -version | awk '/^Build version/ { print $3 }')
+OS_BUILD=$(sw_vers -buildVersion)
 
 cat > "$OUTDIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>BuildMachineOSBuild</key>
+  <string>$OS_BUILD</string>
+  <key>CFBundleSupportedPlatforms</key>
+  <array>
+    <string>MacOSX</string>
+  </array>
+  <key>DTCompiler</key>
+  <string>com.apple.compilers.llvm.clang.1_0</string>
+  <key>DTPlatformBuild</key>
+  <string>$SDK_BUILD</string>
+  <key>DTPlatformName</key>
+  <string>macosx</string>
+  <key>DTPlatformVersion</key>
+  <string>$SDK_VERSION</string>
+  <key>DTSDKBuild</key>
+  <string>$SDK_BUILD</string>
+  <key>DTSDKName</key>
+  <string>macosx$SDK_VERSION</string>
+  <key>DTXcode</key>
+  <string>$XCODE_VERSION</string>
+  <key>DTXcodeBuild</key>
+  <string>$XCODE_BUILD</string>
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleExecutable</key>

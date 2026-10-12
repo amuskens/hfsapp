@@ -68,6 +68,7 @@ final class DiskImageManagerTests: XCTestCase {
         let preview = await manager.materializeForPreview(try manager.entry(named: "peek.txt"))
         let previewURL = try XCTUnwrap(preview)
         XCTAssertEqual(try String(contentsOf: previewURL, encoding: .utf8), "peek")
+        XCTAssertFalse(FileManager.default.isWritableFile(atPath: previewURL.path), "a preview copy should be read-only: edits to it go nowhere")
         await manager.ejectImage()
         XCTAssertNil(manager.imageURL)
         XCTAssertFalse(manager.isOpen)
@@ -193,6 +194,48 @@ final class DiskImageManagerTests: XCTestCase {
         await manager.performPaste()
         XCTAssertNil(manager.errorMessage)
         XCTAssertEqual(manager.entries.map(\.name), ["here.txt"])
+        XCTAssertEqual(manager.statusMessage, "Nothing to move: already in this folder")
+    }
+
+    /// A cut is used up by its paste: the system pasteboard no longer offers the exported
+    /// copies (which describe where the items used to be), and a second Paste does nothing.
+    func testPastingACutReleasesThePasteboard() async throws {
+        let image = try Fixtures.makeClassicHFSImage(in: work)
+        let manager = try await open(image)
+        await manager.importFiles(urls: [try hostFile("moving.txt", "m")])
+        await manager.createFolder(named: "Dest")
+        manager.cutEntry(try manager.entry(named: "moving.txt"))
+        await manager.navigate(into: try manager.entry(named: "Dest"))
+        await manager.performPaste()
+        XCTAssertEqual(manager.entries.map(\.name), ["moving.txt"])
+        XCTAssertTrue(manager.pasteboard.pasteboardItems?.isEmpty ?? true)
+        await manager.performPaste()
+        XCTAssertEqual(manager.entries.map(\.name), ["moving.txt"])
+        XCTAssertNil(manager.errorMessage)
+    }
+
+    /// An operation waiting behind another acts on the folder that was showing when the user
+    /// asked for it, not wherever they've browsed to since.
+    func testAQueuedNewFolderGoesWhereTheUserWasWhenTheyAskedForIt() async throws {
+        let image = try Fixtures.makeClassicHFSImage(in: work, sizeKB: 40 * 1024)
+        let manager = try await open(image)
+        await manager.createFolder(named: "Elsewhere")
+        let files = try (0..<20).map { try hostFile("file \($0).txt", String(repeating: "x", count: 50_000)) }
+        let started = expectation(description: "import started")
+        manager.transferProgressObserver = { message in if message.contains("file 1.txt") { started.fulfill() } }
+        let importing = Task { await manager.importFiles(urls: files) }
+        await fulfillment(of: [started], timeout: 30)
+        let creating = Task { await manager.createFolder(named: "Asked For Here") } // queued behind the import
+        await Task.yield()
+        await manager.navigate(into: try manager.entry(named: "Elsewhere"))
+        await importing.value
+        await creating.value
+        XCTAssertNil(manager.errorMessage)
+        await manager.ejectImage()
+        try Fixtures.withMounted(image) {
+            XCTAssertTrue(try Fixtures.names(in: ":").contains("Asked For Here"))
+            XCTAssertEqual(try Fixtures.names(in: ":Elsewhere"), [])
+        }
     }
 
     // MARK: Moving files between the image and the Mac

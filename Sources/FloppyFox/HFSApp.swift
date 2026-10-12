@@ -14,7 +14,9 @@ struct FloppyFoxApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        // A single window: there is one shared DiskImageManager, so a second window would only
+        // mirror the first (and opening a document must not spawn one).
+        Window("FloppyFox", id: "main") {
             ContentView()
                 .environmentObject(manager)
                 .onAppear {
@@ -73,40 +75,35 @@ struct FloppyFoxApp: App {
             // in the app menu) — the old File menu additionally defined its own "Quit" bound to
             // the same ⌘Q, which is the same duplicate-shortcut problem as above.
 
-            // Undo/Redo and Find/Spelling/Substitutions/Transformations/Speech are part of every
-            // app's default Edit menu, but nothing in this app ever registers an `UndoManager` or
-            // hosts an editable text view for them to act on — they'd just sit there permanently
-            // grayed out, so they're dropped instead of leaving dead menu items around.
-            CommandGroup(replacing: .undoRedo) {}
+            // Find/Spelling/Substitutions/Transformations/Speech have nothing to act on here, so
+            // they're dropped. Undo/Redo stay: the folder-name field's editor uses them.
             CommandGroup(replacing: .textEditing) {}
 
             // `.pasteboard` is the standard Edit menu's Cut/Copy/Paste/Select All section.
             CommandGroup(replacing: .pasteboard) {
+                // While a text field is being edited these act on its text, as everywhere else
+                // on the Mac, instead of on the files.
                 Button("Cut") {
-                    manager.cutSelected()
+                    if !TextEditing.send(#selector(NSText.cut(_:))) { manager.cutSelected() }
                 }
                 .keyboardShortcut("x", modifiers: [.command])
-                .disabled(manager.selectedEntries.isEmpty || manager.isReadOnly)
 
                 Button("Copy") {
-                    manager.copySelected()
+                    if !TextEditing.send(#selector(NSText.copy(_:))) { manager.copySelected() }
                 }
                 .keyboardShortcut("c", modifiers: [.command])
-                .disabled(manager.selectedEntries.isEmpty)
 
                 Button("Paste") {
-                    manager.paste()
+                    if !TextEditing.send(#selector(NSText.paste(_:))) { manager.paste() }
                 }
                 .keyboardShortcut("v", modifiers: [.command])
-                .disabled(!manager.isOpen || manager.isReadOnly)
 
                 Divider()
 
                 Button("Select All") {
-                    manager.selectedEntries = Set(manager.entries)
+                    if !TextEditing.send(#selector(NSText.selectAll(_:))) { manager.selectedEntries = Set(manager.entries) }
                 }
                 .keyboardShortcut("a", modifiers: [.command])
-                .disabled(manager.entries.isEmpty)
             }
 
             CommandGroup(replacing: .help) {
@@ -116,6 +113,15 @@ struct FloppyFoxApp: App {
                 .keyboardShortcut("?", modifiers: [.command])
             }
         }
+    }
+}
+
+/// Routes an Edit menu command to the text field being edited, if there is one.
+@MainActor
+private enum TextEditing {
+    static func send(_ action: Selector) -> Bool {
+        guard let editor = NSApp.keyWindow?.firstResponder as? NSText else { return false }
+        return NSApp.sendAction(action, to: editor, from: nil)
     }
 }
 

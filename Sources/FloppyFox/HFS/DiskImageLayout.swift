@@ -46,19 +46,36 @@ enum DiskImageLayout {
             return UInt16(bytes[0]) << 8 | UInt16(bytes[1])
         }
 
+        /// A volume whose header claims more space than its partition holds — seen on real
+        /// disk images whose partition map was shrunk after formatting. Classic Mac OS trusts
+        /// the volume header, so the disk works there; here it opens read-only (writing could
+        /// put data into space the partition map calls free), as long as the image file
+        /// actually contains the whole volume.
+        func fitted(_ location: HFSVolumeLocation, claimedBytes: UInt64) -> HFSVolumeLocation? {
+            guard claimedBytes > location.length else { return location }
+            guard location.offset < length, claimedBytes <= length - location.offset else { return nil }
+            return HFSVolumeLocation(format: location.format, offset: location.offset, length: claimedBytes, partitionName: location.partitionName,
+                                     readOnlyReason: "This volume is larger than its partition in the disk's partition map, so it was opened read-only. The disk still works in Mac OS, which goes by the volume itself.")
+        }
+
         /// The volume starting at `start` (of at most `size` bytes), if it is HFS or HFS Plus.
         func volume(at start: UInt64, size: UInt64, name: String?) -> HFSVolumeLocation? {
             guard start < length else { return nil }
             let size = min(size, length - start)
             guard let sig = signature(at: start + 1024) else { return nil }
             if hfsPlusSignatures.contains(sig) {
-                return HFSVolumeLocation(format: .hfsPlus, offset: start, length: size, partitionName: name, readOnlyReason: nil)
+                let location = HFSVolumeLocation(format: .hfsPlus, offset: start, length: size, partitionName: name, readOnlyReason: nil)
+                guard let raw = try? device.read(at: start + 1024, count: 512), let header = try? HFSPlusVolumeHeader(sector: raw) else { return location }
+                return fitted(location, claimedBytes: UInt64(header.totalBlocks) * UInt64(header.blockSize))
             }
             guard sig == MasterDirectoryBlock.signature, size >= 1536,
                   let raw = try? device.read(at: start + 1024, count: 512),
                   let mdb = try? MasterDirectoryBlock(sector: raw) else { return nil }
             guard mdb.embeddedSignature == MasterDirectoryBlock.embeddedHFSPlusSignature else {
-                return HFSVolumeLocation(format: .hfs, offset: start, length: size, partitionName: name, readOnlyReason: nil)
+                // An HFS volume ends with its spare MDB and a reserved sector after the last
+                // allocation block.
+                let claimed = UInt64(mdb.firstAllocationSector) * 512 + UInt64(mdb.allocationBlockCount) * UInt64(mdb.allocationBlockSize) + 1024
+                return fitted(HFSVolumeLocation(format: .hfs, offset: start, length: size, partitionName: name, readOnlyReason: nil), claimedBytes: claimed)
             }
             // HFS wrapper: drEmbedExtent (start block, block count), in the wrapper's own
             // allocation blocks.

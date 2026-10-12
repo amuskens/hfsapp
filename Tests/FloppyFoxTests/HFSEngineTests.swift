@@ -347,6 +347,45 @@ final class HFSEngineTests: XCTestCase {
         XCTAssertThrowsError(try DiskImageLayout.volumes(in: junk))
     }
 
+    /// Real disks exist whose partition map was shrunk after formatting, so the volume
+    /// claims more than its partition. Mac OS trusts the volume; so does reading here, but
+    /// writing is refused (the extra space may belong to something else). A volume that runs
+    /// past the end of the image file itself is still rejected.
+    func testAVolumeLargerThanItsPartitionOpensReadOnly() async throws {
+        let volume = Array(try Data(contentsOf: try Fixtures.makeClassicHFSImage(in: work)))
+        let partitionStart = 64
+        func disk(partitionBlocks: Int, truncatedBy cut: Int = 0) throws -> URL {
+            var disk = [UInt8](repeating: 0, count: partitionStart * 512)
+            disk.put16(0x4552, at: 0)
+            disk.put16(512, at: 2)
+            for (index, (start, blocks, type)) in [(1, 63, "Apple_partition_map"), (partitionStart, partitionBlocks, "Apple_HFS")].enumerated() {
+                let base = 512 * (1 + index)
+                disk.put16(0x504D, at: base)
+                disk.put32(2, at: base + 4)
+                disk.put32(UInt32(start), at: base + 8)
+                disk.put32(UInt32(blocks), at: base + 12)
+                disk.put(Array("MacOS".utf8), at: base + 16)
+                disk.put(Array(type.utf8), at: base + 48)
+            }
+            disk += volume.dropLast(cut)
+            let url = work.appendingPathComponent("shrunk-\(partitionBlocks)-\(cut).hda")
+            try Data(disk).write(to: url)
+            return url
+        }
+        let url = try disk(partitionBlocks: volume.count / 512 - 100)
+        let location = try XCTUnwrap(DiskImageLayout.volumes(in: url).first)
+        XCTAssertEqual(location.length, UInt64(volume.count), "the volume's own size should be used")
+        XCTAssertNotNil(location.readOnlyReason)
+        let opened = try DiskImageLayout.openVolume(url, readOnly: false)
+        XCTAssertTrue(opened.isReadOnly)
+        let listed = try await opened.contents(ofFolder: HFSCatalogID.rootFolder)
+        XCTAssertNotNil(listed)
+        await opened.close()
+
+        let truncated = try disk(partitionBlocks: volume.count / 512 - 100, truncatedBy: 50 * 512)
+        XCTAssertThrowsError(try DiskImageLayout.volumes(in: truncated))
+    }
+
     func testOpensRealPartitionedHardDiskImageIfPresent() async throws {
         let url = URL(fileURLWithPath: "/Users/amuskens/Downloads/ PreInstalled MacOS Images/HD0-OpenRetroSCSI-7.1.hda")
         guard FileManager.default.fileExists(atPath: url.path) else { throw XCTSkip("real HDA fixture not present") }

@@ -13,6 +13,9 @@ final class QuickLookController: NSObject {
     private weak var manager: DiskImageManager?
     private var eventMonitor: Any?
     private var previewURL: URL?
+    /// Bumped by every request, so a slow export that finishes after a newer one (or after
+    /// the panel closed) is discarded instead of replacing the newer preview.
+    private var generation = 0
 
     func attach(to manager: DiskImageManager) {
         self.manager = manager
@@ -48,6 +51,7 @@ final class QuickLookController: NSObject {
     func selectionChanged(to entry: FileEntry?) {
         guard QLPreviewPanel.sharedPreviewPanelExists(), let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
         guard let entry, !entry.isDirectory else {
+            generation += 1
             panel.orderOut(nil)
             return
         }
@@ -58,6 +62,7 @@ final class QuickLookController: NSObject {
     func toggle(for entry: FileEntry?) {
         guard let panel = QLPreviewPanel.shared() else { return }
         if panel.isVisible {
+            generation += 1
             panel.orderOut(nil)
             return
         }
@@ -70,7 +75,9 @@ final class QuickLookController: NSObject {
     private func handleSpacebar() -> Bool {
         // A focused button, toggle, etc. uses spacebar to activate itself — only treat it as
         // Quick Look when focus is elsewhere (e.g. the file list, or nothing in particular).
-        if let responder = NSApp.keyWindow?.firstResponder, responder is NSControl {
+        // A text field being edited (rename, New Folder, search) needs its spaces: its field
+        // editor is an NSText, not the NSControl it belongs to.
+        if let responder = NSApp.keyWindow?.firstResponder, responder is NSControl || responder is NSText {
             return false
         }
         guard manager?.selectedEntry != nil else { return false }
@@ -81,7 +88,13 @@ final class QuickLookController: NSObject {
     private func show(_ entry: FileEntry, panel: QLPreviewPanel, makeKey: Bool) async {
         // hfsutils-backed entries aren't real files on disk, so materialize a temp copy first
         // (same mechanism as drag-out and double-click-open) — Quick Look needs a real URL.
+        generation += 1
+        let request = generation
         guard let url = await manager?.materializeForPreview(entry) else { return }
+        guard request == generation else {
+            TemporaryStorage.shared.remove(url.deletingLastPathComponent())
+            return
+        }
         // Each preview is a fresh export; drop the previous one so arrowing through large
         // files doesn't accumulate copies.
         if let previewURL {

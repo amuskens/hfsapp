@@ -268,13 +268,16 @@ final class DiskImageManager: ObservableObject {
         await withBusy {
             await closeImage(status: "Image closed")
             let session = sessionID
+            // This attempt's own expanded VHD copy, adopted only if it is still current at the
+            // end: two opens can overlap (e.g. two files opened from the Finder at once).
+            var expandedCopy: URL?
             do {
                 var reasons: [String] = []
                 var source = url
                 if url.pathExtension.lowercased() == "vhd" {
-                    let preparation = try await VHDImage.prepareForReading(url)
+                    let preparation = try await VHDImage.prepareForReading(url, into: try storage.makeDirectory("vhd"))
                     if preparation.imageURL != url {
-                        vhdExpandedCopy = preparation.imageURL
+                        expandedCopy = preparation.imageURL
                         source = preparation.imageURL
                         reasons.append("Dynamic VHD images are expanded to a temporary copy and opened read-only. Changes can't be written back to the VHD container.")
                     }
@@ -298,9 +301,11 @@ final class DiskImageManager: ObservableObject {
                 }
                 guard session == sessionID else {
                     await volume.close()
+                    if let expandedCopy { storage.remove(expandedCopy.deletingLastPathComponent()) }
                     return
                 }
 
+                self.vhdExpandedCopy = expandedCopy
                 self.volume = volume
                 self.imageURL = url
                 self.volumeName = await volume.volumeName
@@ -320,6 +325,10 @@ final class DiskImageManager: ObservableObject {
                     warningMessage = reason
                 }
             } catch {
+                if let expandedCopy, expandedCopy != vhdExpandedCopy { storage.remove(expandedCopy.deletingLastPathComponent()) }
+                // A failure of an attempt that has since been superseded must not close the
+                // image the user opened after it.
+                guard session == sessionID else { return }
                 await closeImage(status: "Failed to open image")
                 errorMessage = "Could not open \(url.lastPathComponent): \(error.localizedDescription)"
             }
@@ -339,8 +348,12 @@ final class DiskImageManager: ObservableObject {
         // Stop whatever is in flight first. Bumping the session makes its loops stop at the
         // next step, and closing the volume makes any call it still makes fail — so nothing
         // can write to the image after this returns.
+        let interrupted = activeTransfer != nil && writeQueueTail != nil
         activeTransfer?.flag.cancel()
         sessionID = UUID()
+        // Let the write in progress stop at its next step and finish its own save, so the
+        // flush below doesn't race it (queued writes see the new session and do nothing).
+        await writeQueueTail?.value
         if let volume {
             do {
                 try await volume.flush()
@@ -362,14 +375,21 @@ final class DiskImageManager: ObservableObject {
         formatName = nil
         freeSpaceDescription = nil
         if let vhdExpandedCopy {
-            try? fileManager.removeItem(at: vhdExpandedCopy)
+            storage.remove(vhdExpandedCopy.deletingLastPathComponent())
             self.vhdExpandedCopy = nil
         }
         storage.removeAll("preview")
         clipboardExportTask?.cancel()
         clipboardExportTask = nil
         internalClipboard = nil
-        statusMessage = status
+        releasePasteboardIfOurs()
+        statusMessage = interrupted ? "\(status); the operation in progress was stopped" : status
+    }
+
+    /// Clears the system pasteboard if it still holds what this app put there: those file
+    /// URLs point into temporary storage that is about to go away.
+    private func releasePasteboardIfOurs() {
+        if pasteboard.availableType(from: [Self.internalClipboardType]) != nil { pasteboard.clearContents() }
     }
 
     // MARK: - Browsing
@@ -457,9 +477,14 @@ final class DiskImageManager: ObservableObject {
         let trimmed = proposedName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let nameString = volume.validName(from: trimmed)
+        // Captured now: the operation may wait behind another, and by the time it runs the user
+        // may be looking at a different folder (or a different image).
+        let folder = currentFolderID
+        let session = sessionID
         await serializedWrite { [self] in await withBusy {
+            guard session == sessionID else { return }
             do {
-                try await volume.createFolder(named: nameString, in: currentFolderID)
+                try await volume.createFolder(named: nameString, in: folder)
                 try await volume.flush()
                 try await reload()
                 statusMessage = nameString == trimmed ? "Created \(nameString)" : "Created \(nameString) (renamed for classic HFS compatibility)"
@@ -491,14 +516,14 @@ final class DiskImageManager: ObservableObject {
         await serializedWrite { [self] in await withBusy {
             let transfer = beginTransfer(title: "Deleting Items", message: "Preparing to delete…")
             defer { endTransfer(transfer.id) }
-            var deleted = 0
+            var deleted: [String] = []
             var failure: String?
             for entry in entries {
                 do {
                     try transfer.flag.check()
                     updateTransfer(transfer.id, message: "Deleting \(entry.name)…")
                     try await deleteRecursively(entry.id, on: volume, flag: transfer.flag)
-                    deleted += 1
+                    deleted.append(entry.name)
                 } catch is CancellationError {
                     statusMessage = "Delete cancelled"
                     break
@@ -507,8 +532,8 @@ final class DiskImageManager: ObservableObject {
                 }
             }
             await finishWrite(on: volume)
-            if deleted > 0 {
-                statusMessage = deleted == 1 ? "Deleted \(entries.first!.name)" : "Deleted \(deleted) items"
+            if !deleted.isEmpty {
+                statusMessage = deleted.count == 1 ? "Deleted \(deleted[0])" : "Deleted \(deleted.count) items"
             }
             if let failure { errorMessage = failure }
         } }
@@ -564,11 +589,13 @@ final class DiskImageManager: ObservableObject {
             errorMessage = "This image is read-only, so files can't be added to it."
             return
         }
+        // Captured now, not when the queued import finally runs (see createFolder).
+        let destination = currentFolderID
+        let session = sessionID
         await serializedWrite { [self] in await withBusy {
+            guard session == sessionID else { return }
             let transfer = beginTransfer(title: "Adding Items", message: "Preparing import…")
             defer { endTransfer(transfer.id) }
-            let destination = currentFolderID
-            let session = sessionID
             var tally = ImportTally()
             var cancelled = false
             var failure: String?
@@ -725,14 +752,27 @@ final class DiskImageManager: ObservableObject {
         await withBusy {
             let transfer = beginTransfer(title: "Exporting Items", message: "Exporting \(entry.name)…")
             defer { endTransfer(transfer.id) }
+            // Export to a staging location first and swap it in only once complete, so a
+            // cancelled or failed export never costs the user the file they chose to replace.
+            // (itemReplacementDirectory is the safe-save location NSDocument uses; it is on the
+            // destination's volume and usable inside the sandbox.)
+            let staging = (try? fileManager.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: destination, create: true))
+                ?? (try? storage.makeDirectory("export"))
+            guard let staging else {
+                errorMessage = "Could not export \(entry.name): no temporary space is available."
+                return
+            }
+            defer { try? fileManager.removeItem(at: staging) }
+            let staged = staging.appendingPathComponent(destination.lastPathComponent)
             do {
+                try await exportItem(entry.item, to: staged, from: volume, transfer: transfer)
                 if fileManager.fileExists(atPath: destination.path) {
-                    try fileManager.removeItem(at: destination)
+                    _ = try fileManager.replaceItemAt(destination, withItemAt: staged)
+                } else {
+                    try fileManager.moveItem(at: staged, to: destination)
                 }
-                try await exportItem(entry.item, to: destination, from: volume, transfer: transfer)
                 statusMessage = "Exported \(entry.name)"
             } catch is CancellationError {
-                try? fileManager.removeItem(at: destination)
                 statusMessage = "Export cancelled"
             } catch {
                 errorMessage = "Could not export \(entry.name): \(error.localizedDescription)"
@@ -750,18 +790,24 @@ final class DiskImageManager: ObservableObject {
             var lastError: Error?
             for entry in entries {
                 let destination = destinationFolder.appendingPathComponent(Self.hostName(fromClassicHFSName: entry.name))
+                // Only ever remove what this export itself created: the destination folder can
+                // hold same-named files of the user's own, which are skipped, never touched.
+                var created = false
                 do {
                     try transfer.flag.check()
                     guard !fileManager.fileExists(atPath: destination.path) else {
                         throw CocoaError(.fileWriteFileExists, userInfo: [NSFilePathErrorKey: destination.path])
                     }
+                    created = true
                     try await exportItem(entry.item, to: destination, from: volume, transfer: transfer)
                     exported += 1
                 } catch is CancellationError {
-                    try? fileManager.removeItem(at: destination)
+                    if created { try? fileManager.removeItem(at: destination) }
                     statusMessage = "Export cancelled"
                     return
                 } catch {
+                    // A folder that failed partway would otherwise be left half-exported.
+                    if created { try? fileManager.removeItem(at: destination) }
                     lastError = error
                 }
             }
@@ -809,13 +855,18 @@ final class DiskImageManager: ObservableObject {
 
     /// Exports an entry to a private temporary location, for Quick Look, Open, and drags to
     /// other apps. Edits made there don't flow back into the image; use Add Files for that.
-    func materializeForPreview(_ entry: FileEntry, purpose: String = "preview") async -> URL? {
+    ///
+    /// `transfer` is the progress display to report to, if any; without one the copy runs
+    /// quietly with its own cancellation flag (never borrowing an import's, whose progress
+    /// and Cancel button belong to the import). The copy is made read-only, so an app that
+    /// opens it says so instead of letting edits be silently lost.
+    func materializeForPreview(_ entry: FileEntry, purpose: String = "preview", transfer: (id: UUID, flag: CancellationFlag)? = nil) async -> URL? {
         guard let volume else { return nil }
         do {
             let directory = try storage.makeDirectory(purpose)
             let destination = directory.appendingPathComponent(Self.hostName(fromClassicHFSName: entry.name))
-            let transfer = activeTransfer ?? (id: UUID(), flag: CancellationFlag())
-            try await exportItem(entry.item, to: destination, from: volume, transfer: transfer)
+            try await exportItem(entry.item, to: destination, from: volume, transfer: transfer ?? (id: UUID(), flag: CancellationFlag()))
+            Self.makeReadOnly(destination)
             return destination
         } catch is CancellationError {
             statusMessage = "Copy cancelled"
@@ -824,6 +875,19 @@ final class DiskImageManager: ObservableObject {
             errorMessage = "Could not copy \(entry.name): \(error.localizedDescription)"
             return nil
         }
+    }
+
+    /// Clears the write permission of every file under `url` (folders keep theirs, so the
+    /// temporary storage can still be cleaned up).
+    private static func makeReadOnly(_ url: URL) {
+        let fileManager = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return }
+        let files = isDirectory.boolValue
+            ? (fileManager.enumerator(at: url, includingPropertiesForKeys: [.isRegularFileKey])?.compactMap { $0 as? URL }
+                .filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true } ?? [])
+            : [url]
+        for file in files { try? fileManager.setAttributes([.posixPermissions: 0o444], ofItemAtPath: file.path) }
     }
 
     /// Double-click / "Open": folders open in the browser; files open in their default app,
@@ -859,9 +923,11 @@ final class DiskImageManager: ObservableObject {
                 guard let self else {
                     completion(nil, false, CocoaError(.userCancelled)); return
                 }
-                let transfer = self.beginTransfer(title: "Copying Files", message: "Preparing \(entry.name)…")
-                defer { self.endTransfer(transfer.id) }
-                guard let url = await self.materializeForPreview(entry, purpose: "drag") else {
+                // Shows progress only when nothing else is: an import's progress display (and
+                // its Cancel button) must stay the import's.
+                let transfer = self.activeTransfer == nil ? self.beginTransfer(title: "Copying Files", message: "Preparing \(entry.name)…") : nil
+                defer { if let transfer { self.endTransfer(transfer.id) } }
+                guard let url = await self.materializeForPreview(entry, purpose: "drag", transfer: transfer) else {
                     completion(nil, false, CocoaError(.fileReadUnknown))
                     return
                 }
@@ -882,7 +948,7 @@ final class DiskImageManager: ObservableObject {
     /// Marks the selection to be *moved* on the next Paste. Nothing changes until then: the
     /// move happens in one step at paste time, so there is no copy/delete race to lose data in.
     func cutSelected() {
-        guard !selectedEntries.isEmpty else { return }
+        guard !selectedEntries.isEmpty, !isReadOnly else { return }
         fillClipboard(Array(selectedEntries), operation: .cut)
     }
 
@@ -954,7 +1020,11 @@ final class DiskImageManager: ObservableObject {
         if let clipboard = internalClipboard, clipboard.session == sessionID,
            pasteboard.string(forType: Self.internalClipboardType) == clipboard.token {
             if clipboard.operation == .cut {
+                // A cut is used up by its paste, here and in other apps (the exported copies
+                // describe items that are no longer where they were).
                 internalClipboard = nil
+                clipboardExportTask?.cancel()
+                releasePasteboardIfOurs()
                 await moveItems(clipboard.itemIDs, to: currentFolderID)
             } else {
                 await copyItems(clipboard.itemIDs, to: currentFolderID)
@@ -1046,22 +1116,30 @@ final class DiskImageManager: ObservableObject {
         }
         await serializedWrite { [self] in await withBusy {
             var moved = 0
+            var alreadyThere = 0
             var failure: String?
             for id in ids {
                 do {
                     let item = try await volume.item(id)
-                    if item.parentID != folderID {
+                    if item.parentID == folderID {
+                        alreadyThere += 1
+                    } else {
                         try await volume.move(id, to: folderID)
+                        moved += 1
                     }
-                    moved += 1
                 } catch {
                     failure = error.localizedDescription
                 }
             }
             await finishWrite(on: volume)
-            statusMessage = moved == ids.count
-                ? (moved == 1 ? "Moved 1 item" : "Moved \(moved) items")
-                : "Moved \(moved) of \(ids.count) items"
+            let toMove = ids.count - alreadyThere
+            if toMove == 0 {
+                statusMessage = "Nothing to move: already in this folder"
+            } else {
+                statusMessage = moved == toMove
+                    ? (moved == 1 ? "Moved 1 item" : "Moved \(moved) items")
+                    : "Moved \(moved) of \(toMove) items"
+            }
             if let failure { errorMessage = failure }
         } }
     }
@@ -1126,7 +1204,10 @@ final class DiskImageManager: ObservableObject {
 
     /// Writes pending changes; called when the app quits.
     func prepareForTermination() async {
+        activeTransfer?.flag.cancel()
+        await writeQueueTail?.value
         if let volume { try? await volume.flush() }
+        releasePasteboardIfOurs()
         storage.removeLaunchDirectory()
     }
 
@@ -1215,7 +1296,8 @@ final class DiskImageManager: ObservableObject {
     /// prints warnings to stderr about unrelated filesystems — e.g. an unreachable Time Capsule
     /// SMB mount — which must not be read as "the file is in use".
     nonisolated static func processesHoldingOpen(_ path: String) async -> [Int32] {
-        guard FileManager.default.isExecutableFile(atPath: "/usr/sbin/lsof") else { return [] }
+        guard ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] == nil,
+              FileManager.default.isExecutableFile(atPath: "/usr/sbin/lsof") else { return [] }
         let (out, _, _) = await runProcess("/usr/sbin/lsof", ["-t", "--", path])
         return parseLsofPIDs(out, excluding: ProcessInfo.processInfo.processIdentifier)
     }
