@@ -117,6 +117,7 @@ struct HFSPlusVolumeHeader {
     static let extentsFileOffset = 192
     static let catalogFileOffset = 272
     static let attributesFileOffset = 352
+    static let startupFileOffset = 432
 }
 
 /// HFS Plus catalog key: parent ID and a UTF-16 name of up to 255 units.

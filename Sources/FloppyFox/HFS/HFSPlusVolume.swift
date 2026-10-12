@@ -46,6 +46,8 @@ actor HFSPlusVolume: DiskVolume {
     private var lastKnownHeaderSector: [UInt8]
     private var dirty = false
     private var markedInUse = false
+    /// See HFSVolume.leaveForCheck: saves then leave the volume marked for Mac OS to check.
+    private let leaveForCheck: Bool
     private var isClosed = false
     private var needsRepair = false
 
@@ -178,7 +180,26 @@ actor HFSPlusVolume: DiskVolume {
             try checkFork(file.fork(.resource))
         }
         self.keyByID = keyByID
-        self.committed = Committed(header: header, bitmap: bitmap, catalog: catalog, extentsRecords: extentsRecords,
+        var known: [(start: Int, count: Int)] = []
+        func add(_ extents: [HFSPlusExtent]) { known += extents.map { (Int($0.startBlock), Int($0.blockCount)) } }
+        for offset in [HFSPlusVolumeHeader.allocationFileOffset, HFSPlusVolumeHeader.extentsFileOffset,
+                       HFSPlusVolumeHeader.catalogFileOffset, HFSPlusVolumeHeader.attributesFileOffset, HFSPlusVolumeHeader.startupFileOffset] {
+            add(header.fork(offset).extents)
+        }
+        for entry in extentsRecords { add(entry.extents) }
+        for record in catalog where record.type == .file {
+            guard let file = try? HFSPlusFileRecord(raw: record.data) else { continue }
+            add(file.fork(.data).extents)
+            add(file.fork(.resource).extents)
+        }
+        // The boot blocks and volume header, and the spare header in the last 1024 bytes.
+        known.append((0, (1536 + blockSize - 1) / blockSize))
+        let spareBlock = Int((volumeBytes - 1024) / UInt64(blockSize))
+        known.append((spareBlock, Int(header.totalBlocks) - spareBlock))
+        let underAllocated = allocation.claimKnownUsed(known)
+        self.leaveForCheck = underAllocated || header.attributes & HFSPlusVolumeHeader.unmountedCleanlyBit == 0
+            || header.attributes & HFSPlusVolumeHeader.inconsistentBit != 0
+        self.committed = Committed(header: header, bitmap: allocation.committed, catalog: catalog, extentsRecords: extentsRecords,
                                    catalogHeader: catalogHeader, extentsHeader: extentsHeader, keyByID: keyByID)
     }
 
@@ -190,7 +211,7 @@ actor HFSPlusVolume: DiskVolume {
     }
 
     /// Room for new files: free space, less what the next save needs to write its trees safely.
-    var freeBytes: UInt64 { UInt64(max(0, allocation.availableCount - saveReserveBlocks)) * UInt64(blockSize) }
+    var freeBytes: UInt64 { UInt64(allocation.dataAvailableCount(keeping: saveRoom)) * UInt64(blockSize) }
 
     nonisolated func validName(from hostName: String) -> String {
         var name = hostName.replacingOccurrences(of: ":", with: "-")
@@ -304,9 +325,9 @@ actor HFSPlusVolume: DiskVolume {
         let extentsBefore = extentsRecords
         let headerBefore = header
         do {
-            let reserve = saveReserveBlocks
-            let dataExtents = try writeNewFork(dataFork, reserve: reserve)
-            let resourceExtents = try writeNewFork(resourceFork, reserve: reserve)
+            let room = saveRoom
+            let dataExtents = try writeNewFork(dataFork, keeping: room)
+            let resourceExtents = try writeNewFork(resourceFork, keeping: room)
             let id = try allocateCatalogID()
             let now = HFSPlusDate.now
             let encoding = HFSPlusName.textEncoding(for: name)
@@ -403,12 +424,16 @@ actor HFSPlusVolume: DiskVolume {
     @discardableResult
     func copyFile(_ id: UInt32, to parentID: UInt32, name: String) throws -> UInt32 {
         let source = try fileRecord(id)
-        let data = try readForkBytes(id, fork: .data)
-        let resource = try readForkBytes(id, fork: .resource)
+        func stream(_ fork: HFSFork) throws -> HFSForkSource {
+            let data = source.fork(fork)
+            let runs = Self.fullExtents(fileID: id, fork: fork, data: data, overflow: extentsRecords)
+                .map { (position: UInt64($0.startBlock) * UInt64(blockSize), bytes: UInt64($0.blockCount) * UInt64(blockSize)) }
+            return try HFSForkSource(length: data.logicalSize, runs: runs, device: device)
+        }
         let metadata = NewFileMetadata(fileType: source.fileType, creator: source.creator, finderInfo: source.finderInfo,
                                        extendedFinderInfo: source.extendedFinderInfo,
                                        createDate: HFSPlusDate.date(source.createDate), modifyDate: HFSPlusDate.date(source.modifyDate))
-        return try createFile(named: name, in: parentID, metadata: metadata, dataFork: HFSForkSource(bytes: data), resourceFork: HFSForkSource(bytes: resource))
+        return try createFile(named: name, in: parentID, metadata: metadata, dataFork: try stream(.data), resourceFork: try stream(.resource))
     }
 
     func flush() throws {
@@ -492,7 +517,7 @@ actor HFSPlusVolume: DiskVolume {
             neededNodes: try BTree.minimumNodeCount(records: catalogRecords, nodeSize: catalogNodeSize),
             nodeSize: catalogNodeSize, blockSize: blockSize, clumpBytes: Int(oldCatalogFork.clumpSize),
             current: oldCatalog.map { (Int($0.startBlock), Int($0.blockCount)) }, currentNodes: Int(oldCatalogFork.logicalSize) / catalogNodeSize,
-            maxExtents: nil, roomy: roomy, allowInPlace: allowInPlace, map: &allocation, hint: hint
+            maxExtents: nil, compactRuns: 8, roomy: roomy, allowInPlace: allowInPlace, map: &allocation, hint: hint
         )
         let catalogRuns = catalogPlan.runs.map { HFSPlusExtent(startBlock: UInt32($0.start), blockCount: UInt32($0.count)) }
         extentsRecords.removeAll { $0.key.fileID == HFSCatalogID.catalogFile && $0.key.fork == .data }
@@ -503,7 +528,7 @@ actor HFSPlusVolume: DiskVolume {
             neededNodes: try BTree.minimumNodeCount(records: extentsBuild, nodeSize: extentsNodeSize),
             nodeSize: extentsNodeSize, blockSize: blockSize, clumpBytes: Int(oldExtentsFork.clumpSize),
             current: oldExtents.map { (Int($0.startBlock), Int($0.blockCount)) }, currentNodes: Int(oldExtentsFork.logicalSize) / extentsNodeSize,
-            maxExtents: 8, roomy: roomy, allowInPlace: allowInPlace, map: &allocation, hint: hint
+            maxExtents: 8, compactRuns: 8, roomy: roomy, allowInPlace: allowInPlace, map: &allocation, hint: hint
         )
         guard extentsPlan.runs.count <= 8 else { throw HFSError.catalogFull }
         let extentsRuns = extentsPlan.runs.map { HFSPlusExtent(startBlock: UInt32($0.start), blockCount: UInt32($0.count)) }
@@ -551,8 +576,13 @@ actor HFSPlusVolume: DiskVolume {
         header.freeBlocks = UInt32(allocation.freeCount)
         header.modifyDate = HFSPlusDate.now
         header.writeCount &+= 1
-        header.attributes |= HFSPlusVolumeHeader.unmountedCleanlyBit
-        header.attributes &= ~HFSPlusVolumeHeader.inconsistentBit
+        if leaveForCheck {
+            header.attributes &= ~HFSPlusVolumeHeader.unmountedCleanlyBit
+            header.attributes |= HFSPlusVolumeHeader.inconsistentBit
+        } else {
+            header.attributes |= HFSPlusVolumeHeader.unmountedCleanlyBit
+            header.attributes &= ~HFSPlusVolumeHeader.inconsistentBit
+        }
         try device.write(header.raw, at: 1024)
         try device.synchronize()
         lastKnownHeaderSector = header.raw
@@ -759,16 +789,21 @@ actor HFSPlusVolume: DiskVolume {
 
     /// Space new file data must leave free so the next save can write fresh copies of both
     /// trees instead of overwriting them in place.
-    private var saveReserveBlocks: Int {
-        let catalogNodes = Int(committed.header.fork(HFSPlusVolumeHeader.catalogFileOffset).logicalSize) / catalogNodeSize
-        let extentsNodes = Int(committed.header.fork(HFSPlusVolumeHeader.extentsFileOffset).logicalSize) / extentsNodeSize
-        return TreePlacement.blocks(forNodes: catalogNodes + max(catalogNodes / 4, 4), nodeSize: catalogNodeSize, blockSize: blockSize)
-            + TreePlacement.blocks(forNodes: extentsNodes, nodeSize: extentsNodeSize, blockSize: blockSize)
+    /// What the next save needs to write both trees by copy (see HFSVolume.saveRoom), each
+    /// within the volume header's eight extents.
+    private var saveRoom: AllocationMap.SaveRoom {
+        func room(_ header: BTree.Header, nodeSize: Int) -> Int {
+            let used = Int(header.totalNodes) - Int(min(header.freeNodes, header.totalNodes))
+            let nodes = TreePlacement.minimumNodes(needed: used + max(used / 4, 4), current: Int(header.totalNodes))
+            return TreePlacement.blocks(forNodes: nodes, nodeSize: nodeSize, blockSize: blockSize)
+        }
+        return AllocationMap.SaveRoom(trees: [(room(committed.catalogHeader, nodeSize: catalogNodeSize), 8),
+                                              (room(committed.extentsHeader, nodeSize: extentsNodeSize), 8)])
     }
 
-    private func writeNewFork(_ source: HFSForkSource, reserve: Int) throws -> [HFSPlusExtent] {
+    private func writeNewFork(_ source: HFSForkSource, keeping room: AllocationMap.SaveRoom) throws -> [HFSPlusExtent] {
         let blocks = Int((source.length + UInt64(blockSize) - 1) / UInt64(blockSize))
-        let extents = try allocation.allocate(blocks, hint: Int(header.nextAllocation), reserve: reserve)
+        let extents = try allocation.allocateData(blocks, hint: Int(header.nextAllocation), keeping: room)
             .map { HFSPlusExtent(startBlock: UInt32($0.start), blockCount: UInt32($0.count)) }
         if let last = extents.last { header.nextAllocation = last.startBlock + last.blockCount }
         var offset: UInt64 = 0

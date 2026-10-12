@@ -154,35 +154,35 @@ final class CrashSafetyTests: XCTestCase {
             try await volume.flush()
             for (index, id) in fillers.enumerated() where index % 2 == 0 { try await volume.delete(id) }
             try await volume.flush()
-            // Use up the contiguous room the save reserve kept free, so the remaining free
-            // space is mostly one-block holes and the catalog has to be scattered over them.
-            let plug = Int(await volume.freeBytes)
-            try await volume.createFile(named: "plug", in: HFSCatalogID.rootFolder, type: [], creator: [],
-                                        dataFork: HFSForkSource(bytes: [UInt8](repeating: 0, count: plug)), resourceFork: .empty)
-            try await volume.flush()
+            // Free space is now the room kept for the next save plus one-block holes.
             await volume.close()
         }
         try Fixtures.fsck(image).clean ? () : XCTFail("setup left the volume damaged")
 
-        // Round 0 scatters the catalog over single-block holes (overflow extents); round 1
-        // grows a catalog that already has overflow extents — the reviewed failure.
-        var sawCatalogOverflow = false
+        // Each round adds folders until the catalog has to gather single-block holes for more
+        // overflow extents. Round 0 gives it overflow extents; round 1 grows a catalog that
+        // already has them — the reviewed failure.
+        var created = 0
         for round in 0..<2 {
             let volume = try open(image)
-            for i in 0..<10 {
-                try await volume.createFolder(named: String(format: "Round %d folder %02d padding", round, i), in: HFSCatalogID.rootFolder)
+            let before = await volume.overflowRecords.filter { $0.key.fileID == HFSCatalogID.catalogFile }.count
+            var grew = false
+            for batch in 0..<30 where !grew {
+                for i in 0..<20 {
+                    try await volume.createFolder(named: String(format: "R%d batch %02d folder %02d", round, batch, i), in: HFSCatalogID.rootFolder)
+                }
+                try await volume.flush()
+                created += 20
+                grew = await volume.overflowRecords.filter { $0.key.fileID == HFSCatalogID.catalogFile }.count > before
             }
-            try await volume.flush()
-            let catalogOverflow = await volume.overflowRecords.filter { $0.key.fileID == HFSCatalogID.catalogFile }
-            if !catalogOverflow.isEmpty { sawCatalogOverflow = true }
+            XCTAssertTrue(grew, "round \(round) should have added catalog overflow extents")
             await volume.close()
             let verdict = try Fixtures.fsck(image)
             XCTAssertTrue(verdict.clean, "round \(round):\n\(verdict.output)")
         }
-        XCTAssertTrue(sawCatalogOverflow, "the test should have forced catalog overflow extents")
         let reopened = try open(image)
         let folders = try await reopened.contents(ofFolder: HFSCatalogID.rootFolder).filter(\.isFolder)
-        XCTAssertEqual(folders.count, 20)
+        XCTAssertEqual(folders.count, created)
     }
 
     // MARK: Hostile images
