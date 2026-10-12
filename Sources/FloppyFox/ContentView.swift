@@ -716,7 +716,7 @@ struct ContentView: View {
     }
 
     private func classicMacIcon(named name: String, size: CGFloat, rotation: Double = 0) -> some View {
-        Image(name, bundle: .module)
+        Image(name, bundle: .floppyFoxResources)
             .interpolation(.high)
             .resizable()
             .scaledToFit()

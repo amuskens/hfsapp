@@ -11,9 +11,10 @@ HD_ICON=./Build/FloppyFoxHDDoc.icns
 
 rm -rf "$OUTDIR" "$ICONSET" "$ICON" "$DOC_ICONSET" "$DOC_ICON" "$HD_ICONSET" "$HD_ICON"
 
-echo "Building release executable..."
-swift build -c release
-BIN=.build/release/FloppyFox
+echo "Building universal (arm64 + x86_64) release executable..."
+swift build -c release --arch arm64 --arch x86_64
+PRODUCTS=.build/apple/Products/Release
+BIN=$PRODUCTS/FloppyFox
 
 if [ ! -f "$BIN" ]; then
   echo "Built binary not found at $BIN"
@@ -62,13 +63,15 @@ cp "$DOC_ICON" "$OUTDIR/Contents/Resources/DiskImageDocument.icns"
 cp "$HD_ICON" "$OUTDIR/Contents/Resources/HardDiskImageDocument.icns"
 
 # SwiftPM keeps processed assets and the bundled help README in a companion resource bundle.
-# Preserve it inside the application so `Bundle.module` works in packaged release builds too.
-# The generated accessor looks for it next to Bundle.main.bundleURL, i.e. at the top level
-# of the .app (a sibling of Contents/), not inside Contents/Resources.
-RESOURCE_BUNDLE=$(find .build -path '*/release/FloppyFox_FloppyFox.bundle' -type d -print -quit)
-if [ -n "$RESOURCE_BUNDLE" ]; then
-  cp -R "$RESOURCE_BUNDLE" "$OUTDIR/"
+# It goes in Contents/Resources, where `Bundle.floppyFoxResources` looks for it. (SwiftPM's own
+# `Bundle.module` expects it at the top level of the .app, but codesign rejects anything there:
+# "unsealed contents present in the bundle root".)
+RESOURCE_BUNDLE=$PRODUCTS/FloppyFox_FloppyFox.bundle
+if [ ! -d "$RESOURCE_BUNDLE" ]; then
+  echo "Resource bundle not found at $RESOURCE_BUNDLE"
+  exit 1
 fi
+cp -R "$RESOURCE_BUNDLE" "$OUTDIR/Contents/Resources/"
 
 cat > "$OUTDIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -93,6 +96,8 @@ cat > "$OUTDIR/Contents/Info.plist" <<PLIST
   <string>1</string>
   <key>NSHumanReadableCopyright</key>
   <string>(C) 2026 Anders Muskens</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.utilities</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>

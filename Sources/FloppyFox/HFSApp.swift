@@ -167,7 +167,7 @@ private enum AppPresentation {
            let releaseIcon = NSImage(contentsOf: releaseIconURL) {
             return releaseIcon
         }
-        if let bundledIconURL = Bundle.module.url(forResource: "FloppyFoxIcon", withExtension: "svg"),
+        if let bundledIconURL = Bundle.floppyFoxResources.url(forResource: "FloppyFoxIcon", withExtension: "svg"),
            let bundledIcon = NSImage(contentsOf: bundledIconURL) {
             return bundledIcon
         }
@@ -175,7 +175,7 @@ private enum AppPresentation {
     }
 
     static func showReadme() {
-        let helpURL = Bundle.module.url(forResource: "FloppyFoxHelp", withExtension: "md")
+        let helpURL = Bundle.floppyFoxResources.url(forResource: "FloppyFoxHelp", withExtension: "md")
         let readme = helpURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
             ?? "FloppyFox Help\n\nThe bundled README could not be loaded."
 

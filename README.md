@@ -61,6 +61,22 @@ Run the test suite with:
 swift test
 ```
 
+The suite has three tiers:
+
+- **Unit tests** (`ParsingTests`, parts of `RobustnessTests`) cover hfsutils output parsing,
+  name conversion, hfs:// pseudo-URLs, and fuzzed VHD/resource-fork input. They need nothing
+  installed.
+- **Integration tests** (`HFSUtilsBackendTests`, `MountedBackendTests`) build throwaway disk
+  images: classic HFS with hfsutils' `hformat`, HFS+ with `hdiutil create`. After each
+  operation they eject and check the image file itself with hfsutils, so a change only counts
+  if it actually reached the disk. The hfsutils tests are skipped unless hfsutils is
+  installed (`brew install hfsutils`).
+- **Real-image tests** (in `HFSAppTests`) run against period disk images that aren't in the
+  repository. Put `HD1 BlueSCSI Bootstrap.hda`, `StuffIt Deluxe 3.0.7 Disk 1.dsk`,
+  `StuffIt Deluxe 3.0.7 Disk 2.dsk` and `boot.vhd` in the repo root (they're gitignored), and
+  set `FLOPPYFOX_VHD_FIXTURE=/path/to/image.vhd` for the VHD tests. Tests whose image is
+  missing are skipped.
+
 If the command-line tools are not using the full Xcode SDK, specify it explicitly:
 
 ```bash

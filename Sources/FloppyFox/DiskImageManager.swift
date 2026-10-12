@@ -104,17 +104,17 @@ struct FileEntry: Identifiable, Hashable {
             if let resourceIconPNG, let image = NSImage(data: resourceIconPNG) {
                 return image
             }
-            if finderType == "APPL", let image = NSImage(named: "ClassicMac") ?? Bundle.module.image(forResource: "ClassicMac") {
+            if finderType == "APPL", let image = NSImage(named: "ClassicMac") ?? Bundle.floppyFoxResources.image(forResource: "ClassicMac") {
                 return image
             }
             if ["dsk", "img", "hda", "vhd"].contains((name as NSString).pathExtension.lowercased()),
-               let image = NSImage(named: "Floppy") ?? Bundle.module.image(forResource: "Floppy") {
+               let image = NSImage(named: "Floppy") ?? Bundle.floppyFoxResources.image(forResource: "Floppy") {
                 return image
             }
             if isDirectory {
                 return workspace.icon(for: .folder)
             }
-            if let image = NSImage(named: "ClassicDocument") ?? Bundle.module.image(forResource: "ClassicDocument") {
+            if let image = NSImage(named: "ClassicDocument") ?? Bundle.floppyFoxResources.image(forResource: "ClassicDocument") {
                 image.isTemplate = false
                 return image
             }
@@ -130,6 +130,24 @@ struct FileEntry: Identifiable, Hashable {
 
     static func == (lhs: FileEntry, rhs: FileEntry) -> Bool {
         return lhs.url == rhs.url
+    }
+}
+
+/// Hands a pipe's contents from the thread that drained it back to `runProcess`.
+private final class DrainedData: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func set(_ value: Data) {
+        lock.lock()
+        data = value
+        lock.unlock()
+    }
+
+    func get() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
     }
 }
 
@@ -182,6 +200,8 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
     @Published var currentHFSPath: String? = ":" // ':' denotes root for hfsutils
 
     private let fileManager = FileManager.default
+    /// The system pasteboard in the app; tests substitute a private one.
+    var pasteboard: NSPasteboard = .general
     private var internalClipboardURLs: [URL] = []
     private var internalClipboardOperation: ClipboardOperation = .copy
     private var internalClipboardToken: String?
@@ -463,6 +483,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
 
         guard hfsutilsAvailable else {
             self.imageURL = nil
+            cleanupTempCopyIfAny()
             self.errorMessage = hdiutilError.localizedDescription
             self.statusMessage = "Failed to mount image"
             return
@@ -479,6 +500,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
         } catch {
             self.imageURL = nil
             self.currentHFSPath = ":"
+            cleanupTempCopyIfAny()
             self.errorMessage = error.localizedDescription
             self.statusMessage = "Failed to mount image"
         }
@@ -538,27 +560,53 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
         _ arguments: [String],
         environment additions: [String: String] = [:]
     ) async -> (String, String, Int32) {
+        await Self.runProcess(executable, arguments, environment: additions)
+    }
+
+    nonisolated static func runProcess(
+        _ executable: String,
+        _ arguments: [String],
+        environment additions: [String: String] = [:]
+    ) async -> (String, String, Int32) {
         await Task.detached(priority: .userInitiated) {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: executable)
-            proc.arguments = arguments
-            if !additions.isEmpty {
-                proc.environment = ProcessInfo.processInfo.environment.merging(additions) { _, new in new }
-            }
-            let outPipe = Pipe()
-            let errPipe = Pipe()
-            proc.standardOutput = outPipe
-            proc.standardError = errPipe
-            do {
-                try proc.run()
-                proc.waitUntilExit()
-                let out = Self.decodeProcessOutput(outPipe.fileHandleForReading.readDataToEndOfFile())
-                let err = Self.decodeProcessOutput(errPipe.fileHandleForReading.readDataToEndOfFile())
-                return (out, err, proc.terminationStatus)
-            } catch {
-                return ("", "\(error)", Int32(-1))
-            }
+            runProcessBlocking(executable, arguments, environment: additions)
         }.value
+    }
+
+    private nonisolated static func runProcessBlocking(
+        _ executable: String,
+        _ arguments: [String],
+        environment additions: [String: String]
+    ) -> (String, String, Int32) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: executable)
+        proc.arguments = arguments
+        if !additions.isEmpty {
+            proc.environment = ProcessInfo.processInfo.environment.merging(additions) { _, new in new }
+        }
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+        do {
+            try proc.run()
+        } catch {
+            return ("", "\(error)", Int32(-1))
+        }
+        // Both pipes must be drained *while* the child runs: a pipe holds only 64 KB, and a
+        // child that fills it blocks on write and never exits. Waiting first (as this used
+        // to) hung the app forever on e.g. `hls` of a folder with a few thousand files.
+        // stderr is drained on a second thread so neither pipe can stall the other.
+        let errData = DrainedData()
+        let errDrained = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            errData.set(errPipe.fileHandleForReading.readDataToEndOfFile())
+            errDrained.signal()
+        }
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        errDrained.wait()
+        proc.waitUntilExit()
+        return (Self.decodeProcessOutput(outData), Self.decodeProcessOutput(errData.get()), proc.terminationStatus)
     }
 
     /// macOS tools emit UTF-8, while hfsutils emits classic Mac Roman filenames. A strict
@@ -757,6 +805,12 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
 
     private func prepareForHFSUtils(imagePath: String) async throws {
         if hfsUtilsPrepared { return }
+        // Already working on a private copy (e.g. an expanded dynamic VHD): nothing else can
+        // hold it open, and copying the original container over it would be wrong.
+        if tempImageCopyURL != nil {
+            hfsUtilsPrepared = true
+            return
+        }
 
         let attached = await findAttachedDevices(for: imagePath)
         if !attached.isEmpty {
@@ -781,7 +835,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
                     }
                 }
             } else if resp == .alertSecondButtonReturn {
-                try await createTempCopyAndUse(imagePath: imagePath)
+                try await switchToTemporaryCopy(imagePath: imagePath, reason: "You chose to work on a temporary copy of this image, so it was opened read-only. Changes could not be saved back to the original.")
                 hfsUtilsPrepared = true
                 return
             } else {
@@ -791,25 +845,25 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
 
         // Wait until the file is no longer held open by any process. If it remains locked, fall back to operating on a temporary copy.
         if await !isFileUnlocked(path: imagePath, timeout: 5.0) {
-            // Create a temporary copy and operate on it to avoid locks
-            try await createTempCopyAndUse(imagePath: imagePath)
+            try await switchToTemporaryCopy(imagePath: imagePath, reason: "This image is held open by another program, so a read-only copy was opened instead. Close the other program and reopen the image to make changes.")
         }
         hfsUtilsPrepared = true
     }
 
-    private func createTempCopyAndUse(imagePath: String) async throws {
+    /// Points every later hfsutils call at a private copy of the image, used when the original
+    /// can't be opened exclusively. Edits to that copy are deleted on eject, so the session is
+    /// made read-only: reporting "Added …" for changes that silently vanish is data loss.
+    func switchToTemporaryCopy(imagePath: String, reason: String) async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hfsapp-temp-\(UUID().uuidString).img")
-        do {
-            try await Task.detached(priority: .userInitiated) {
-                try FileManager.default.copyItem(atPath: imagePath, toPath: tmp.path)
-            }.value
-            tempImageCopyURL = tmp
-            statusMessage = "Using temporary copy for image operations"
-            print("Created temp copy at \(tmp.path) due to lock on original image")
-        } catch {
-            print("Failed to create temp copy: \(error)")
-            throw error
-        }
+        try await Task.detached(priority: .userInitiated) {
+            try FileManager.default.copyItem(atPath: imagePath, toPath: tmp.path)
+        }.value
+        cleanupTempCopyIfAny()
+        tempImageCopyURL = tmp
+        isReadOnly = true
+        readOnlyReason = reason
+        warningMessage = reason
+        statusMessage = "Opened a read-only copy of the image"
     }
 
     private func imagePathToUse(original: String) -> String {
@@ -826,25 +880,32 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
     }
 
     private nonisolated func isFileUnlocked(path: String, timeout: TimeInterval) async -> Bool {
-        // Poll lsof to check whether any process holds the file open
         let interval: TimeInterval = 0.2
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            let (out, err, code) = await runProcess("/usr/sbin/lsof", [path])
-            if code != 0 {
-                // If lsof returns non-zero and no output, assume no process holds it
-                if out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && err.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return true
-                }
-            } else {
-                // code == 0; if output empty, unlocked
-                if out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return true
-                }
+            if await Self.processesHoldingOpen(path).isEmpty {
+                return true
             }
             try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
         }
         return false
+    }
+
+    /// PIDs of *other* processes that have `path` open, per `lsof -t` (bare PIDs on stdout).
+    ///
+    /// Only stdout is meaningful. lsof exits 1 whenever nothing has the file open, and also
+    /// prints warnings to stderr about unrelated filesystems — e.g. an unreachable Time Capsule
+    /// SMB mount. Treating "exit 1 plus any stderr" as *locked* made every hfsutils session on
+    /// such a Mac quietly switch to a temporary copy, and edits were then discarded on eject.
+    nonisolated static func processesHoldingOpen(_ path: String) async -> [Int32] {
+        let (out, _, _) = await runProcess("/usr/sbin/lsof", ["-t", "--", path])
+        return parseLsofPIDs(out, excluding: ProcessInfo.processInfo.processIdentifier)
+    }
+
+    nonisolated static func parseLsofPIDs(_ output: String, excluding ownPID: Int32) -> [Int32] {
+        output.split(whereSeparator: \.isNewline)
+            .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+            .filter { $0 != ownPID }
     }
 
     /// Checked once, up front, when opening an image — separate from (and much cheaper than)
@@ -856,8 +917,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
         if !FileManager.default.isWritableFile(atPath: imagePath) {
             return "This image's file permissions don't allow writing, so it was opened read-only."
         }
-        let (out, _, code) = await runProcess("/usr/sbin/lsof", [imagePath])
-        if code == 0, !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if await !Self.processesHoldingOpen(imagePath).isEmpty {
             return "This image is currently open in another program (e.g. an emulator like Mini vMac), so it was opened read-only to avoid conflicting changes."
         }
         return nil
@@ -865,46 +925,51 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
 
     func detachImageIfMounted() async {
         if let device = mountedDevice {
-            do {
-                try await runHdiutilDetach(device: device)
-            } catch {
-                // If detach fails, ignore here because a new mount may still work.
-            }
-            // Bumped here, immediately before clearing state and with no `await` in between,
-            // rather than at the top of this function: bumping earlier would leave a window
-            // (while the `await` above was in flight) where some other in-flight listing could
-            // capture the *already-bumped* sessionID as its own baseline, pass the staleness
-            // check, and then write its result right after — undoing the clear below.
-            sessionID = UUID()
-            mountedDevice = nil
-            mountPoint = nil
-            currentDirectory = nil
-            entries = []
-            selectedEntry = nil
-            hfsUtilsPrepared = false
-            isReadOnly = false
-            readOnlyReason = nil
-            cleanupTempCopyIfAny()
-            statusMessage = "Image detached"
+            // If detach fails, carry on: a new image may still attach fine.
+            try? await runHdiutilDetach(device: device)
+            resetSession(status: "Image detached")
             return
         }
-
         if imageURL != nil {
             // Previous image was hfsutils-backed (no real device to detach); make sure its
-            // lock is released and its temp copy cleaned up before attaching a new image.
+            // lock is released before attaching a new image. Serialized like every other
+            // hfsutils call so it can't land in the middle of an in-flight hmount…humount.
             if let humount = humountPath {
-                _ = await runCommand([humount])
+                _ = try? await serializedHFSUtilsOperation { [self] in
+                    await runCommand([humount])
+                }
             }
-            sessionID = UUID()
-            cleanupTempCopyIfAny()
-            imageURL = nil
-            entries = []
-            selectedEntry = nil
-            currentHFSPath = ":"
-            hfsUtilsPrepared = false
-            isReadOnly = false
-            readOnlyReason = nil
+            resetSession(status: "Image detached")
         }
+    }
+
+    /// Returns the manager to the no-image state. Called with no `await` between it and the
+    /// detach it follows, so `sessionID` is bumped alongside the clear: bumping earlier would
+    /// let an in-flight listing capture the new ID as its baseline and resurrect stale entries.
+    ///
+    /// Everything that refers to the old image goes: `imageURL` (left set, a natively mounted
+    /// image turned into a phantom hfsutils session after Eject), its temporary copy (an
+    /// expanded dynamic VHD can be gigabytes), and the internal clipboard, whose HFS paths
+    /// would otherwise be resolved against whichever image is opened next.
+    private func resetSession(status: String) {
+        sessionID = UUID()
+        mountedDevice = nil
+        mountPoint = nil
+        currentDirectory = nil
+        imageURL = nil
+        entries = []
+        selectedEntry = nil
+        currentHFSPath = ":"
+        hfsUtilsPrepared = false
+        isReadOnly = false
+        readOnlyReason = nil
+        cleanupTempCopyIfAny()
+        clipboardExportTask?.cancel()
+        clipboardExportTask = nil
+        internalClipboardURLs = []
+        internalClipboardOperation = .copy
+        internalClipboardToken = nil
+        statusMessage = status
     }
 
     static var supportedImageTypes: [UTType] {
@@ -916,53 +981,25 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
             if let device = mountedDevice {
                 do {
                     try await runHdiutilDetach(device: device)
-                    // See the comment in `detachImageIfMounted` on why this is bumped here,
-                    // right alongside the clear, rather than before the `await` above.
-                    sessionID = UUID()
-                    mountPoint = nil
-                    mountedDevice = nil
-                    currentDirectory = nil
-                    entries = []
-                    selectedEntry = nil
-                    hfsUtilsPrepared = false
-                    isReadOnly = false
-                    readOnlyReason = nil
-                    statusMessage = "Image ejected"
-                    errorMessage = nil
                 } catch {
                     self.errorMessage = error.localizedDescription
                     statusMessage = "Failed to eject image"
+                    return
                 }
-                return
-            }
-
-            if usingHFSUtils {
+            } else if usingHFSUtils, let humount = humountPath {
                 // Best-effort: explicitly release the hfsutils-level lock rather than relying
                 // on it being implicitly dropped when the last hmount/hcopy/hdel process
-                // exited, in case anything is still outstanding. Routed through the same
-                // `serializedHFSUtilsOperation` queue as every other hmount/hcopy/hdel/humount
-                // call site — this humount used to fire directly, so clicking Eject (never
-                // disabled while a transfer is running) while an import/export/delete/move was
-                // mid hmount...hcopy...humount could interleave an out-of-order humount into
-                // that in-flight sequence, exactly the cross-process race
-                // `serializedHFSUtilsOperation`'s own documentation warns about.
-                if let humount = humountPath {
-                    _ = try? await serializedHFSUtilsOperation { [self] in
-                        await runCommand([humount])
-                    }
+                // exited. Routed through `serializedHFSUtilsOperation` because Eject is never
+                // disabled during a transfer: a direct humount could interleave into an
+                // in-flight import's hmount...hcopy...humount sequence.
+                _ = try? await serializedHFSUtilsOperation { [self] in
+                    await runCommand([humount])
                 }
-                sessionID = UUID()
-                cleanupTempCopyIfAny()
-                imageURL = nil
-                entries = []
-                selectedEntry = nil
-                currentHFSPath = ":"
-                hfsUtilsPrepared = false
-                isReadOnly = false
-                readOnlyReason = nil
-                statusMessage = "Image ejected"
-                errorMessage = nil
+            } else if imageURL == nil {
+                return
             }
+            resetSession(status: "Image ejected")
+            errorMessage = nil
         }
     }
 
@@ -1098,16 +1135,23 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
             } else if usingHFSUtils {
                 // go up in HFS path
                 if let path = currentHFSPath, path != ":" {
+                    let parentPath: String
                     if let idx = path.range(of: ":", options: .backwards)?.lowerBound {
                         let trimmed = String(path[..<idx])
-                        currentHFSPath = trimmed.isEmpty ? ":" : trimmed
+                        parentPath = trimmed.isEmpty ? ":" : trimmed
                     } else {
-                        currentHFSPath = ":"
+                        parentPath = ":"
                     }
+                    currentHFSPath = parentPath
                     do {
                         try await loadDirectory(at: URL(fileURLWithPath: "/"))
                         selectedEntry = nil
                     } catch {
+                        // As in `navigate(into:)`: don't strand later actions at a path that
+                        // never listed.
+                        if currentHFSPath == parentPath {
+                            currentHFSPath = path
+                        }
                         self.errorMessage = DiskImageError.loadDirectoryFailed(URL(fileURLWithPath: "/"), error).localizedDescription
                     }
                 }
@@ -1228,7 +1272,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
         guard usingHFSUtils, let image = imageURL else { return }
         internalClipboardURLs = selected.compactMap { entry in
             let hfsPath = pathForEntry(entry)
-            return URL(string: "hfs://localhost\(image.path)?path=\(hfsPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? hfsPath)")
+            return Self.makeHFSPseudoURL(imagePath: image.path, hfsPath: hfsPath)
         }
         internalClipboardOperation = .copy
         prepareHFSClipboard(entries: selected)
@@ -1257,7 +1301,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
         guard usingHFSUtils, let image = imageURL else { return }
         internalClipboardURLs = selected.compactMap { entry in
             let hfsPath = pathForEntry(entry)
-            return URL(string: "hfs://localhost\(image.path)?path=\(hfsPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? hfsPath)")
+            return Self.makeHFSPseudoURL(imagePath: image.path, hfsPath: hfsPath)
         }
         internalClipboardOperation = .cut
         prepareHFSClipboard(entries: selected)
@@ -1280,7 +1324,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
         guard usingHFSUtils else { return }
         let hfsPath = pathForEntry(entry)
         if let image = imageURL {
-            let pseudo = URL(string: "hfs://localhost\(image.path)?path=\(hfsPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? hfsPath)")
+            let pseudo = Self.makeHFSPseudoURL(imagePath: image.path, hfsPath: hfsPath)
             internalClipboardURLs = pseudo.map { [$0] } ?? []
             internalClipboardOperation = .copy
             prepareHFSClipboard(entries: [entry])
@@ -1294,7 +1338,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
     private func publishClipboard(urls: [URL], token: String = UUID().uuidString) {
         clipboardExportTask?.cancel()
         internalClipboardToken = token
-        let pasteboard = NSPasteboard.general
+        let pasteboard = self.pasteboard
         pasteboard.clearContents()
         let items: [NSPasteboardItem] = urls.enumerated().map { index, url in
             let item = NSPasteboardItem()
@@ -1317,7 +1361,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
 
         // Claim the pasteboard immediately, so an in-app Paste made while extraction is still
         // running uses the internal HFS paths rather than whatever Finder previously copied.
-        let pasteboard = NSPasteboard.general
+        let pasteboard = self.pasteboard
         pasteboard.clearContents()
         let marker = NSPasteboardItem()
         marker.setString(token, forType: Self.internalClipboardType)
@@ -1346,7 +1390,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
             }
             guard !Task.isCancelled,
                   self.internalClipboardToken == token,
-                  NSPasteboard.general.string(forType: Self.internalClipboardType) == token else { return }
+                  self.pasteboard.string(forType: Self.internalClipboardType) == token else { return }
             // Keep the same token while replacing the marker-only clipboard with real file
             // URLs Finder can paste. The temporary files remain alive for the app session.
             self.clipboardExportTask = nil
@@ -1356,8 +1400,12 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
     }
 
     func paste() {
+        Task { await performPaste() }
+    }
+
+    /// Paste, awaitable (the menu command fires it off in a Task).
+    func performPaste() async {
         guard let target = currentDirectory ?? mountPoint ?? (usingHFSUtils ? URL(fileURLWithPath: "/") : nil) else { return }
-        let pasteboard = NSPasteboard.general
         let ownsPasteboard = internalClipboardToken != nil
             && pasteboard.string(forType: Self.internalClipboardType) == internalClipboardToken
 
@@ -1366,19 +1414,18 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
             internalClipboardURLs = []
             internalClipboardOperation = .copy
             internalClipboardToken = nil
-            Task { await moveFiles(urls: sources, destination: target) }
+            await moveFiles(urls: sources, destination: target)
             return
         }
 
         if ownsPasteboard, !internalClipboardURLs.isEmpty {
-            Task { await importFiles(urls: internalClipboardURLs, destination: target) }
+            await importFiles(urls: internalClipboardURLs, destination: target)
             return
         }
 
         let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL], !urls.isEmpty {
-            Task { await importFiles(urls: urls, destination: target) }
-            return
+            await importFiles(urls: urls, destination: target)
         }
     }
 
@@ -1403,9 +1450,9 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
             defer { statusMessage = "Diagnostics complete" }
             var combined = "Diagnostics for \(imageURL.path)\n\n"
             let cmds: [[String]] = [
-                ["/usr/bin/hdiutil", "attach", "-plist", imageURL.path],
-                ["/usr/bin/hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path],
-                ["/usr/bin/hdiutil", "attach", "-nomount", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path],
+                ["/usr/bin/hdiutil", "attach", "-readonly", "-nobrowse", "-noautoopen", "-plist", imageURL.path],
+                ["/usr/bin/hdiutil", "attach", "-readonly", "-nobrowse", "-noautoopen", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path],
+                ["/usr/bin/hdiutil", "attach", "-readonly", "-nomount", "-imagekey", "diskimage-class=CRawDiskImage", "-plist", imageURL.path],
                 ["/usr/bin/hdiutil", "imageinfo", imageURL.path]
             ]
 
@@ -1487,48 +1534,66 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
     }
 
     func exportSelected() async {
-        await withBusy {
-            // if using hfsutils, ensure no hdiutil attached device blocks the file
-            if usingHFSUtils, let image = imageURL {
-                try? await prepareForHFSUtils(imagePath: image.path)
-            }
-            let entries = selectedEntries
-            guard !entries.isEmpty else { return }
+        let entries = selectedEntries
+        guard !entries.isEmpty else { return }
 
-            if entries.count == 1, let entry = entries.first {
-                // Single file: preserve the existing "Save As" flow, which lets the user
-                // rename the file on the way out, not just pick a folder.
-                let panel = NSSavePanel()
-                panel.nameFieldStringValue = Self.hostName(fromClassicHFSName: entry.name)
-                panel.canCreateDirectories = true
-                panel.title = "Export File from Volume"
-                panel.message = "Choose a destination to export the selected item."
-                guard panel.runModal() == .OK, let destination = panel.url else { return }
-
-                let progressID = beginTransfer(title: "Exporting Items", message: "Exporting \(entry.name)…")
-                defer { endTransfer(progressID) }
-                switch await exportOneFile(entry, to: destination, progressID: progressID) {
-                case .success:
-                    statusMessage = "Exported \(entry.name)"
-                case .failure(is CancellationError):
-                    statusMessage = "Export cancelled"
-                case .failure(let error):
-                    self.errorMessage = error.localizedDescription
-                }
-                return
-            }
-
-            // Multiple files: ask for a destination folder and copy each one in, keeping its
-            // original name.
-            let panel = NSOpenPanel()
-            panel.canChooseDirectories = true
-            panel.canChooseFiles = false
+        if entries.count == 1, let entry = entries.first {
+            // Single file: a Save As flow, which lets the user rename the file on the way out,
+            // not just pick a folder.
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = Self.hostName(fromClassicHFSName: entry.name)
             panel.canCreateDirectories = true
-            panel.allowsMultipleSelection = false
-            panel.title = "Export \(entries.count) Items"
-            panel.message = "Choose a destination folder to export the selected items into."
-            guard panel.runModal() == .OK, let destinationFolder = panel.url else { return }
+            panel.title = "Export File from Volume"
+            panel.message = "Choose a destination to export the selected item."
+            guard panel.runModal() == .OK, let destination = panel.url else { return }
+            await export(entry, to: destination)
+            return
+        }
 
+        // Multiple files: ask for a destination folder and copy each one in, keeping its
+        // original name.
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.title = "Export \(entries.count) Items"
+        panel.message = "Choose a destination folder to export the selected items into."
+        guard panel.runModal() == .OK, let destinationFolder = panel.url else { return }
+        await export(entries, intoFolder: destinationFolder)
+    }
+
+    /// Exports one entry to exactly `destination`, replacing whatever is there: the Save panel
+    /// has already asked the user to confirm "Replace". (Refusing an existing destination here
+    /// made Replace always fail with "Destination already exists".)
+    func export(_ entry: FileEntry, to destination: URL) async {
+        await withBusy {
+            await prepareHFSUtilsIfNeeded()
+            let progressID = beginTransfer(title: "Exporting Items", message: "Exporting \(entry.name)…")
+            defer { endTransfer(progressID) }
+            if fileManager.fileExists(atPath: destination.path) {
+                do {
+                    try fileManager.removeItem(at: destination)
+                } catch {
+                    errorMessage = DiskImageError.exportFailed(entry.url, error).localizedDescription
+                    return
+                }
+            }
+            switch await exportOneFile(entry, to: destination, progressID: progressID) {
+            case .success:
+                statusMessage = "Exported \(entry.name)"
+            case .failure(is CancellationError):
+                statusMessage = "Export cancelled"
+            case .failure(let error):
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    /// Exports each entry into `destinationFolder` under its own (host-safe) name.
+    func export(_ entries: some Collection<FileEntry>, intoFolder destinationFolder: URL) async {
+        await withBusy {
+            await prepareHFSUtilsIfNeeded()
             let progressID = beginTransfer(title: "Exporting Items", message: "Preparing export…")
             defer { endTransfer(progressID) }
             var exportedCount = 0
@@ -1549,8 +1614,15 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
             }
             statusMessage = "Exported \(exportedCount) of \(entries.count) items"
             if let lastError, exportedCount < entries.count {
-                self.errorMessage = lastError.localizedDescription
+                errorMessage = lastError.localizedDescription
             }
+        }
+    }
+
+    /// If using hfsutils, ensure no hdiutil-attached device blocks the image file.
+    private func prepareHFSUtilsIfNeeded() async {
+        if usingHFSUtils, let image = imageURL {
+            try? await prepareForHFSUtils(imagePath: image.path)
         }
     }
 
@@ -1580,7 +1652,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
 
     /// Copies an hfsutils-backed entry out to a real file at `destination`, using its actual
     /// HFS name/extension. Shared by the Export button and drag-out-to-Finder.
-    private func exportHFSEntry(_ entry: FileEntry, to destination: URL) async throws {
+    private func exportHFSEntry(_ entry: FileEntry, to destination: URL, macBinary: Bool = false) async throws {
         guard let hcopy = hcopyPath, let hmount = hmountPath, let image = imageURL else {
             throw NSError(domain: "hfsutils", code: 0, userInfo: [NSLocalizedDescriptionKey: "hfsutils backend unavailable"])
         }
@@ -1598,7 +1670,8 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
                 throw NSError(domain: "hfsutils", code: Int(mountCode), userInfo: [NSLocalizedDescriptionKey: "hmount failed: \(mountErr.isEmpty ? mountOut : mountErr)"])
             }
             let literalPath = Self.escapedHFSGlobPath(hfsPath)
-            let (out, err, code) = await runHFSCommand([hcopy, literalPath, destination.path], hfsArgumentIndices: [1])
+            let modeArguments = macBinary ? ["-m"] : []
+            let (out, err, code) = await runHFSCommand([hcopy] + modeArguments + [literalPath, destination.path], hfsArgumentIndices: [1 + modeArguments.count])
             _ = await runCommand([humount])
             guard code == 0, fileManager.fileExists(atPath: destination.path) else {
                 throw NSError(domain: "hfsutils", code: Int(code), userInfo: [NSLocalizedDescriptionKey: "hcopy failed: \(err.isEmpty ? out : err)"])
@@ -1614,7 +1687,8 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
     private func exportHFSEntryRecursive(
         _ entry: FileEntry,
         to destination: URL,
-        progressID: UUID? = nil
+        progressID: UUID? = nil,
+        macBinary: Bool = false
     ) async throws {
         try checkCancellation(progressID)
         if let progressID {
@@ -1631,12 +1705,13 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
                 try await exportHFSEntryRecursive(
                     child,
                     to: destination.appendingPathComponent(Self.hostName(fromClassicHFSName: child.name)),
-                    progressID: progressID
+                    progressID: progressID,
+                    macBinary: macBinary
                 )
             }
             return
         }
-        try await exportHFSEntry(entry, to: destination)
+        try await exportHFSEntry(entry, to: destination, macBinary: macBinary)
     }
 
     /// Moves a single entry from `sourceHFSPath` to `destHFSPath` within the same image, using
@@ -1722,14 +1797,14 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
     /// `exportHFSEntryRecursive` so a folder is copied out (with all its contents) just like an
     /// Export would. Shared by `openEntry`, `QuickLookController`, and the drag-out item
     /// provider in `makeDragItemProvider`.
-    func materializeForPreview(_ entry: FileEntry, progressID: UUID? = nil) async -> URL? {
+    func materializeForPreview(_ entry: FileEntry, progressID: UUID? = nil, macBinary: Bool = false) async -> URL? {
         if isMounted {
             return entry.url
         }
         guard usingHFSUtils,
               let destination = makeTempExtractionDestination(for: entry, prefix: "hfsapp-preview") else { return nil }
         do {
-            try await exportHFSEntryRecursive(entry, to: destination, progressID: progressID)
+            try await exportHFSEntryRecursive(entry, to: destination, progressID: progressID, macBinary: macBinary)
             return destination
         } catch is CancellationError {
             try? fileManager.removeItem(at: destination)
@@ -1784,6 +1859,9 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
                     }
                     updateTransfer(progressID, message: "Adding \(source.lastPathComponent)…")
                     do {
+                        if Self.isSameOrDescendant(destination, of: source) {
+                            throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError, userInfo: [NSLocalizedDescriptionKey: "A folder can't be copied into itself."])
+                        }
                         renamedItemCount += try await importHostItemCancelable(source, parent: destination, progressID: progressID)
                     } catch is CancellationError {
                         wasCancelled = true
@@ -1838,7 +1916,11 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
                 updateTransfer(progressID, message: "Adding \(source.lastPathComponent)…")
                 var hostSource = source
                 var tempDirToCleanUp: URL?
+                var macBinary = false
                 do {
+                    if source.scheme == "hfs", hfsPathInCurrentImage(source) == nil {
+                        throw NSError(domain: "hfsutils", code: 0, userInfo: [NSLocalizedDescriptionKey: "This item came from an image that is no longer open."])
+                    }
                     // `hcopy` only transfers HFS<->UNIX, not HFS-to-HFS directly (verified:
                     // passing two colon-style paths fails with "error opening source file"). So
                     // a source that's itself one of our synthetic hfs://...?path=... pseudo-URLs
@@ -1847,10 +1929,14 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
                     // first — otherwise `source.path` here would resolve to the pseudo-URL's
                     // embedded *image* path, not the entry's real HFS path, and this would try
                     // to hcopy the entire disk image file into itself.
-                    if let sourceHFSPath = Self.hfsPath(fromPseudoURL: source) {
+                    //
+                    // Both legs use MacBinary: hcopy's automatic mode writes a bare data fork,
+                    // so the copy lost its resource fork and came back typed `????/UNIX`.
+                    if let sourceHFSPath = hfsPathInCurrentImage(source) {
                         let isDirectory = await hfsIsDirectory(path: sourceHFSPath, imagePath: image.path)
                         let sourceEntry = FileEntry(url: source, isDirectory: isDirectory, size: nil, hfsPath: sourceHFSPath)
-                        guard let materialized = await materializeForPreview(sourceEntry, progressID: progressID) else {
+                        macBinary = true
+                        guard let materialized = await materializeForPreview(sourceEntry, progressID: progressID, macBinary: true) else {
                             throw NSError(domain: "hfsutils", code: 0, userInfo: [NSLocalizedDescriptionKey: "Could not read \(sourceEntry.name) from the image"])
                         }
                         hostSource = materialized
@@ -1861,7 +1947,8 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
                         hostSource,
                         hfsDestParent: destPath,
                         imagePath: image.path,
-                        progressID: progressID
+                        progressID: progressID,
+                        macBinary: macBinary
                     )
                     if let tempDirToCleanUp {
                         try? fileManager.removeItem(at: tempDirToCleanUp)
@@ -1959,6 +2046,11 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
                     guard (try? checkCancellation(progressID)) != nil else { break }
                     updateTransfer(progressID, message: "Moving \(source.lastPathComponent)…")
                     let targetURL = destination.appendingPathComponent(source.lastPathComponent)
+                    // Cut and Paste in the same folder: nothing to do (Finder treats it the same way).
+                    if targetURL.standardizedFileURL == source.standardizedFileURL {
+                        movedCount += 1
+                        continue
+                    }
                     do {
                         try await Task.detached(priority: .userInitiated) {
                             if FileManager.default.fileExists(atPath: targetURL.path) {
@@ -1978,14 +2070,17 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
                 let destPath = currentHFSPath ?? ":"
                 for source in urls {
                     guard (try? checkCancellation(progressID)) != nil else { break }
-                    guard let sourceHFSPath = Self.hfsPath(fromPseudoURL: source) else {
+                    guard let sourceHFSPath = hfsPathInCurrentImage(source) else {
                         lastError = NSError(domain: "hfsutils", code: 0, userInfo: [NSLocalizedDescriptionKey: "Can only move items that are already inside this image"])
                         continue
                     }
                     let name = FileEntry(url: source, isDirectory: false, size: nil, hfsPath: sourceHFSPath).name
                     updateTransfer(progressID, message: "Moving \(name)…")
                     let hfsDest = destPath.hasSuffix(":") ? "\(destPath)\(name)" : "\(destPath):\(name)"
-                    guard hfsDest != sourceHFSPath else { continue }
+                    guard hfsDest != sourceHFSPath else {
+                        movedCount += 1
+                        continue
+                    }
                     do {
                         try await moveHFSEntryWithinVolume(from: sourceHFSPath, to: hfsDest, imagePath: image.path)
                         movedCount += 1
@@ -2107,16 +2202,40 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
         (try? checkCancellation(id)) == nil
     }
 
-    /// Extracts the colon-separated HFS path from one of our synthetic
-    /// hfs://localhost/<image-path>?path=<hfs-path> pseudo-URLs (see `copyEntry`), or nil if
-    /// `url` isn't one of ours.
-    private nonisolated static func hfsPath(fromPseudoURL url: URL) -> String? {
+    /// Only unreserved characters pass through unescaped. `.urlQueryAllowed` (used before)
+    /// leaves `&`, `=` and `+` alone, so ":Tom & Jerry" parsed back as ":Tom"; and building the
+    /// URL by string concatenation made `URL(string:)` return nil on macOS 13 for any image path
+    /// containing a space.
+    private nonisolated static let pseudoURLComponentAllowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~/")
+
+    /// Builds the synthetic hfs://localhost/<image-path>?path=<hfs-path> URL that identifies an
+    /// hfsutils-backed entry (and travels on the internal clipboard).
+    nonisolated static func makeHFSPseudoURL(imagePath: String, hfsPath: String) -> URL? {
+        var components = URLComponents()
+        components.scheme = "hfs"
+        components.host = "localhost"
+        components.percentEncodedPath = imagePath.addingPercentEncoding(withAllowedCharacters: pseudoURLComponentAllowed) ?? ""
+        components.percentEncodedQuery = "path=" + (hfsPath.addingPercentEncoding(withAllowedCharacters: pseudoURLComponentAllowed) ?? "")
+        return components.url
+    }
+
+    /// Inverse of `makeHFSPseudoURL`, or nil if `url` isn't one of ours.
+    nonisolated static func parseHFSPseudoURL(_ url: URL) -> (imagePath: String, hfsPath: String)? {
         guard url.scheme == "hfs",
-              let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let path = comps.queryItems?.first(where: { $0.name == "path" })?.value else {
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let query = components.percentEncodedQuery, query.hasPrefix("path="),
+              let hfsPath = String(query.dropFirst("path=".count)).removingPercentEncoding else {
             return nil
         }
-        return path
+        return (components.path, hfsPath)
+    }
+
+    /// The HFS path of a pseudo-URL, but only if it belongs to the image open right now. The
+    /// internal clipboard can outlive the image it was filled from; resolving its HFS paths
+    /// against a *different* image would copy or move whatever happens to share that name.
+    private func hfsPathInCurrentImage(_ url: URL) -> String? {
+        guard let parsed = Self.parseHFSPseudoURL(url), parsed.imagePath == imageURL?.path else { return nil }
+        return parsed.hfsPath
     }
 
     // MARK: - hfsutils integration helpers
@@ -2247,8 +2366,24 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
     /// Classic HFS permits `/` inside a catalog name, while host URLs interpret it as a path
     /// separator. macOS traditionally presents that classic character as `:` on modern
     /// filesystems, where it is a valid single filename component.
+    ///
+    /// Classic Mac OS also allows names like `..` and `.`, which are ordinary items there but
+    /// path traversal here: exporting a folder named `..` wrote its contents into the *parent*
+    /// of the folder the user chose. Those, and the empty name, get a visible substitute.
     nonisolated static func hostName(fromClassicHFSName hfsName: String) -> String {
-        hfsName.replacingOccurrences(of: "/", with: ":")
+        let name = hfsName.replacingOccurrences(of: "/", with: ":")
+        switch name {
+        case "": return "Untitled"
+        case ".", "..": return name.replacingOccurrences(of: ".", with: "\u{2024}") // ONE DOT LEADER
+        default: return name
+        }
+    }
+
+    /// True when `candidate` is `folder` itself or somewhere inside it.
+    nonisolated static func isSameOrDescendant(_ candidate: URL, of folder: URL) -> Bool {
+        let folderComponents = folder.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        let candidateComponents = candidate.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        return candidateComponents.starts(with: folderComponents)
     }
 
     /// hfsutils expands shell-style metacharacters itself, even though Process passes each path
@@ -2271,7 +2406,8 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
         _ source: URL,
         hfsDestParent: String,
         imagePath: String,
-        progressID: UUID? = nil
+        progressID: UUID? = nil,
+        macBinary: Bool = false
     ) async throws -> Int {
         try checkCancellation(progressID)
         if let progressID {
@@ -2290,11 +2426,12 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
                     child,
                     hfsDestParent: hfsDest,
                     imagePath: imagePath,
-                    progressID: progressID
+                    progressID: progressID,
+                    macBinary: macBinary
                 )
             }
         } else {
-            try await importHFSFile(from: source.path, to: hfsDest, imagePath: imagePath)
+            try await importHFSFile(from: source.path, to: hfsDest, imagePath: imagePath, macBinary: macBinary)
         }
         return renamedCount
     }
@@ -2318,7 +2455,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func importHFSFile(from hostPath: String, to hfsDest: String, imagePath: String) async throws {
+    private func importHFSFile(from hostPath: String, to hfsDest: String, imagePath: String, macBinary: Bool = false) async throws {
         guard let hcopy = hcopyPath, let hmount = hmountPath else {
             throw NSError(domain: "hfsutils", code: 0, userInfo: [NSLocalizedDescriptionKey: "hfsutils backend unavailable"])
         }
@@ -2329,7 +2466,8 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
             guard mountCode == 0 else {
                 throw NSError(domain: "hfsutils", code: Int(mountCode), userInfo: [NSLocalizedDescriptionKey: "hmount failed: \(mountErr.isEmpty ? mountOut : mountErr)"])
             }
-            let (out, err, code) = await runHFSCommand([hcopy, hostPath, hfsDest], hfsArgumentIndices: [2])
+            let modeArguments = macBinary ? ["-m"] : []
+            let (out, err, code) = await runHFSCommand([hcopy] + modeArguments + [hostPath, hfsDest], hfsArgumentIndices: [2 + modeArguments.count])
             _ = await runCommand([humount])
             guard code == 0 else {
                 throw NSError(domain: "hfsutils", code: Int(code), userInfo: [NSLocalizedDescriptionKey: "hcopy failed: \(err.isEmpty ? out : err)"])
@@ -2368,7 +2506,6 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
             // Verbatim output makes that carriage return look like a line ending, truncating
             // the name and aborting recursive folder exports.
             let (out, err, code) = await runHFSCommand([hls, "-a1Q", Self.escapedHFSGlobPath(query)], hfsArgumentIndices: [2])
-            print("DEBUG hfsList: usePath=\(usePath) query=\(query) mountOut=\(mountOut) hlsOut=\(out) hlsErr=\(err) hlsCode=\(code)")
             guard code == 0 else {
                 _ = await runCommand([humount])
                 throw NSError(domain: "hfsutils", code: Int(code), userInfo: [NSLocalizedDescriptionKey: "hls failed: \(err.isEmpty ? out : err)"])
@@ -2380,9 +2517,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
             // "token" here (as this used to) silently truncates every multi-word name (e.g.
             // "Lorem Ipsum.doc" -> "Ipsum.doc"), which is why exports of such files failed with
             // "no such file or directory": hcopy was asked for a name that doesn't actually exist.
-            let lines = out.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-            for line in lines {
-                guard let name = Self.decodeHLSQuotedName(line), !name.isEmpty else { continue }
+            for name in Self.parseHLSQuotedListing(out) where !name.isEmpty {
 
                 let hfsFullPath: String
                 if query == ":" {
@@ -2419,7 +2554,7 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
                     try? FileManager.default.removeItem(at: temporary)
                 }
 
-                let pseudo = URL(string: "hfs://localhost\(imagePath)?path=\(hfsFullPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? hfsFullPath)")!
+                let pseudo = Self.makeHFSPseudoURL(imagePath: imagePath, hfsPath: hfsFullPath) ?? URL(fileURLWithPath: imagePath)
                 let entry = FileEntry(
                     url: pseudo,
                     isDirectory: isDir,
@@ -2444,6 +2579,27 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
             }
             return results
         }
+    }
+
+    /// Splits `hls -1Q` output into names. hls wraps a long *escaped* name (e.g. 30 Mac Roman
+    /// high-bit bytes become 120 characters) onto several physical lines, each fragment ending
+    /// in a `\` continuation marker — even in `-1` mode, whatever `-w` says. A complete record
+    /// always ends in its closing `"`, so a trailing `\` reliably marks a continuation.
+    nonisolated static func parseHLSQuotedListing(_ output: String) -> [String] {
+        var names: [String] = []
+        var pending = ""
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasSuffix("\\") {
+                pending += line.dropLast()
+                continue
+            }
+            let record = pending + line
+            pending = ""
+            if let name = decodeHLSQuotedName(record) {
+                names.append(name)
+            }
+        }
+        return names
     }
 
     nonisolated static func decodeHLSQuotedName(_ line: String) -> String? {
@@ -2496,7 +2652,9 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
         isInvisible: Bool,
         isLocked: Bool
     )? {
-        // hfsutils formats files as `%c%c %4s/%4s data-size resource-size ...`.
+        // hfsutils formats files as `%c%c %4s/%4s resource-size data-size ...` — resource fork
+        // first (a 9-byte data-only file lists as `0  9`; this used to be read the other way
+        // round, so the inspector showed the two forks swapped).
         // Fixed-width type/creator codes may themselves contain spaces, so preserve them
         // verbatim instead of splitting the whole line on whitespace.
         let pattern = #"^([fF])([i ])\s(.{4})/(.{4})\s+(\d+)\s+(\d+)\s"#
@@ -2506,8 +2664,8 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
               let invisibleRange = Range(match.range(at: 2), in: listing),
               let typeRange = Range(match.range(at: 3), in: listing),
               let creatorRange = Range(match.range(at: 4), in: listing),
-              let dataRange = Range(match.range(at: 5), in: listing),
-              let resourceRange = Range(match.range(at: 6), in: listing),
+              let resourceRange = Range(match.range(at: 5), in: listing),
+              let dataRange = Range(match.range(at: 6), in: listing),
               let dataSize = Int(listing[dataRange]),
               let resourceSize = Int(listing[resourceRange]) else { return nil }
         return (
@@ -2561,8 +2719,6 @@ final class DiskImageManager: ObservableObject, @unchecked Sendable {
                         group.leave()
                     }
                 }
-            } else {
-                group.leave()
             }
         }
 

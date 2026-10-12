@@ -71,8 +71,9 @@ final class FloppyFoxTests: XCTestCase {
         ))
         XCTAssertEqual(attributes.type, "TEXT")
         XCTAssertEqual(attributes.creator, "ttxt")
-        XCTAssertEqual(attributes.dataForkSize, 332)
-        XCTAssertEqual(attributes.resourceForkSize, 987)
+        // hls prints the resource fork size first.
+        XCTAssertEqual(attributes.resourceForkSize, 332)
+        XCTAssertEqual(attributes.dataForkSize, 987)
         XCTAssertTrue(attributes.isInvisible)
         XCTAssertTrue(attributes.isLocked)
     }
@@ -201,7 +202,9 @@ final class FloppyFoxTests: XCTestCase {
 
     func testOpenRealMultiPartitionHDAImage() async throws {
         let url = URL(fileURLWithPath: "/Users/amuskens/Downloads/ PreInstalled MacOS Images/HD0-OpenRetroSCSI-7.1.hda")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), "fixture not found at \(url.path)")
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw XCTSkip("Real HDA fixture not present on this machine")
+        }
 
         let manager = DiskImageManager()
         await manager.attachImage(imageURL: url)
