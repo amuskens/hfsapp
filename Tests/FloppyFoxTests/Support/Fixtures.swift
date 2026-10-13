@@ -27,9 +27,9 @@ enum Fixtures {
         return url
     }
 
-    static func makeHFSPlusImage(in directory: URL, name: String = "Plus.dmg", sizeMB: Int = 32, label: String = "FloppyFoxPlus") throws -> URL {
+    static func makeHFSPlusImage(in directory: URL, name: String = "Plus.dmg", sizeMB: Int = 32, label: String = "FloppyFoxPlus", fileSystem: String = "HFS+") throws -> URL {
         let url = directory.appendingPathComponent(name)
-        let result = run("/usr/bin/hdiutil", ["create", "-size", "\(sizeMB)m", "-fs", "HFS+", "-volname", label, url.path])
+        let result = run("/usr/bin/hdiutil", ["create", "-size", "\(sizeMB)m", "-fs", fileSystem, "-volname", label, url.path])
         guard result.status == 0 else { throw XCTSkip("hdiutil create is unavailable here: \(result.output)") }
         return url
     }
@@ -70,8 +70,7 @@ enum Fixtures {
     }
 
     static func names(in hfsPath: String) throws -> Set<String> {
-        let out = try hfs("hls", ["-a1Q", hfsPath])
-        return Set(out.split(separator: "\n").compactMap { DiskImageManager.decodeHLSQuotedName(String($0)) })
+        Set(HLSOutput.names(try hfs("hls", ["-a1Q", hfsPath])))
     }
 
     static func readFile(_ hfsPath: String, scratch: URL) throws -> Data {
@@ -79,6 +78,60 @@ enum Fixtures {
         defer { try? FileManager.default.removeItem(at: host) }
         try hfs("hcopy", ["-r", hfsPath, host.path])
         return try Data(contentsOf: host)
+    }
+
+    /// Runs Apple's `fsck_hfs -n` (check only, never repair) on a bare HFS volume image and
+    /// returns its verdict. Apple's checker validates catalog key order, B-tree structure,
+    /// valences, the allocation bitmap and the MDB totals — an oracle independent of both this
+    /// app and hfsutils. (It also flags reserved catalog fields hfsutils leaves non-zero, so
+    /// only use it on volumes this app alone has written to after `hformat`.)
+    static func fsck(_ image: URL) throws -> (clean: Bool, output: String) {
+        let attach = run("/usr/bin/hdiutil", ["attach", "-nomount", "-readonly", "-noverify", "-imagekey", "diskimage-class=CRawDiskImage", image.path])
+        let lines = attach.output.split(separator: "\n").map(String.init)
+        func device(in line: String) -> String? {
+            line.split(whereSeparator: \.isWhitespace).first(where: { $0.hasPrefix("/dev/disk") }).map(String.init)
+        }
+        guard attach.status == 0, let wholeDisk = lines.lazy.compactMap(device).first else {
+            // A failure, not a skip: a skipped fsck would hide exactly the problems it checks for.
+            throw NSError(domain: "Fixtures", code: 2, userInfo: [NSLocalizedDescriptionKey: "hdiutil could not attach \(image.lastPathComponent) for fsck (is it still open?): \(attach.output)"])
+        }
+        defer { _ = run("/usr/bin/hdiutil", ["detach", wholeDisk]) }
+        // A partitioned image: check its HFS partition rather than the whole disk.
+        let target = lines.first(where: { $0.contains("Apple_HFS") }).flatMap(device) ?? wholeDisk
+        let check = run("/sbin/fsck_hfs", ["-n", "-d", target.replacingOccurrences(of: "/dev/disk", with: "/dev/rdisk")])
+        return (check.status == 0 && check.output.contains("appears to be OK"), check.output)
+    }
+
+    /// Runs `fsck_hfs -fy` (check *and repair*, as Disk Utility's First Aid does).
+    @discardableResult
+    static func fsckRepair(_ image: URL) throws -> String {
+        let attach = run("/usr/bin/hdiutil", ["attach", "-nomount", "-noverify", "-imagekey", "diskimage-class=CRawDiskImage", image.path])
+        let lines = attach.output.split(separator: "\n").map(String.init)
+        func device(in line: String) -> String? {
+            line.split(whereSeparator: \.isWhitespace).first(where: { $0.hasPrefix("/dev/disk") }).map(String.init)
+        }
+        guard attach.status == 0, let wholeDisk = lines.lazy.compactMap(device).first else {
+            throw NSError(domain: "Fixtures", code: 2, userInfo: [NSLocalizedDescriptionKey: "hdiutil could not attach \(image.lastPathComponent): \(attach.output)"])
+        }
+        defer { _ = run("/usr/bin/hdiutil", ["detach", wholeDisk]) }
+        let target = lines.first(where: { $0.contains("Apple_HFS") }).flatMap(device) ?? wholeDisk
+        return run("/sbin/fsck_hfs", ["-fy", target.replacingOccurrences(of: "/dev/disk", with: "/dev/rdisk")]).output
+    }
+
+    /// fsck's complaints other than "blocks are marked in use that nothing references" —
+    /// the expected residue of a save cut off between its bitmap and header writes.
+    static func fsckProblems(_ image: URL) throws -> [String] {
+        let verdict = try fsck(image)
+        if verdict.clean { return [] }
+        let harmless = ["orphaned blocks", "Invalid volume free block count", "Checking", "Executing fsck_hfs", "volume name is",
+                        "Verify Status", "CBTStat", "found corrupt and needs to be repaired", "CheckHFS returned", "NO WRITE",
+                        "Can't open", "cacheBlockSize", "volume type", "MDB is at", "VHB is at", "sector size", "VolumeObject",
+                        "total sectors", "(", "Volume bitmap needs minor repair", "Checking multi-linked", "Trimming",
+                        "Checking non-journaled", "Checking Extended Attributes", "Volume bitmap needs repair for under-allocation"]
+        return verdict.output.split(separator: "\n").map(String.init).filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return !trimmed.isEmpty && !harmless.contains { trimmed.contains($0) }
+        }
     }
 
     static func run(_ executable: String, _ arguments: [String]) -> (status: Int32, output: String) {
@@ -101,7 +154,9 @@ extension DiskImageManager {
     /// A manager wired to a private pasteboard, so tests never clobber the developer's real
     /// clipboard and never see stray contents from it.
     static func forTesting() -> DiskImageManager {
-        let manager = DiskImageManager()
+        // Private scratch space, so tests never sweep (or get swept by) a running app.
+        let storage = TemporaryStorage(root: FileManager.default.temporaryDirectory.appendingPathComponent("FloppyFoxTests-\(UUID().uuidString)"))
+        let manager = DiskImageManager(storage: storage)
         manager.pasteboard = NSPasteboard(name: NSPasteboard.Name("com.floppyfox.tests.\(UUID().uuidString)"))
         return manager
     }
@@ -123,4 +178,94 @@ func withTimeout<T: Sendable>(_ seconds: Double, _ operation: @escaping @Sendabl
         group.cancelAll()
         return result
     }
+}
+
+/// Parsing of hfsutils' `hls -Q` output, used to read results back through the oracle.
+enum HLSOutput {
+    static func decodeQuotedName(_ line: String) -> String? {
+        guard line.first == "\"", line.last == "\"", line.count >= 2 else { return nil }
+        let contents = Array(line.dropFirst().dropLast())
+        var bytes: [UInt8] = []
+        var index = 0
+        while index < contents.count {
+            let character = contents[index]
+            guard character == "\\" else {
+                bytes += Array(String(character).data(using: .macOSRoman) ?? Data(String(character).utf8))
+                index += 1
+                continue
+            }
+            index += 1
+            guard index < contents.count else { return nil }
+            let escaped = contents[index]
+            switch escaped {
+            case "n": bytes.append(0x0A); index += 1
+            case "b": bytes.append(0x08); index += 1
+            case "r": bytes.append(0x0D); index += 1
+            case "t": bytes.append(0x09); index += 1
+            case "f": bytes.append(0x0C); index += 1
+            case "0"..."7":
+                var digits = ""
+                while digits.count < 3, index < contents.count, ("0"..."7").contains(contents[index]) {
+                    digits.append(contents[index])
+                    index += 1
+                }
+                guard let byte = UInt8(digits, radix: 8) else { return nil }
+                bytes.append(byte)
+            default:
+                bytes += Array(String(escaped).utf8)
+                index += 1
+            }
+        }
+        return String(data: Data(bytes), encoding: .macOSRoman)
+    }
+
+    /// hls wraps long escaped names over several lines, each fragment ending in `\`.
+    static func names(_ output: String) -> [String] {
+        var names: [String] = []
+        var pending = ""
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasSuffix("\\") {
+                pending += line.dropLast()
+                continue
+            }
+            let record = pending + line
+            pending = ""
+            if let name = decodeQuotedName(record) { names.append(name) }
+        }
+        return names
+    }
+}
+
+extension DiskVolume {
+    /// The pre-`NewFileMetadata` shape of `createFile`, for brevity in tests.
+    @discardableResult
+    func createFile(named name: String, in parentID: UInt32, type: [UInt8], creator: [UInt8], dataFork: HFSForkSource, resourceFork: HFSForkSource) throws -> UInt32 {
+        try createFile(named: name, in: parentID, metadata: NewFileMetadata(fileType: type, creator: creator), dataFork: dataFork, resourceFork: resourceFork)
+    }
+}
+
+/// `volume.child(named:inFolder:)`, unwrapped (await can't appear inside XCTUnwrap).
+func childItem(_ volume: any DiskVolume, _ name: String, in folder: UInt32, file: StaticString = #filePath, line: UInt = #line) async throws -> VolumeItem {
+    let item = await volume.child(named: name, inFolder: folder)
+    return try XCTUnwrap(item, "no \(name) in folder \(folder)", file: file, line: line)
+}
+
+/// The safety property of an interrupted save: fsck finds nothing worse than orphaned blocks,
+/// or — in the one-write window where the spare header lags the main one — a real repair
+/// (`fsck_hfs -fy`, as Disk First Aid runs) leaves a clean volume in exactly one of `states`.
+func assertCleanOrRepairsToKnownState(_ image: URL, oneOf states: [Set<String>], context: String,
+                                      file: StaticString = #filePath, line: UInt = #line) async throws {
+    let problems = try Fixtures.fsckProblems(image)
+    if problems.isEmpty { return }
+    let repaired = image.deletingLastPathComponent().appendingPathComponent("repaired-" + image.lastPathComponent)
+    try? FileManager.default.removeItem(at: repaired)
+    try FileManager.default.copyItem(at: image, to: repaired)
+    defer { try? FileManager.default.removeItem(at: repaired) }
+    let repairOutput = try Fixtures.fsckRepair(repaired)
+    let verdict = try Fixtures.fsck(repaired)
+    XCTAssertTrue(verdict.clean, "\(context): \(problems); after repair still damaged:\n\(repairOutput)\n\(verdict.output)", file: file, line: line)
+    let volume = try DiskImageLayout.openVolume(repaired, readOnly: true)
+    let names = Set(try await volume.contents(ofFolder: HFSCatalogID.rootFolder).map(\.name))
+    await volume.close()
+    XCTAssertTrue(states.contains(names), "\(context): after repair the volume holds \(names), neither the old nor the new state", file: file, line: line)
 }

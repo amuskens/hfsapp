@@ -4,13 +4,18 @@ A macOS app project for browsing and editing Apple HFS disk images (`.hda`, `.ds
 
 It allows you to:
 
-- open HFS disk image files, including raw `.vhd` images and fixed or dynamic VHD containers
-- mount the image in read/write mode using `hdiutil`
+- open Mac OS Standard (HFS) and Mac OS Extended (HFS+) volumes: floppy images, partitioned
+  hard-disk images (BlueSCSI `.hda`), Mac OS 8.1–9 disks, and fixed or dynamic VHD containers
 - explore folders and files inside the volume
-- delete files and folders inside the image
-- add files by dragging from Finder into the app
-- copy files from the mounted volume using the clipboard or by dragging from Finder into the app
-- export selected files and folders from the volume to the host filesystem
+- copy, move and delete files and folders inside the image
+- add files by dragging from Finder or pasting; MacBinary `.bin` files are unpacked
+- copy files out by dragging, the clipboard, or Export, with resource forks and Finder
+  type/creator preserved
+
+FloppyFox reads and writes HFS and HFS+ with its own engine (`Sources/FloppyFox/HFS/`): no
+`hdiutil` mounts and no external tools, so it runs inside the App Sandbox and can ship on the
+Mac App Store. Saving is crash-safe: new B-trees are written to free space and a single
+volume-header write commits them, so an interrupted save leaves the old or the new volume.
 
 ## Prerequisites
 
@@ -61,21 +66,30 @@ Run the test suite with:
 swift test
 ```
 
-The suite has three tiers:
+The app itself needs nothing installed, but the tests use
+[hfsutils](https://www.mars.org/home/rob/proj/hfs/) (`brew install hfsutils`) as an
+independent oracle: `hformat` builds throwaway volumes, and `hls`/`hcopy` read results back.
+Tests that need it are skipped when it's missing.
 
-- **Unit tests** (`ParsingTests`, parts of `RobustnessTests`) cover hfsutils output parsing,
-  name conversion, hfs:// pseudo-URLs, and fuzzed VHD/resource-fork input. They need nothing
-  installed.
-- **Integration tests** (`HFSUtilsBackendTests`, `MountedBackendTests`) build throwaway disk
-  images: classic HFS with hfsutils' `hformat`, HFS+ with `hdiutil create`. After each
-  operation they eject and check the image file itself with hfsutils, so a change only counts
-  if it actually reached the disk. The hfsutils tests are skipped unless hfsutils is
-  installed (`brew install hfsutils`).
-- **Real-image tests** (in `HFSAppTests`) run against period disk images that aren't in the
-  repository. Put `HD1 BlueSCSI Bootstrap.hda`, `StuffIt Deluxe 3.0.7 Disk 1.dsk`,
-  `StuffIt Deluxe 3.0.7 Disk 2.dsk` and `boot.vhd` in the repo root (they're gitignored), and
-  set `FLOPPYFOX_VHD_FIXTURE=/path/to/image.vhd` for the VHD tests. Tests whose image is
-  missing are skipped.
+- **Unit tests** (`ParsingTests`, `RobustnessTests`) cover name conversion and ordering,
+  subprocess plumbing, and fuzzed VHD and resource-fork input.
+- **Engine tests** (`HFSEngineTests`, `HFSPlusEngineTests`) drive the engines directly:
+  multi-level catalog growth, extents-overflow files, large allocation blocks, Unicode names,
+  case-sensitive HFSX, cancelled writes, corrupted images. HFS+ results are also mounted with
+  macOS's own driver.
+- **Crash-safety tests** (`CrashSafetyTests`, plus a sweep in `HFSPlusEngineTests`) cut off a
+  save after every possible number of writes and check the volume is the old or the new one;
+  they also cover freed-block reuse, fragmented catalog growth, hostile partition tables and
+  catalogs, file locking and changes made by other programs.
+- **App tests** (`DiskImageManagerTests`) cover what the window does: import, export,
+  copy/cut/paste, delete, read-only cases and cancellation.
+
+Every test that writes a volume also runs Apple's `fsck_hfs -n` on the result. It checks
+B-tree structure, catalog key order, valences, the allocation bitmap and the MDB totals.
+
+Set `FLOPPYFOX_REAL_HDA=/path/to/image.hda` (a System 6/7 disk) and
+`FLOPPYFOX_REAL_HFSPLUS_HDA=/path/to/image.hda` (a Mac OS 8.1–9 disk) to also edit clones of
+real Mac OS-written hard-disk images and fsck them (the originals are never modified).
 
 If the command-line tools are not using the full Xcode SDK, specify it explicitly:
 
@@ -97,10 +111,38 @@ Open the resulting application directly with:
 open Build/FloppyFox.app
 ```
 
-The local build script does not currently apply a Developer ID signature or submit the app for
-Apple notarization. An app intended for distribution must be signed and notarized separately.
+`VERSION`, `BUILD_NUMBER` and `RELEASE_CHANNEL` (shown in About, e.g. `beta`) set the version.
+Without a signing identity the app is ad-hoc signed with its sandbox entitlements, so local
+builds run under the same App Sandbox as the store build.
+
+For the Mac App Store, create the app record and a Mac App Store provisioning profile for
+`com.andersmuskens.FloppyFox` in your developer account, then:
+
+```bash
+DISTRIBUTION=appstore VERSION=1.0 BUILD_NUMBER=1 \
+  SIGN_IDENTITY="Apple Distribution: Your Name (TEAMID)" \
+  INSTALLER_IDENTITY="3rd Party Mac Developer Installer: Your Name (TEAMID)" \
+  PROVISIONING_PROFILE=path/to/FloppyFox.provisionprofile \
+  ./Tools/build-app.sh
+```
+
+This produces `Build/FloppyFox.pkg`; upload it with Transporter. For direct distribution
+outside the store, set `SIGN_IDENTITY` to a Developer ID identity and `NOTARY_PROFILE` to a
+notarytool keychain profile instead.
 
 ## Structure
 
-- `Sources/HFSApp/` contains the app entry point and HFS disk image manager
+- `Sources/FloppyFox/HFS/` is the HFS engine: image layouts (partition maps, DiskCopy 4.2,
+  VHD), the master directory block, B-trees, allocation, and MacBinary
+- `Sources/FloppyFox/DiskImageManager.swift` is the app's model: opening images, browsing,
+  import/export, clipboard and progress
+- `Sources/FloppyFox/ContentView.swift` and `HFSApp.swift` are the SwiftUI interface and menus
+- `Tools/` has the build script, sandbox entitlements and icon generators
 - `Package.swift` defines the macOS platform target and test target
+
+## Third-party code
+
+`Sources/FloppyFox/HFS/HFSPlusCaseFolding.swift` contains Apple's HFS Plus case-folding
+tables, generated from `UCStringCompareData.h` in Apple's open-source
+[hfs](https://github.com/apple-oss-distributions/hfs) project. That file is covered by the
+Apple Public Source License 2.0, whose notice it carries; the rest of FloppyFox is MIT-licensed.

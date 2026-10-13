@@ -31,13 +31,15 @@ struct VHDPreparation: Sendable {
 /// file; the caller deliberately opens that file read-only because writing it back would require
 /// rebuilding the VHD block allocation table and checksums.
 enum VHDImage {
-    static func prepareForReading(_ source: URL) async throws -> VHDPreparation {
+    /// `directory` receives the expanded copy of a dynamic VHD (the app passes a directory in
+    /// its managed temporary storage, so the copy can't outlive the session).
+    static func prepareForReading(_ source: URL, into directory: URL = FileManager.default.temporaryDirectory) async throws -> VHDPreparation {
         try await Task.detached(priority: .userInitiated) {
-            try prepareSynchronously(source)
+            try prepareSynchronously(source, into: directory)
         }.value
     }
 
-    private static func prepareSynchronously(_ source: URL) throws -> VHDPreparation {
+    private static func prepareSynchronously(_ source: URL, into directory: URL) throws -> VHDPreparation {
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
         let fileLength = try input.seekToEnd()
@@ -84,8 +86,7 @@ enum VHDImage {
         let table = try input.read(upToCount: tableByteCount) ?? Data()
         guard table.count == tableByteCount else { throw VHDImageError.invalidBlockTable }
 
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("floppyfox-vhd-\(UUID().uuidString).img")
+        let outputURL = directory.appendingPathComponent("floppyfox-vhd-\(UUID().uuidString).img")
         guard FileManager.default.createFile(atPath: outputURL.path, contents: nil) else {
             throw CocoaError(.fileWriteUnknown)
         }

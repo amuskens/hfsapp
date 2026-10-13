@@ -1,0 +1,349 @@
+import Foundation
+
+/// One catalog item as the rest of the app sees it, from either kind of volume.
+struct VolumeItem: Sendable, Hashable, Identifiable {
+    let id: UInt32
+    let parentID: UInt32
+    let name: String
+    let isFolder: Bool
+    let dataLength: UInt64
+    let resourceLength: UInt64
+    let fileType: [UInt8]
+    let creator: [UInt8]
+    let finderFlags: UInt16
+    let isLocked: Bool
+    let createDate: Date
+    let modifyDate: Date
+    let valence: Int
+
+    static let invisibleFlag: UInt16 = 0x4000
+    var isInvisible: Bool { finderFlags & Self.invisibleFlag != 0 }
+}
+
+/// Why a volume was opened without write access.
+enum ReadOnlyCause: Sendable, Equatable {
+    /// The caller asked for read-only, or the image file can't be written.
+    case requested
+    /// The volume's own lock (Get Info "Locked", a locked floppy).
+    case locked
+    /// The "unmounted cleanly" bit is clear: Mac OS (an emulator, a real Mac) has the volume
+    /// mounted right now, or it wasn't ejected properly. Writing could clash with that
+    /// computer's own changes; Mac OS would check the volume first.
+    case notCleanlyUnmounted
+    /// A Mac OS X journaled volume, whose journal this app doesn't maintain.
+    case journaled
+    /// Another process holds the image file's exclusive lock.
+    case inUse
+}
+
+/// The operations the app performs on a volume. `HFSVolume` (Mac OS Standard) and
+/// `HFSPlusVolume` (Mac OS Extended) implement them.
+///
+/// Changes are made in memory and written by `flush()`, atomically: new B-trees go to free
+/// space and a single volume-header write switches to them. If a flush fails the volume
+/// rolls back to its last committed state and the error says so. Once `close()`d, every call
+/// throws `HFSError.closed`.
+protocol DiskVolume: Actor {
+    nonisolated var isReadOnly: Bool { get }
+    nonisolated var readOnlyCause: ReadOnlyCause? { get }
+    nonisolated var formatName: String { get }
+
+    var volumeName: String { get }
+    var freeBytes: UInt64 { get }
+
+    func item(_ id: UInt32) throws -> VolumeItem
+    func contents(ofFolder folderID: UInt32) throws -> [VolumeItem]
+    func path(of id: UInt32) throws -> [VolumeItem]
+    func child(named name: String, inFolder folderID: UInt32) -> VolumeItem?
+    func readFork(_ id: UInt32, fork: HFSFork, chunkSize: Int, sink: @Sendable ([UInt8]) throws -> Void) throws
+    func readForkBytes(_ id: UInt32, fork: HFSFork) throws -> [UInt8]
+    func finderInfo(_ id: UInt32) throws -> (finderInfo: [UInt8], extended: [UInt8])
+
+    func createFolder(named name: String, in parentID: UInt32) throws -> UInt32
+    func createFile(named name: String, in parentID: UInt32, metadata: NewFileMetadata, dataFork: HFSForkSource, resourceFork: HFSForkSource) throws -> UInt32
+    func delete(_ id: UInt32) throws
+    func move(_ id: UInt32, to newParentID: UInt32, newName: String?) throws
+    func copyFile(_ id: UInt32, to parentID: UInt32, name: String) throws -> UInt32
+    func flush() throws
+    func close()
+
+    /// A name this volume accepts, derived from a host file name (length limits, the `:`
+    /// separator, character set).
+    nonisolated func validName(from hostName: String) -> String
+}
+
+extension DiskVolume {
+    func readFork(_ id: UInt32, fork: HFSFork, sink: @Sendable ([UInt8]) throws -> Void) throws {
+        try readFork(id, fork: fork, chunkSize: 1 << 20, sink: sink)
+    }
+
+    func move(_ id: UInt32, to newParentID: UInt32) throws {
+        try move(id, to: newParentID, newName: nil)
+    }
+}
+
+/// Finder metadata for a new file.
+struct NewFileMetadata: Sendable {
+    var fileType: [UInt8]
+    var creator: [UInt8]
+    /// The full 16-byte FInfo, if known (its type/creator are overridden by the fields above).
+    var finderInfo: [UInt8]?
+    var extendedFinderInfo: [UInt8]?
+    var createDate: Date?
+    var modifyDate: Date?
+
+    init(fileType: [UInt8], creator: [UInt8], finderInfo: [UInt8]? = nil, extendedFinderInfo: [UInt8]? = nil, createDate: Date? = nil, modifyDate: Date? = nil) {
+        self.fileType = fileType
+        self.creator = creator
+        self.finderInfo = finderInfo
+        self.extendedFinderInfo = extendedFinderInfo
+        self.createDate = createDate
+        self.modifyDate = modifyDate
+    }
+
+    /// FInfo with this metadata's type and creator, and the Finder's on-desktop position
+    /// cleared (a host or foreign position means nothing on this disk).
+    func resolvedFinderInfo() -> [UInt8] {
+        var info = Array((finderInfo ?? []).prefix(16))
+        info += [UInt8](repeating: 0, count: 16 - info.count)
+        info.replaceSubrange(0..<4, with: Self.fourCC(fileType))
+        info.replaceSubrange(4..<8, with: Self.fourCC(creator))
+        for i in 10..<16 { info[i] = 0 }
+        return info
+    }
+
+    static func fourCC(_ code: [UInt8]) -> [UInt8] {
+        Array(code.prefix(4)) + [UInt8](repeating: 0x20, count: max(0, 4 - code.count))
+    }
+}
+
+/// A volume's allocation bitmap, in two versions: `working` (what the pending changes use) and
+/// `committed` (what is on disk). New space is only taken from blocks free in *both*, so blocks
+/// released by a delete that isn't committed yet can't be overwritten before the delete is
+/// durable — and the old B-tree files stay intact until the new ones are committed.
+struct AllocationMap {
+    private(set) var working: [UInt8]
+    private(set) var committed: [UInt8]
+    let blockCount: Int
+    /// Blocks past this are never handed out (HFS: Apple never allocates the final block).
+    let allocatableCount: Int
+    let maxRunLength: Int
+
+    init(bitmap: [UInt8], blockCount: Int, allocatableCount: Int, maxRunLength: Int) {
+        working = bitmap
+        committed = bitmap
+        self.blockCount = blockCount
+        self.allocatableCount = allocatableCount
+        self.maxRunLength = maxRunLength
+    }
+
+    private static func isSet(_ map: [UInt8], _ block: Int) -> Bool {
+        map[block / 8] & (0x80 >> UInt8(block % 8)) != 0
+    }
+
+    func isUsed(_ block: Int) -> Bool { block < blockCount && Self.isSet(working, block) }
+
+    /// Marks blocks the volume's structures are known to use as used in both versions, and
+    /// returns whether any of them were marked free. A bitmap Mac OS didn't get to flush
+    /// (the volume wasn't unmounted cleanly) can under-report, and handing such a block to
+    /// new data would overwrite a file — or, on HFS Plus, the volume header.
+    mutating func claimKnownUsed(_ runs: [(start: Int, count: Int)]) -> Bool {
+        var corrected = false
+        for run in runs where run.count > 0 && run.start >= 0 && run.start < blockCount {
+            for block in run.start..<min(run.start + run.count, blockCount) where !Self.isSet(working, block) || !Self.isSet(committed, block) {
+                working[block / 8] |= 0x80 >> UInt8(block % 8)
+                committed[block / 8] |= 0x80 >> UInt8(block % 8)
+                corrected = true
+            }
+        }
+        return corrected
+    }
+
+    func isAvailable(_ block: Int) -> Bool {
+        block < allocatableCount && !Self.isSet(working, block) && !Self.isSet(committed, block)
+    }
+
+    /// Marks a run used or free. Runs reaching past the volume (only possible on a damaged
+    /// image) are clipped rather than trusted.
+    mutating func set(start: Int, count: Int, used: Bool) {
+        guard start >= 0, count > 0, start < blockCount else { return }
+        for block in start..<min(start + count, blockCount) {
+            if used { working[block / 8] |= 0x80 >> UInt8(block % 8) } else { working[block / 8] &= ~(0x80 >> UInt8(block % 8)) }
+        }
+    }
+
+    /// Population count of `map` over blocks `0..<limit`.
+    private static func usedCount(_ map: [UInt8], limit: Int) -> Int {
+        let fullBytes = limit / 8
+        var used = 0
+        for index in 0..<fullBytes { used += map[index].nonzeroBitCount }
+        for block in (fullBytes * 8)..<limit where isSet(map, block) { used += 1 }
+        return used
+    }
+
+    /// Free blocks after the pending changes (what the volume header records).
+    var freeCount: Int { blockCount - Self.usedCount(working, limit: blockCount) }
+
+    /// Blocks that new data may use right now.
+    var availableCount: Int {
+        let fullBytes = allocatableCount / 8
+        var used = 0
+        for index in 0..<fullBytes { used += (working[index] | committed[index]).nonzeroBitCount }
+        for block in (fullBytes * 8)..<allocatableCount where !isAvailable(block) { used += 1 }
+        return allocatableCount - used
+    }
+
+    /// Both versions combined: written before a commit so that neither the old nor the new
+    /// structures are ever marked free on disk.
+    var union: [UInt8] { zip(working, committed).map { $0 | $1 } }
+
+    mutating func commit() { committed = working }
+
+    mutating func rollBack(to bitmap: [UInt8]) {
+        working = bitmap
+        committed = bitmap
+    }
+
+    /// Free runs, skipping whole used bytes quickly.
+    private func freeRuns() -> [(start: Int, count: Int)] {
+        var runs: [(start: Int, count: Int)] = []
+        var block = 0
+        while block < allocatableCount {
+            if block % 8 == 0, block + 8 <= allocatableCount, (working[block / 8] | committed[block / 8]) == 0xFF {
+                block += 8
+                continue
+            }
+            if !isAvailable(block) { block += 1; continue }
+            let start = block
+            while block < allocatableCount, block - start < maxRunLength {
+                if block % 8 == 0, block + 8 <= allocatableCount, block - start + 8 <= maxRunLength, (working[block / 8] | committed[block / 8]) == 0 {
+                    block += 8
+                    continue
+                }
+                if !isAvailable(block) { break }
+                block += 1
+            }
+            runs.append((start, block - start))
+        }
+        return runs
+    }
+
+    /// Allocates `count` blocks: one run if any is long enough (searching from `hint`, or with
+    /// `bestFit` the shortest that fits, which keeps long runs for what needs them), else the
+    /// largest runs first. At most `maxExtents` runs when given; at least `reserve` blocks must
+    /// remain available afterwards.
+    mutating func allocate(_ count: Int, hint: Int, maxExtents: Int? = nil, reserve: Int = 0, bestFit: Bool = false) throws -> [(start: Int, count: Int)] {
+        guard count > 0 else { return [] }
+        let available = availableCount
+        guard count <= available, available - count >= reserve else { throw HFSError.volumeFull }
+        let runs = freeRuns()
+        let single = bestFit
+            ? runs.filter { $0.count >= count }.min { $0.count < $1.count }
+            : runs.first(where: { $0.start >= hint && $0.count >= count }) ?? runs.first(where: { $0.count >= count })
+        if let run = single {
+            set(start: run.start, count: count, used: true)
+            return [(run.start, count)]
+        }
+        var result: [(start: Int, count: Int)] = []
+        var needed = count
+        for run in runs.sorted(by: { $0.count > $1.count }) where needed > 0 {
+            let take = min(run.count, needed)
+            result.append((run.start, take))
+            needed -= take
+        }
+        if needed > 0 { throw HFSError.volumeFull }
+        if let maxExtents, result.count > maxExtents { throw HFSError.volumeFull }
+        for run in result { set(start: run.start, count: run.count, used: true) }
+        return result.sorted { $0.start < $1.start }
+    }
+}
+
+extension AllocationMap {
+    /// Room the next save needs for fresh copies of its trees: each tree's blocks, in at most
+    /// `maxRuns` runs (few enough that the catalog doesn't spill into the extents tree).
+    struct SaveRoom {
+        var trees: [(blocks: Int, maxRuns: Int)]
+        var totalBlocks: Int { trees.reduce(0) { $0 + $1.blocks } }
+    }
+
+    /// A copy of the map with `room` set aside, and how many blocks of it couldn't be: where a
+    /// tree doesn't fit in its runs, its longest runs are set aside and the rest is counted.
+    func settingAside(_ room: SaveRoom) -> (map: AllocationMap, shortfall: Int) {
+        var copy = self
+        var shortfall = 0
+        for tree in room.trees where tree.blocks > 0 {
+            if (try? copy.allocate(tree.blocks, hint: 0, maxExtents: tree.maxRuns, bestFit: true)) != nil { continue }
+            var needed = tree.blocks
+            for run in copy.freeRuns().sorted(by: { $0.count > $1.count }).prefix(tree.maxRuns) where needed > 0 {
+                let take = min(run.count, needed)
+                copy.set(start: run.start, count: take, used: true)
+                needed -= take
+            }
+            shortfall += needed
+        }
+        return (copy, shortfall)
+    }
+
+    /// Allocates file data around the room the next save needs, so the save can still write
+    /// its trees by copy (the crash-safe way) however fragmented the data leaves free space.
+    mutating func allocateData(_ count: Int, hint: Int, keeping room: SaveRoom) throws -> [(start: Int, count: Int)] {
+        var (aside, shortfall) = settingAside(room)
+        let runs = try aside.allocate(count, hint: hint, reserve: shortfall)
+        for run in runs { set(start: run.start, count: run.count, used: true) }
+        return runs
+    }
+
+    /// Blocks that file data can use (see `allocateData`).
+    func dataAvailableCount(keeping room: SaveRoom) -> Int {
+        let (aside, shortfall) = settingAside(room)
+        return max(0, aside.availableCount - shortfall)
+    }
+}
+
+/// Where a rebuilt B-tree file goes.
+enum TreePlacement {
+    struct Plan {
+        var runs: [(start: Int, count: Int)]
+        var nodeCount: Int
+        /// True when there was no room for a fresh copy and the tree is rewritten over the
+        /// current file (not crash-atomic: the last resort on a full or fragmented volume).
+        var inPlace: Bool
+    }
+
+    /// The smallest a rebuilt tree is made: what its records need, but never smaller than it
+    /// is. Mac OS never shrinks these files, and a crash between the main and spare volume
+    /// headers is only repairable (fsck_hfs mixes fields from the two) when the sizes match.
+    static func minimumNodes(needed: Int, current: Int) -> Int {
+        max(needed, current)
+    }
+
+    static func blocks(forNodes nodes: Int, nodeSize: Int, blockSize: Int) -> Int {
+        (nodes * nodeSize + blockSize - 1) / blockSize
+    }
+
+    /// A fresh copy in free space — `roomy` sizes it at the file's current size plus room to
+    /// grow, otherwise exactly what's needed — so the old tree stays valid until the volume
+    /// header switches over. With `allowInPlace`, falls back to rewriting the current file
+    /// when it is big enough and there is no room for a copy.
+    /// A copy is first tried in at most `compactRuns` runs (what the volume header holds, so
+    /// the copy doesn't add overflow records), then in up to `maxExtents`.
+    static func plan(neededNodes: Int, nodeSize: Int, blockSize: Int, clumpBytes: Int,
+                     current: [(start: Int, count: Int)], currentNodes: Int, maxExtents: Int?, compactRuns: Int,
+                     roomy: Bool, allowInPlace: Bool, map: inout AllocationMap, hint: Int) throws -> Plan {
+        // The clump size comes from disk: bounded, so a hostile one can't overflow sizes.
+        let clumpNodes = max(1, min(clumpBytes, 64 << 20) / nodeSize)
+        let roomyNodes = max(currentNodes, neededNodes + max(neededNodes / 4, clumpNodes))
+        let neededNodes = minimumNodes(needed: neededNodes, current: currentNodes)
+        let caps: [Int?] = maxExtents.map { $0 <= compactRuns } == true ? [maxExtents] : [compactRuns, maxExtents]
+        for nodes in roomy ? [roomyNodes, neededNodes] : [neededNodes] {
+            let count = blocks(forNodes: nodes, nodeSize: nodeSize, blockSize: blockSize)
+            for cap in caps {
+                if let runs = try? map.allocate(count, hint: hint, maxExtents: cap, bestFit: true) {
+                    return Plan(runs: runs, nodeCount: count * blockSize / nodeSize, inPlace: false)
+                }
+            }
+        }
+        guard allowInPlace, currentNodes >= neededNodes else { throw HFSError.volumeFull }
+        return Plan(runs: current, nodeCount: currentNodes, inPlace: true)
+    }
+}

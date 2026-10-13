@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 @main
 struct FloppyFoxApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var manager = DiskImageManager()
 
     init() {
@@ -13,10 +14,13 @@ struct FloppyFoxApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        // A single window: there is one shared DiskImageManager, so a second window would only
+        // mirror the first (and opening a document must not spawn one).
+        Window("FloppyFox", id: "main") {
             ContentView()
                 .environmentObject(manager)
                 .onAppear {
+                    appDelegate.manager = manager
                     // Activate the app so it shows in the Dock and receives key events
                     NSApplication.shared.activate(ignoringOtherApps: true)
                 }
@@ -53,7 +57,7 @@ struct FloppyFoxApp: App {
                 Button("Add Files") {
                     manager.addFiles()
                 }
-                .disabled((!manager.isMounted && !manager.usingHFSUtils) || manager.isReadOnly)
+                .disabled(!manager.isOpen || manager.isReadOnly)
 
                 Button("Export Selected") {
                     Task { await manager.exportSelected() }
@@ -62,67 +66,44 @@ struct FloppyFoxApp: App {
 
                 Divider()
 
-                Button("Diagnostics…") {
-                    Task {
-                        if let image = manager.imageURL {
-                            _ = await manager.runDiagnostics(on: image)
-                        } else {
-                            let panel = NSOpenPanel()
-                            panel.allowedContentTypes = DiskImageManager.supportedImageTypes
-                            panel.canChooseFiles = true
-                            panel.canChooseDirectories = false
-                            panel.allowsMultipleSelection = false
-                            panel.title = "Choose image for diagnostics"
-                            if panel.runModal() == .OK, let url = panel.url {
-                                _ = await manager.runDiagnostics(on: url)
-                            }
-                        }
-                    }
-                }
-
                 Button("Eject") {
                     Task { await manager.ejectImage() }
                 }
-                .disabled(!manager.isMounted && !manager.usingHFSUtils)
+                .disabled(!manager.isOpen)
             }
             // "Quit FloppyFox ⌘Q" is already provided automatically (CommandGroup(.appTermination),
             // in the app menu) — the old File menu additionally defined its own "Quit" bound to
             // the same ⌘Q, which is the same duplicate-shortcut problem as above.
 
-            // Undo/Redo and Find/Spelling/Substitutions/Transformations/Speech are part of every
-            // app's default Edit menu, but nothing in this app ever registers an `UndoManager` or
-            // hosts an editable text view for them to act on — they'd just sit there permanently
-            // grayed out, so they're dropped instead of leaving dead menu items around.
-            CommandGroup(replacing: .undoRedo) {}
+            // Find/Spelling/Substitutions/Transformations/Speech have nothing to act on here, so
+            // they're dropped. Undo/Redo stay: the folder-name field's editor uses them.
             CommandGroup(replacing: .textEditing) {}
 
             // `.pasteboard` is the standard Edit menu's Cut/Copy/Paste/Select All section.
             CommandGroup(replacing: .pasteboard) {
+                // While a text field is being edited these act on its text, as everywhere else
+                // on the Mac, instead of on the files.
                 Button("Cut") {
-                    manager.cutSelected()
+                    if !TextEditing.send(#selector(NSText.cut(_:))) { manager.cutSelected() }
                 }
                 .keyboardShortcut("x", modifiers: [.command])
-                .disabled(manager.selectedEntries.isEmpty || manager.isReadOnly)
 
                 Button("Copy") {
-                    manager.copySelected()
+                    if !TextEditing.send(#selector(NSText.copy(_:))) { manager.copySelected() }
                 }
                 .keyboardShortcut("c", modifiers: [.command])
-                .disabled(manager.selectedEntries.isEmpty)
 
                 Button("Paste") {
-                    manager.paste()
+                    if !TextEditing.send(#selector(NSText.paste(_:))) { manager.paste() }
                 }
                 .keyboardShortcut("v", modifiers: [.command])
-                .disabled((!manager.isMounted && !manager.usingHFSUtils) || manager.isReadOnly)
 
                 Divider()
 
                 Button("Select All") {
-                    manager.selectedEntries = Set(manager.entries)
+                    if !TextEditing.send(#selector(NSText.selectAll(_:))) { manager.selectedEntries = Set(manager.entries) }
                 }
                 .keyboardShortcut("a", modifiers: [.command])
-                .disabled(manager.entries.isEmpty)
             }
 
             CommandGroup(replacing: .help) {
@@ -135,11 +116,29 @@ struct FloppyFoxApp: App {
     }
 }
 
+/// Routes an Edit menu command to the text field being edited, if there is one.
+@MainActor
+private enum TextEditing {
+    static func send(_ action: Selector) -> Bool {
+        guard let editor = NSApp.keyWindow?.firstResponder as? NSText else { return false }
+        return NSApp.sendAction(action, to: editor, from: nil)
+    }
+}
+
 @MainActor
 private enum AppPresentation {
     private static let fallbackVersion = "0.1"
     private static let fallbackBuild = "1"
-    private static let releaseChannel = "beta"
+
+    /// "beta", "TestFlight", … from the bundle's `FloppyFoxReleaseChannel` key; empty (and
+    /// not shown) for a normal release. Set by Tools/build-app.sh's RELEASE_CHANNEL.
+    private static var releaseChannel: String {
+        (Bundle.main.infoDictionary?["FloppyFoxReleaseChannel"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
+    }
+
+    private static func withChannel(_ text: String) -> String {
+        releaseChannel.isEmpty ? text : "\(text) \(releaseChannel)"
+    }
 
     static func showAboutPanel() {
         let info = Bundle.main.infoDictionary
@@ -155,8 +154,8 @@ private enum AppPresentation {
         NSApplication.shared.orderFrontStandardAboutPanel(options: [
             .applicationName: "FloppyFox",
             .applicationIcon: aboutIcon,
-            .applicationVersion: "\(version) \(releaseChannel)",
-            .version: "Version \(version) \(releaseChannel) (build \(build))",
+            .applicationVersion: withChannel(version),
+            .version: "\(withChannel("Version \(version)")) (build \(build))",
             .credits: credits
         ])
         NSApplication.shared.activate(ignoringOtherApps: true)
@@ -198,7 +197,7 @@ private enum AppPresentation {
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = "FloppyFox Help"
-        alert.informativeText = "README • Version \(releaseVersion) \(releaseChannel)"
+        alert.informativeText = "README • \(withChannel("Version \(releaseVersion)"))"
         alert.accessoryView = scrollView
         alert.addButton(withTitle: "Close")
         NSApplication.shared.activate(ignoringOtherApps: true)
@@ -207,5 +206,27 @@ private enum AppPresentation {
 
     private static var releaseVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? fallbackVersion
+    }
+}
+
+/// Writes pending changes and clears the app's temporary files when it quits.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    weak var manager: DiskImageManager?
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let manager else {
+            TemporaryStorage.shared.removeLaunchDirectory()
+            return .terminateNow
+        }
+        Task {
+            await manager.prepareForTermination()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
     }
 }

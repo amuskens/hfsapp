@@ -1,18 +1,19 @@
 # FloppyFox
 
-FloppyFox is a macOS app for browsing and editing Apple HFS disk images (`.hda`, `.dsk`, `.img`, and `.vhd`). It is designed for exploring and modifying disk images used by Classic Mac OS, emulators, and devices such as BlueSCSI.
+FloppyFox is a macOS app for browsing and editing Apple HFS disk images (`.hda`, `.dsk`, `.img`, `.image`, and `.vhd`). It is designed for exploring and modifying disk images used by Classic Mac OS, emulators, and devices such as BlueSCSI.
+
+FloppyFox reads and writes HFS volumes itself. It doesn't mount images in macOS and needs no other software.
 
 ## Features
 
-- Open HFS disk images, including raw `.vhd` images and fixed or dynamic VHD containers.
+- Open Mac OS Standard (HFS) and Mac OS Extended (HFS+) volumes: floppy images, partitioned hard-disk images such as BlueSCSI `.hda` files, Mac OS 8.1–9 disks, and fixed or dynamic VHD containers.
 - Browse folders and files in list or icon view.
-- Add files and folders by dragging from Finder or pasting from the clipboard.
-- Copy files and folders to Finder using drag and drop or the clipboard.
-- Create and delete folders and files inside writable images.
-- Export selected files and folders to the host filesystem.
+- Add files and folders by dragging from Finder or pasting from the clipboard. MacBinary (`.bin`) files are unpacked automatically.
+- Copy files and folders to Finder using drag and drop, the clipboard, or Export. Resource forks and Finder type/creator codes come along, so classic applications keep working when copied back.
+- Copy, move, and delete files and folders inside writable images.
 - Inspect classic Finder attributes, data forks, and resource forks.
 
-Long-running file operations display a progress panel. Choose **Cancel** or press Escape to stop after the current file operation finishes safely.
+Long-running file operations display a progress panel. Choose **Cancel** or press Escape to stop. Items that finished copying are kept; the one in progress is discarded.
 
 ## Basic use
 
@@ -20,40 +21,24 @@ Long-running file operations display a progress panel. Choose **Cancel** or pres
 2. Double-click folders to browse them, or use **Up** and the path menu.
 3. Drag files between FloppyFox and Finder, or use Cut, Copy, and Paste.
 4. Right-click in the browser to create a folder or access file operations.
-5. Choose **Eject** before moving or replacing an image that was opened read/write.
+5. Choose **Eject** before using the image in an emulator or copying it to a device.
 
-Some images cannot be mounted directly by macOS. FloppyFox automatically uses hfsutils as a fallback when available.
+## Read-only images
 
-## Prerequisites
+Some images open read-only. FloppyFox tells you why when it opens one:
 
-- macOS 13 or newer.
-- hfsutils is recommended for disk images macOS cannot mount directly.
+- The image file's permissions don't allow writing, or the volume itself is locked.
+- Another program, such as an emulator, has the image open.
+- The volume wasn't ejected properly (for example, an emulator crashed while using it). If nothing else is using the image, choose **Open for Writing Anyway**.
+- Journaled Mac OS Extended volumes (from Mac OS X) are read-only.
+- Dynamic VHD and DiskCopy 4.2 images: changes can't be written back to these containers.
 
-## Building in Visual Studio Code
+Changes are saved safely: if your Mac loses power while FloppyFox is saving, the disk keeps either its previous contents or the new ones.
 
-Install Xcode and its Command Line Tools, Visual Studio Code, and the official **Swift** extension published by Swift Server Work Group. Open the repository using **File > Open Folder**, or run:
+## Not supported yet
 
-```bash
-cd /path/to/hfsapp
-code .
-```
-
-VS Code recognizes `Package.swift` as a Swift package. Use **Swift: Build Package** from the Command Palette, or use the integrated terminal:
-
-```bash
-swift build
-swift run
-swift test
-```
-
-To create the release application at `Build/FloppyFox.app`, run:
-
-```bash
-./Tools/build-app.sh
-open Build/FloppyFox.app
-```
-
-This local application bundle is not signed or notarized for public distribution.
+- When a hard-disk image has several partitions, only the first one is shown.
+- On Mac OS Extended volumes, hard links and files with extended attributes can't be deleted.
 
 ## Support
 
