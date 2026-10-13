@@ -342,9 +342,11 @@ enum HFSPlusName {
     /// The Mac OS text encoding classic Mac OS should use to display a name, and its bit in
     /// the volume header's encodings bitmap (TN1150 "Text Encodings").
     static func textEncoding(for string: String) -> UInt32 {
+        // Single-script encodings first: the CJK ones also contain Cyrillic and Greek letters,
+        // so a Russian name would otherwise be hinted as Japanese.
         let candidates: [(CFStringEncodings, UInt32)] = [
-            (.macJapanese, 1), (.macChineseTrad, 2), (.macKorean, 3), (.macCyrillic, 7),
-            (.macChineseSimp, 25), (.macCentralEurRoman, 29), (.macGreek, 6), (.macTurkish, 35),
+            (.macCyrillic, 7), (.macGreek, 6), (.macCentralEurRoman, 29), (.macTurkish, 35),
+            (.macJapanese, 1), (.macChineseTrad, 2), (.macKorean, 3), (.macChineseSimp, 25),
         ]
         if string.data(using: .macOSRoman, allowLossyConversion: false) != nil { return 0 }
         for (cf, value) in candidates {

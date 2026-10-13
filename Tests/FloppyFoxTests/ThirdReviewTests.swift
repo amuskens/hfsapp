@@ -200,4 +200,55 @@ final class ThirdReviewTests: XCTestCase {
         await volume.close()
         XCTAssertEqual(try mdb(url).attributes & MasterDirectoryBlock.unmountedCleanlyBit, 0)
     }
+
+    // MARK: Plausible findings
+
+    /// Mac OS 8/9 shows a name using its record's encoding hint, so a rename must update it.
+    func testRenamingOnHFSPlusUpdatesTheNamesEncodingHint() async throws {
+        let url = try HFSPlusFixtures.makeVolume(in: work)
+        let volume = try openHFSPlus(url)
+        let file = try await volume.createFile(named: "Plain", in: HFSCatalogID.rootFolder, type: [], creator: [], dataFork: HFSForkSource(bytes: [1]), resourceFork: .empty)
+        let folder = try await volume.createFolder(named: "Folder", in: HFSCatalogID.rootFolder)
+        let fileHint = try await volume.textEncoding(of: file)
+        XCTAssertEqual(fileHint, 0)
+        try await volume.move(file, to: HFSCatalogID.rootFolder, newName: "Привет")
+        try await volume.move(folder, to: HFSCatalogID.rootFolder, newName: "日本語")
+        try await volume.flush()
+        await volume.close()
+        let reopened = try openHFSPlus(url)
+        let renamedFile = try await reopened.textEncoding(of: file)
+        let renamedFolder = try await reopened.textEncoding(of: folder)
+        XCTAssertEqual(renamedFile, 7, "MacCyrillic")
+        XCTAssertEqual(renamedFolder, 1, "MacJapanese")
+        await reopened.close()
+        XCTAssertTrue(try Fixtures.fsck(url).clean)
+    }
+
+    /// A catalog whose recorded size its extents don't cover is rejected at open, rather than
+    /// failing halfway through a later save.
+    func testATreeLargerThanItsExtentsIsRejectedAtOpen() throws {
+        let url = try Fixtures.makeClassicHFSImage(in: work)
+        // drCTFlSize (catalog file size) is at MDB offset 146.
+        try patch(url, at: 1024 + 146, { $0.put32(0x0100_0000, at: 0) }, count: 4)
+        XCTAssertThrowsError(try openHFS(url))
+    }
+
+    // MARK: Found by the large-volume tests
+
+    /// Map nodes (a tree of more than ~2000 nodes needs them) must lay out their record as
+    /// Apple's B-tree code does — free-space offset at nodeSize - 6 — or hfsutils (and
+    /// possibly Mac OS) refuses the volume.
+    func testBTreeMapNodesUseApplesLayout() throws {
+        let template = try BTree.Header(raw: [UInt8](repeating: 0, count: 106))
+        for nodeSize in [512, 4096] {
+            let nodes = try BTree.build(records: [], nodeCount: 40_000, template: template, nodeSize: nodeSize)
+            let mapNodes = nodes.dropFirst().prefix { $0[8] == BTree.NodeKind.map.rawValue }
+            XCTAssertFalse(mapNodes.isEmpty, "\(nodeSize)")
+            for node in mapNodes {
+                XCTAssertEqual(try node.u16(10), 1)
+                XCTAssertEqual(try node.u16(nodeSize - 2), 14, "record offset")
+                XCTAssertEqual(try node.u16(nodeSize - 4), UInt16(nodeSize - 6), "free-space offset")
+            }
+        }
+    }
 }

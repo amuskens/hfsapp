@@ -174,6 +174,15 @@ actor HFSPlusVolume: DiskVolume {
             try checkFork(header.fork(offset))
         }
         for entry in extentsRecords { try checkExtents(entry.extents) }
+        // Each tree's file must be covered by its extents: a save in place writes all of it.
+        for (fileID, offset, nodeSize) in [(HFSCatalogID.catalogFile, HFSPlusVolumeHeader.catalogFileOffset, catalogNodeSize),
+                                           (HFSCatalogID.extentsFile, HFSPlusVolumeHeader.extentsFileOffset, extentsNodeSize)] {
+            let fork = header.fork(offset)
+            let covered = Self.fullExtents(fileID: fileID, fork: .data, data: fork, overflow: extentsRecords).reduce(UInt64(0)) { $0 + UInt64($1.blockCount) }
+            guard covered * UInt64(blockSize) >= fork.logicalSize, fork.logicalSize % UInt64(nodeSize) == 0 else {
+                throw HFSError.corrupt("a B-tree file is larger than its extents")
+            }
+        }
         for record in catalog where record.type == .file {
             guard let file = try? HFSPlusFileRecord(raw: record.data) else { continue }
             try checkFork(file.fork(.data))
@@ -407,14 +416,20 @@ actor HFSPlusVolume: DiskVolume {
         if newKey == oldKey { return }
         if let existing = index(of: newKey), existing != oldIndex { throw HFSError.alreadyExists(HFSPlusName.decode(units)) }
 
+        var data = record.data
+        if let newName {
+            // The record's encoding hint is what Mac OS 8/9 uses to show the name.
+            let encoding = HFSPlusName.textEncoding(for: newName)
+            data.put32(encoding, at: 80)
+            header.encodingsBitmap |= HFSPlusName.encodingsBitmapBit(for: encoding)
+        }
         catalog.remove(at: oldIndex)
-        insert(HFSPlusCatalogRecord(key: newKey, data: record.data))
+        insert(HFSPlusCatalogRecord(key: newKey, data: data))
         keyByID[id] = newKey
         if let thread = index(of: HFSPlusCatalogKey(parentID: id, name: [])) {
             let threadType: HFSPlusRecordType = record.type == .folder ? .folderThread : .fileThread
             catalog[thread].data = HFSPlusThreadRecord.make(type: threadType, parentID: newParentID, name: units)
         }
-        if let newName { header.encodingsBitmap |= HFSPlusName.encodingsBitmapBit(for: HFSPlusName.textEncoding(for: newName)) }
         let now = HFSPlusDate.now
         touchFolder(oldKey.parentID, date: now)
         touchFolder(newParentID, date: now)
@@ -689,6 +704,13 @@ actor HFSPlusVolume: DiskVolume {
             position += 1
         }
         return result
+    }
+
+    /// A file or folder record's text encoding hint, for diagnostics and tests.
+    func textEncoding(of id: UInt32) throws -> UInt32 {
+        try checkOpen()
+        guard let key = keyByID[id], let index = index(of: key) else { throw HFSError.notFound("Item \(id)") }
+        return try catalog[index].data.u32(80)
     }
 
     private func fileRecord(_ id: UInt32) throws -> HFSPlusFileRecord {

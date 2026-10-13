@@ -207,6 +207,11 @@ actor HFSVolume: DiskVolume {
         }
         try checkExtents(mdb.catalogFileExtents)
         try checkExtents(mdb.extentsFileExtents)
+        // Each tree's file must be covered by its extents: a save in place writes all of it.
+        for (fork, size) in [(catalogFork, catalogSize), (extentsFork, extentsSize)]
+        where fork.reduce(0, { $0 + Int($1.blockCount) }) * blockSize < size || size % BTree.nodeSize512 != 0 {
+            throw HFSError.corrupt("a B-tree file is larger than its extents")
+        }
         for entry in extentsRecords { try checkExtents(entry.record) }
         for record in catalog where record.type == .file {
             guard let file = try? FileRecord(raw: record.data) else { continue }
