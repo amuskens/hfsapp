@@ -34,6 +34,9 @@ enum ReadOnlyCause: Sendable, Equatable {
     case journaled
     /// Another process holds the image file's exclusive lock.
     case inUse
+    /// The directory's own bookkeeping is inconsistent (e.g. a B-tree header's record count),
+    /// though it can still be read. Disk First Aid in Mac OS repairs such disks.
+    case damaged
 }
 
 /// The operations the app performs on a volume. `HFSVolume` (Mac OS Standard) and

@@ -103,9 +103,8 @@ enum BTree {
             result += try records(of: node, nodeSize: nodeSize)
             nodeNumber = try node.u32(0)
         }
-        guard result.count == Int(header.leafRecords) else {
-            throw HFSError.corrupt("B-tree has \(result.count) leaf records, header says \(header.leafRecords)")
-        }
+        // A header whose leaf count disagrees with the chain is left for the caller to judge:
+        // Mac OS doesn't use the count, so such disks work there (see ReadOnlyCause.damaged).
         return (header, result)
     }
 
