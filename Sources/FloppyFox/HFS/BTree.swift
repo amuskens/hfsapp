@@ -28,9 +28,11 @@ enum BTree {
         nodeSize - descriptorSize - headerRecordSize - userDataRecordSize - 8
     }
 
-    /// A map node holds one record (and two offsets).
+    /// A map node holds one record, then two bytes of free space and two offsets — Apple's
+    /// B-tree code (and hfsutils, which rejects anything else) puts the free-space offset at
+    /// nodeSize - 6.
     static func mapNodeBytes(nodeSize: Int) -> Int {
-        nodeSize - descriptorSize - 4
+        nodeSize - descriptorSize - 6
     }
 
     static func mapNodeCount(totalNodes: Int, nodeSize: Int) -> Int {
