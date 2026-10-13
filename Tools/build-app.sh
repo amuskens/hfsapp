@@ -86,6 +86,8 @@ if [ ! -d "$RESOURCE_BUNDLE" ]; then
   exit 1
 fi
 cp -R "$RESOURCE_BUNDLE" "$OUTDIR/Contents/Resources/"
+# The App Store requires a privacy manifest declaring why "required reason" APIs are used.
+cp Tools/PrivacyInfo.xcprivacy "$OUTDIR/Contents/Resources/"
 # SwiftPM leaves the bundle without an Info.plist (or with one naming an executable it doesn't
 # have); App Store validation wants every nested bundle identified, and resources-only.
 cat > "$OUTDIR/Contents/Resources/FloppyFox_FloppyFox.bundle/Info.plist" <<PLIST

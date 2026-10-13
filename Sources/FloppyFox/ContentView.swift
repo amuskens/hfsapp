@@ -363,6 +363,7 @@ struct ContentView: View {
                                 .resizable()
                                 .scaledToFit()
                                 .frame(width: 48, height: 48)
+                                .accessibilityHidden(true) // the name says what it is
                         }
                         Text(entry.name)
                             .font(.caption)
@@ -462,6 +463,7 @@ struct ContentView: View {
                 Image(nsImage: icon)
                     .resizable()
                     .frame(width: 18, height: 18)
+                    .accessibilityHidden(true) // the name says what it is
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(entry.name)
