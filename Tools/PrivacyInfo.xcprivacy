@@ -11,13 +11,16 @@
 	<key>NSPrivacyAccessedAPITypes</key>
 	<array>
 		<dict>
-			<!-- Creation and modification dates of files the user adds to or exports from a
-			     disk image, carried across so they match the originals. -->
+			<!-- 3B52.1: creation and modification dates of files the user adds to or exports
+			     from a disk image, carried across so they match the originals.
+			     C617.1: fstat on the app's own temporary files, such as the expanded copy of a
+			     dynamic VHD in the container's tmp directory. -->
 			<key>NSPrivacyAccessedAPIType</key>
 			<string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
 			<key>NSPrivacyAccessedAPITypeReasons</key>
 			<array>
 				<string>3B52.1</string>
+				<string>C617.1</string>
 			</array>
 		</dict>
 	</array>

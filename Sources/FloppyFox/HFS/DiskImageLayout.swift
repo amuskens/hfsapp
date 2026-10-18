@@ -53,6 +53,13 @@ enum DiskImageLayout {
         /// actually contains the whole volume.
         func fitted(_ location: HFSVolumeLocation, claimedBytes: UInt64) -> HFSVolumeLocation? {
             guard claimedBytes > location.length else { return location }
+            // An image cut short by at most the spare header and the reserved sector after it
+            // (seen on DiskCopy images copied around with a fixed 800K size) still holds every
+            // allocation block, so it reads fine.
+            if location.offset + location.length == length, claimedBytes - location.length <= 1024 {
+                return HFSVolumeLocation(format: location.format, offset: location.offset, length: location.length, partitionName: location.partitionName,
+                                         readOnlyReason: "This image is missing the last few bytes of its volume (the spare volume header), so it was opened read-only.")
+            }
             guard location.offset < length, claimedBytes <= length - location.offset else { return nil }
             return HFSVolumeLocation(format: location.format, offset: location.offset, length: claimedBytes, partitionName: location.partitionName,
                                      readOnlyReason: "This volume is larger than its partition in the disk's partition map, so it was opened read-only. The disk still works in Mac OS, which goes by the volume itself.")
@@ -144,12 +151,17 @@ enum DiskImageLayout {
 
         // DiskCopy 4.2: 84-byte header (name, sizes, checksums), magic 0x0100 at offset 82.
         if length > 84, signature(at: 82) == 0x0100, let header = try? device.read(at: 0, count: 84) {
-            let dataSize = UInt64(try header.u32(64))
-            if dataSize > 0, dataSize <= length - 84, let found = volume(at: 84, size: dataSize, name: nil) {
+            // The data may be cut short (see `fitted`); `volume` decides whether what's left is usable.
+            let dataSize = min(UInt64(try header.u32(64)), length - 84)
+            if dataSize > 0, let found = volume(at: 84, size: dataSize, name: nil) {
                 // Writing would invalidate the header's data checksum, which Disk Copy verifies.
                 return [HFSVolumeLocation(format: found.format, offset: found.offset, length: found.length, partitionName: nil,
                                           readOnlyReason: "DiskCopy 4.2 images are opened read-only.")]
             }
+        }
+        // MFS, the 400K format of the first Macs, keeps its signature where HFS does.
+        if signature(at: 1024) == 0xD2D7 || (signature(at: 82) == 0x0100 && signature(at: 84 + 1024) == 0xD2D7) {
+            throw HFSError.unsupported("The 400K Macintosh File System (MFS) format, which predates HFS,")
         }
         throw HFSError.notHFS
     }

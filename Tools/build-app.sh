@@ -10,6 +10,9 @@ set -euo pipefail
 #     INSTALLER_IDENTITY="3rd Party Mac Developer Installer: …" \
 #     PROVISIONING_PROFILE=path/to/FloppyFox.provisionprofile ./Tools/build-app.sh
 #                                                              Build/FloppyFox.pkg for App Store Connect
+#   DISTRIBUTION=archive [SIGN_IDENTITY="Apple Development: …"] ./Tools/build-app.sh
+#                                                              an .xcarchive in Xcode's Organizer, which
+#                                                              validates, re-signs and uploads it
 VERSION=${VERSION:-0.1}
 BUILD_NUMBER=${BUILD_NUMBER:-1}
 RELEASE_CHANNEL=${RELEASE_CHANNEL:-}
@@ -90,7 +93,14 @@ cp -R "$RESOURCE_BUNDLE" "$OUTDIR/Contents/Resources/"
 cp Tools/PrivacyInfo.xcprivacy "$OUTDIR/Contents/Resources/"
 # SwiftPM leaves the bundle without an Info.plist (or with one naming an executable it doesn't
 # have); App Store validation wants every nested bundle identified, and resources-only.
-cat > "$OUTDIR/Contents/Resources/FloppyFox_FloppyFox.bundle/Info.plist" <<PLIST
+# Newer SwiftPM lays the bundle out macOS-style, with Contents/Info.plist; replace that one,
+# since a root-level Info.plist is ignored in that layout.
+RESOURCE_PLIST="$OUTDIR/Contents/Resources/FloppyFox_FloppyFox.bundle/Info.plist"
+if [ -d "$OUTDIR/Contents/Resources/FloppyFox_FloppyFox.bundle/Contents" ]; then
+  rm -f "$RESOURCE_PLIST"
+  RESOURCE_PLIST="$OUTDIR/Contents/Resources/FloppyFox_FloppyFox.bundle/Contents/Info.plist"
+fi
+cat > "$RESOURCE_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -247,6 +257,65 @@ if [ "${DISTRIBUTION:-}" = "appstore" ]; then
   productbuild --component "$OUTDIR" /Applications --sign "$INSTALLER_IDENTITY" "$PKG"
   echo "Built $PKG — upload it with Transporter, or:"
   echo "  xcrun altool --upload-app -t macos -f $PKG --apiKey <key id> --apiIssuer <issuer id>"
+  exit 0
+fi
+
+if [ "${DISTRIBUTION:-}" = "archive" ]; then
+  # SwiftPM can't archive an app, so lay out the .xcarchive Xcode would make. Organizer's
+  # Validate App and Distribute App re-sign it with an App Store certificate and profile
+  # (cloud-managed signing creates both), keeping the entitlements signed in here.
+  IDENTITY=${SIGN_IDENTITY:--}
+  codesign --force --sign "$IDENTITY" --entitlements "$ENTITLEMENTS" "$OUTDIR"
+  codesign --verify --deep --strict --verbose=2 "$OUTDIR"
+  TEAM_ID=${TEAM_ID:-}
+  if [ -z "$TEAM_ID" ] && [ "$IDENTITY" != "-" ]; then
+    TEAM_ID=$(security find-certificate -c "$IDENTITY" -p | openssl x509 -noout -subject \
+      | sed -n 's/.*OU *= *\([A-Z0-9]*\).*/\1/p')
+  fi
+
+  ARCHIVE=${ARCHIVE_PATH:-$HOME/Library/Developer/Xcode/Archives/$(date +%Y-%m-%d)/FloppyFox $(date +%Y-%m-%d\ %H.%M.%S).xcarchive}
+  rm -rf "$ARCHIVE"
+  mkdir -p "$ARCHIVE/Products/Applications" "$ARCHIVE/dSYMs"
+  ditto "$OUTDIR" "$ARCHIVE/Products/Applications/FloppyFox.app"
+  ditto "$PRODUCTS/FloppyFox.dSYM" "$ARCHIVE/dSYMs/FloppyFox.app.dSYM"
+  cat > "$ARCHIVE/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>ApplicationProperties</key>
+  <dict>
+    <key>ApplicationPath</key>
+    <string>Applications/FloppyFox.app</string>
+    <key>Architectures</key>
+    <array>
+      <string>arm64</string>
+      <string>x86_64</string>
+    </array>
+    <key>CFBundleIdentifier</key>
+    <string>$BUNDLE_ID</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$VERSION</string>
+    <key>CFBundleVersion</key>
+    <string>$BUILD_NUMBER</string>
+    <key>SigningIdentity</key>
+    <string>$IDENTITY</string>
+    <key>Team</key>
+    <string>$TEAM_ID</string>
+  </dict>
+  <key>ArchiveVersion</key>
+  <integer>2</integer>
+  <key>CreationDate</key>
+  <date>$(date -u +%Y-%m-%dT%H:%M:%SZ)</date>
+  <key>Name</key>
+  <string>FloppyFox</string>
+  <key>SchemeName</key>
+  <string>FloppyFox</string>
+</dict>
+</plist>
+PLIST
+  echo "Built $ARCHIVE"
+  echo "Open Xcode > Window > Organizer, select it, and choose Validate App."
   exit 0
 fi
 

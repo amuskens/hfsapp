@@ -132,8 +132,6 @@ actor HFSVolume: DiskVolume {
         } else if mdb.attributes & MasterDirectoryBlock.unmountedCleanlyBit == 0 && !allowUncleanVolume {
             cause = .notCleanlyUnmounted
         }
-        self.readOnlyCause = cause
-        self.isReadOnly = cause != nil
         self.mdb = mdb
         self.lastKnownMDBSector = sector
         self.blockSize = blockSize
@@ -231,6 +229,13 @@ actor HFSVolume: DiskVolume {
         }
         let underAllocated = allocation.claimKnownUsed(known)
         self.leaveForCheck = underAllocated || mdb.attributes & MasterDirectoryBlock.unmountedCleanlyBit == 0
+        // Directory bookkeeping that disagrees with the directory itself (a leaf count off by
+        // one is common on period disks): readable, but not something to build on.
+        if cause == nil, catalogRaw.count != Int(catalogHeader.leafRecords) || extentsRaw.count != Int(extentsHeader.leafRecords) {
+            cause = .damaged
+        }
+        self.readOnlyCause = cause
+        self.isReadOnly = cause != nil
         self.committed = Committed(mdb: mdb, bitmap: allocation.committed, catalog: catalog, extentsRecords: extentsRecords,
                                    catalogHeader: catalogHeader, extentsHeader: extentsHeader, keyByID: keyByID)
     }

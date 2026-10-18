@@ -92,7 +92,13 @@ final class DiskImageManager: ObservableObject {
     @Published private(set) var folderPath: [VolumeItem] = []
     @Published var entries: [FileEntry] = []
     @Published var selectedEntries: Set<FileEntry> = []
-    @Published var errorMessage: String?
+    @Published var errorMessage: String? {
+        didSet {
+            // Work still running when its image was ejected fails with "closed": that's the
+            // Eject doing its job, not something to report.
+            if let errorMessage, errorMessage.contains(HFSError.closed.localizedDescription) { self.errorMessage = nil }
+        }
+    }
     @Published var statusMessage: String = "No image loaded"
     // True while an operation is in flight, so the UI can show a lightweight progress
     // indicator instead of looking frozen.
@@ -171,10 +177,15 @@ final class DiskImageManager: ObservableObject {
     /// Runs write operations (import, delete, copy, move, new folder) one after another. A
     /// failed save rolls back every pending change on the volume, so two operations must never
     /// share an uncommitted batch — e.g. an import into a folder whose creation is undone.
+    ///
+    /// An operation queued for one image never runs against another: if the image was ejected
+    /// or reopened while it waited, it is dropped.
     private func serializedWrite(_ body: @escaping @MainActor () async -> Void) async {
         let previous = writeQueueTail
-        let task = Task { @MainActor in
+        let session = sessionID
+        let task = Task { @MainActor [weak self] in
             await previous?.value
+            guard let self, session == self.sessionID, self.volume != nil else { return }
             await body()
         }
         writeQueueTail = task
@@ -1224,6 +1235,8 @@ final class DiskImageManager: ObservableObject {
             return "This is a journaled Mac OS Extended volume (from Mac OS X), which FloppyFox can open read-only."
         case .inUse:
             return "Another program is writing to this image, so it was opened read-only."
+        case .damaged:
+            return "This disk's directory has minor damage, so it was opened read-only. You can still copy files from it; to repair it, run Disk First Aid on it in Mac OS."
         }
     }
 

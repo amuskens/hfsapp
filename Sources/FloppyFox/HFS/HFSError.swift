@@ -26,6 +26,10 @@ enum HFSError: LocalizedError, Equatable {
         case .corrupt(let detail):
             return "The volume appears to be damaged (\(detail))."
         case .notFound(let name):
+            // The engine names items by catalog ID ("Item 23"), which means nothing to a user.
+            if let last = name.split(separator: " ").last, last.allSatisfy(\.isNumber) {
+                return "It is no longer on the disk; it may have been moved or deleted."
+            }
             return "\(name) could not be found on the volume."
         case .alreadyExists(let name):
             return "An item named \(name) already exists in this folder."
