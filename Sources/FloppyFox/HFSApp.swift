@@ -11,6 +11,9 @@ struct FloppyFoxApp: App {
         // Ensure the process is a regular GUI app so it gets a Dock icon and menu bar when
         // launched directly (for example via `swift run` or running the built executable).
         NSApplication.shared.setActivationPolicy(.regular)
+        if let icon = FileArtwork.image(named: "AppIcon") {
+            NSApplication.shared.applicationIconImage = icon
+        }
     }
 
     var body: some Scene {
@@ -166,8 +169,7 @@ private enum AppPresentation {
            let releaseIcon = NSImage(contentsOf: releaseIconURL) {
             return releaseIcon
         }
-        if let bundledIconURL = Bundle.floppyFoxResources.url(forResource: "FloppyFoxIcon", withExtension: "svg"),
-           let bundledIcon = NSImage(contentsOf: bundledIconURL) {
+        if let bundledIcon = FileArtwork.image(named: "AppIcon") {
             return bundledIcon
         }
         return NSApplication.shared.applicationIconImage

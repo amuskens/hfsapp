@@ -220,9 +220,11 @@ struct ContentView: View {
     private var fileBrowser: some View {
         VStack(spacing: 0) {
             HStack(alignment: .center, spacing: 14) {
-                Image(systemName: "externaldrive")
-                    .font(.system(size: 26, weight: .light))
-                    .foregroundStyle(.secondary)
+                Image(nsImage: FileArtwork.image(named: volumeArtworkName) ?? NSImage())
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(width: 36, height: 36)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 8) {
@@ -355,7 +357,7 @@ struct ContentView: View {
                     VStack(spacing: 6) {
                         if let icon = entry.icon {
                             Image(nsImage: icon)
-                                .interpolation(.none)
+                                .interpolation(entry.resourceIconPNG == nil ? .high : .none)
                                 .resizable()
                                 .scaledToFit()
                                 .frame(width: 48, height: 48)
@@ -457,6 +459,7 @@ struct ContentView: View {
         HStack(spacing: 12) {
             if let icon = entry.icon {
                 Image(nsImage: icon)
+                    .interpolation(entry.resourceIconPNG == nil ? .high : .none)
                     .resizable()
                     .frame(width: 20, height: 20)
                     .accessibilityHidden(true) // the name says what it is
@@ -538,7 +541,8 @@ struct ContentView: View {
             } else if let entry = manager.selectedEntry {
                 inspectorHeader(icon: entry.icon.map { Image(nsImage: $0) } ?? Image(systemName: "doc"),
                                 title: entry.name,
-                                subtitle: entry.isDirectory ? "Folder" : entry.sizeText)
+                                subtitle: entry.isDirectory ? "Folder" : entry.sizeText,
+                                classicIcon: entry.resourceIconPNG != nil)
                 Text(hfsPath(of: entry))
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.secondary)
@@ -603,10 +607,10 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    private func inspectorHeader(icon: Image, title: String, subtitle: String?) -> some View {
+    private func inspectorHeader(icon: Image, title: String, subtitle: String?, classicIcon: Bool = false) -> some View {
         HStack(spacing: 14) {
             icon
-                .interpolation(.none)
+                .interpolation(classicIcon ? .none : .high)
                 .resizable()
                 .scaledToFit()
                 .frame(width: 48, height: 48)
@@ -667,9 +671,9 @@ struct ContentView: View {
 
     private var placeholderView: some View {
         VStack(spacing: 0) {
-            classicMacGraphic
-                .padding(.bottom, 28)
-            Text(isDropTargetForOpen ? "Drop to Open" : "Open an HFS Disk Image")
+            welcomeGraphic
+                .padding(.bottom, 12)
+            Text(isDropTargetForOpen ? "Drop to Open" : "Open a Disk Image")
                 .font(.title.weight(.semibold))
                 .padding(.bottom, 10)
             Text("Drag a disk image here, or choose one to browse and edit its files.")
@@ -695,12 +699,12 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(isDropTargetForOpen ? Color.accentColor.opacity(0.08) : Color.clear)
+                .fill(isDropTargetForOpen ? Color.accentColor.opacity(0.08) : Color(nsColor: .controlBackgroundColor).opacity(0.5))
         }
         .overlay {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(isDropTargetForOpen ? Color.accentColor : Color.secondary.opacity(0.28),
-                              style: StrokeStyle(lineWidth: isDropTargetForOpen ? 2 : 1.5, dash: [7, 6]))
+                .strokeBorder(isDropTargetForOpen ? Color.accentColor : Color.primary.opacity(0.07),
+                              lineWidth: isDropTargetForOpen ? 2 : 1)
         }
         .padding(margin)
         .animation(.easeInOut(duration: 0.15), value: isDropTargetForOpen)
@@ -709,34 +713,18 @@ struct ContentView: View {
         }
     }
 
-    private var classicMacGraphic: some View {
-        HStack(alignment: .bottom, spacing: -14) {
-            classicMacIcon(named: "Floppy", size: 84, rotation: -8)
-                .offset(y: -4)
-            classicMacIcon(named: "ClassicMac", size: 136)
-                .zIndex(1)
-            classicMacIcon(named: "HappyMac", size: 84, rotation: 8)
-                .offset(y: -4)
-        }
-        .padding(28)
-        .background {
-            Circle()
-                .fill(Color.accentColor.opacity(0.08))
-                .frame(width: 230, height: 230)
-        }
-        .accessibilityHidden(true)
+    private var volumeArtworkName: String {
+        let ext = manager.imageURL?.pathExtension.lowercased() ?? ""
+        return ["dsk", "img", "image", "dc42"].contains(ext) ? "FloppyDisk" : "HardDisk"
     }
 
-    /// The icons are loose PNGs in the resource bundle; `Image(_:bundle:)` only searches asset
-    /// catalogs and would draw nothing.
-    private func classicMacIcon(named name: String, size: CGFloat, rotation: Double = 0) -> some View {
-        Image(nsImage: Bundle.floppyFoxResources.image(forResource: name) ?? NSImage())
+    private var welcomeGraphic: some View {
+        Image(nsImage: FileArtwork.image(named: "Welcome") ?? NSImage())
             .interpolation(.high)
             .resizable()
             .scaledToFit()
-            .frame(width: size, height: size)
-            .shadow(color: .black.opacity(0.12), radius: 6, y: 3)
-            .rotationEffect(.degrees(rotation))
+            .frame(width: 300, height: 256)
+            .accessibilityHidden(true)
     }
 }
 

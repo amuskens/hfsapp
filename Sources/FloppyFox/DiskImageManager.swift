@@ -40,18 +40,11 @@ struct FileEntry: Identifiable, Hashable, Sendable {
         if let resourceIconPNG, let image = NSImage(data: resourceIconPNG) {
             return image
         }
-        if finderType == "APPL", let image = Bundle.floppyFoxResources.image(forResource: "ClassicMac") {
-            return image
-        }
-        if ["dsk", "img", "hda", "vhd"].contains((name as NSString).pathExtension.lowercased()),
-           let image = Bundle.floppyFoxResources.image(forResource: "Floppy") {
-            return image
-        }
         if isDirectory {
             return NSWorkspace.shared.icon(for: .folder)
         }
-        if let image = Bundle.floppyFoxResources.image(forResource: "ClassicDocument") {
-            image.isTemplate = false
+        if let name = FileArtwork.resourceName(name: name, finderType: finderType, isDirectory: isDirectory),
+           let image = FileArtwork.image(named: name) {
             return image
         }
         return NSWorkspace.shared.icon(for: .data)
