@@ -29,28 +29,22 @@ struct ContentView: View {
     @State private var isNewFolderPromptPresented = false
     @State private var newFolderName = "untitled folder"
 
+    /// Space between the window edge and the cards, and between the two cards.
+    private let margin: CGFloat = 20
+
     var body: some View {
-        VStack(spacing: 0) {
-            header
-                .padding(14)
-                .background(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(Color(nsColor: .windowBackgroundColor).opacity(0.98))
-                        .shadow(color: .black.opacity(0.08), radius: 10, x: 0, y: 4)
-                )
-                .padding(.horizontal)
-                .padding(.top)
-
-            Divider()
-
+        Group {
             if manager.isOpen {
                 mountedContent
             } else {
                 placeholderView
             }
         }
-        .frame(minWidth: 820, minHeight: 520)
+        .frame(minWidth: 860, minHeight: 560)
         .background(appBackground)
+        .navigationTitle(manager.isOpen ? (manager.volumeName ?? "FloppyFox") : "FloppyFox")
+        .navigationSubtitle(manager.isOpen ? (manager.imageURL?.lastPathComponent ?? "") : "")
+        .toolbar { toolbarContent }
         .overlay {
             if let title = manager.transferTitle, let message = manager.transferMessage {
                 VStack(spacing: 12) {
@@ -165,21 +159,18 @@ struct ContentView: View {
             .ignoresSafeArea()
     }
 
-    private var header: some View {
-        HStack(spacing: 12) {
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
             Button {
                 manager.openImage()
             } label: {
                 Label("Open Image", systemImage: "externaldrive.badge.plus")
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .keyboardShortcut("o", modifiers: [.command])
+            .help("Open a disk image (⌘O)")
+        }
 
-            // Copy/Paste buttons hidden per user preference
-
-            Spacer()
-
+        ToolbarItemGroup(placement: .primaryAction) {
             if manager.isBusy {
                 ProgressView()
                     .controlSize(.small)
@@ -190,18 +181,15 @@ struct ContentView: View {
             } label: {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }
-            .buttonStyle(.bordered)
-            .controlSize(.large)
+            .help("Reread the disk image")
             .disabled(!manager.isOpen)
 
             Button {
                 Task { await manager.ejectImage() }
             } label: {
-                Label("Eject", systemImage: "eject.fill")
+                Label("Eject", systemImage: "eject")
             }
-            .buttonStyle(.bordered)
-            .controlSize(.large)
-            .tint(.orange)
+            .help("Close the disk image")
             .disabled(!manager.isOpen)
         }
     }
@@ -209,98 +197,76 @@ struct ContentView: View {
     private var mountedContent: some View {
         HSplitView {
             fileBrowser
-                .frame(minWidth: 420, maxWidth: .infinity)
-                .background(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(Color(nsColor: .textBackgroundColor).opacity(0.96))
-                        .shadow(color: .black.opacity(0.13), radius: 16, x: 0, y: 7)
-                        .shadow(color: Color.accentColor.opacity(0.07), radius: 4, x: 0, y: 1)
-                )
-                .overlay {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(Color.primary.opacity(0.09), lineWidth: 1)
-                }
-                .padding(12)
+                .card(fill: Color(nsColor: .textBackgroundColor))
+                .padding([.leading, .vertical], margin)
+                .padding(.trailing, margin / 2)
+                .frame(minWidth: 460, maxWidth: .infinity)
+                .layoutPriority(1)
                 .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTarget) { providers in
                     guard !manager.isReadOnly else { return false }
                     return manager.handleDroppedFiles(providers: providers)
                 }
 
             detailPane
+                .card(fill: Color(nsColor: .controlBackgroundColor))
+                .padding([.trailing, .vertical], margin)
+                .padding(.leading, margin / 2)
                 // HSplitView supplies the draggable divider. These bounds keep the inspector
-                // useful while allowing the user to choose how much room it receives.
-                .frame(minWidth: 260, idealWidth: 300, maxWidth: 440)
-                .frame(maxHeight: .infinity, alignment: .topLeading)
-                .background(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(Color(nsColor: .windowBackgroundColor).opacity(0.94))
-                        .shadow(color: .black.opacity(0.09), radius: 12, x: 0, y: 5)
-                )
-                .overlay {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
-                }
-                .padding(12)
+                // useful while leaving most of the window to the file list.
+                .frame(minWidth: 280, idealWidth: 300, maxWidth: 380)
         }
     }
 
     private var fileBrowser: some View {
         VStack(spacing: 0) {
-            VStack(spacing: 10) {
-                ZStack {
-                    Text(manager.volumeName ?? manager.imageURL?.lastPathComponent ?? "Volume")
-                        .font(.title.bold())
-                        .frame(maxWidth: .infinity)
-                        .multilineTextAlignment(.center)
-                    HStack {
-                        Spacer()
+            HStack(alignment: .center, spacing: 14) {
+                Image(systemName: "externaldrive")
+                    .font(.system(size: 26, weight: .light))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text(manager.volumeName ?? manager.imageURL?.lastPathComponent ?? "Volume")
+                            .font(.title2.weight(.semibold))
+                            .lineLimit(1)
                         if manager.isReadOnly {
                             Text("Read-Only")
-                                .font(.caption.bold())
+                                .font(.caption.weight(.semibold))
                                 .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                                .background(Capsule().fill(Color.orange.opacity(0.2)))
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Color.orange.opacity(0.18)))
                                 .foregroundColor(.orange)
                         }
                     }
-                }
-                HStack(spacing: 8) {
-                    Text(currentHFSPath)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.head)
-                    if let free = manager.freeSpaceDescription {
-                        Text("·")
-                            .foregroundColor(.secondary)
-                        Text(free)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                    HStack(spacing: 6) {
+                        Text(currentHFSPath)
+                            .font(.system(.caption, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.head)
+                        if let free = manager.freeSpaceDescription {
+                            Text("·")
+                            Text(free)
+                                .font(.caption)
+                                .fixedSize()
+                        }
                     }
+                    .foregroundColor(.secondary)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Capsule().fill(Color(nsColor: .controlBackgroundColor)))
+                Spacer(minLength: 0)
             }
             .padding(.horizontal, 20)
-            .padding(.vertical, 18)
+            .padding(.top, 20)
+            .padding(.bottom, 16)
 
-            HStack {
-                Button {
-                    presentNewFolderPrompt()
-                } label: {
-                    Label("New Folder", systemImage: "folder.badge.plus")
-                }
-                .buttonStyle(.bordered)
-                .tint(.accentColor)
-                .disabled(manager.isReadOnly)
-
+            HStack(spacing: 8) {
                 Button {
                     Task { await manager.goUp() }
                 } label: {
-                    Label("Up", systemImage: "arrow.up")
+                    Image(systemName: "chevron.up")
+                        .frame(width: 14)
                 }
-                .buttonStyle(.bordered)
+                .help("Enclosing folder")
+                .accessibilityLabel("Up")
                 .disabled(!manager.canGoBack)
 
                 Menu {
@@ -315,27 +281,56 @@ struct ContentView: View {
                     Label(currentFolderName, systemImage: "folder")
                 }
                 .menuStyle(.button)
+                .fixedSize()
                 .help("Go to a folder in the current path")
 
-                Spacer()
+                Spacer(minLength: 12)
+
+                Button {
+                    presentNewFolderPrompt()
+                } label: {
+                    Label("New Folder", systemImage: "folder.badge.plus")
+                }
+                .fixedSize()
+                .disabled(manager.isReadOnly)
 
                 Picker("View as", selection: $browserViewStyle) {
                     ForEach(BrowserViewStyle.allCases) { style in
-                        Label(style.rawValue, systemImage: style.systemImage)
+                        Image(systemName: style.systemImage)
+                            .accessibilityLabel(style.rawValue)
                             .tag(style)
                     }
                 }
-                .pickerStyle(.menu)
+                .pickerStyle(.segmented)
+                .labelsHidden()
                 .fixedSize()
-
+                .help("View as list or icons")
             }
-            .padding(.horizontal)
-            .padding(.bottom, 8)
+            .controlSize(.regular)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 14)
 
-            if browserViewStyle == .list {
-                listView
-            } else {
-                iconView
+            Divider()
+
+            Group {
+                if browserViewStyle == .list {
+                    listView
+                } else {
+                    iconView
+                }
+            }
+            .overlay {
+                if manager.entries.isEmpty {
+                    Text("This folder is empty")
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+        .overlay {
+            if isDropTarget {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(Color.accentColor, lineWidth: 2)
+                    .allowsHitTesting(false)
             }
         }
     }
@@ -349,12 +344,13 @@ struct ContentView: View {
             }
         }
         .listStyle(.inset)
+        .scrollContentBackground(.hidden)
         .contextMenu { browserContextMenu }
     }
 
     private var iconView: some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 92), spacing: 14)], spacing: 18) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 96), spacing: 16)], spacing: 20) {
                 ForEach(manager.entries) { entry in
                     VStack(spacing: 6) {
                         if let icon = entry.icon {
@@ -392,7 +388,7 @@ struct ContentView: View {
                     .contextMenu { entryContextMenu(for: entry) }
                 }
             }
-            .padding(16)
+            .padding(20)
         }
         .contextMenu { browserContextMenu }
     }
@@ -458,24 +454,24 @@ struct ContentView: View {
     }
 
     private func row(for entry: FileEntry) -> some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
             if let icon = entry.icon {
                 Image(nsImage: icon)
                     .resizable()
-                    .frame(width: 18, height: 18)
+                    .frame(width: 20, height: 20)
                     .accessibilityHidden(true) // the name says what it is
             }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(entry.name)
-                    .font(.body)
-                if !entry.isDirectory {
-                    Text(entry.sizeText)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-            }
-            Spacer()
+            Text(entry.name)
+                .font(.body)
+                .lineLimit(1)
+            Spacer(minLength: 12)
+            Text(entry.isDirectory ? "Folder" : entry.sizeText)
+                .font(.callout)
+                .foregroundColor(.secondary)
+                .monospacedDigit()
         }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 4)
         .contentShape(Rectangle())
         // `.simultaneousGesture` (rather than `.onTapGesture`/`.gesture`) so these don't
         // consume the click List needs for its own handling — attaching a plain tap gesture
@@ -519,40 +515,39 @@ struct ContentView: View {
     }
 
     private var detailPane: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(manager.selectedEntries.count > 1 ? "Selected items" : "Selected item")
-                .font(.title3.bold())
-                .padding(.top)
-
+        VStack(alignment: .leading, spacing: 14) {
             if manager.selectedEntries.count > 1 {
                 let entries = manager.selectedEntries
-                Text("\(entries.count) items selected")
-                    .font(.headline)
+                inspectorHeader(icon: Image(systemName: "doc.on.doc"),
+                                title: "\(entries.count) items selected",
+                                subtitle: nil)
+                Divider()
                 let totalSize = entries.compactMap { $0.size }.reduce(0, +)
                 inspectorRow("Total size", value: ByteCountFormatter.string(fromByteCount: Int64(totalSize), countStyle: .file))
                 Spacer()
-                Button {
+                Button(role: .destructive) {
                     deleteConfirmationEntries = entries
                 } label: {
                     Label("Delete Selected", systemImage: "trash")
+                        .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .buttonStyle(.bordered)
                 .tint(.red)
                 .disabled(manager.isReadOnly)
             } else if let entry = manager.selectedEntry {
-                Text(entry.name)
-                    .font(.headline)
+                inspectorHeader(icon: entry.icon.map { Image(nsImage: $0) } ?? Image(systemName: "doc"),
+                                title: entry.name,
+                                subtitle: entry.isDirectory ? "Folder" : entry.sizeText)
                 Text(hfsPath(of: entry))
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.secondary)
                     .lineLimit(3)
-                Text(entry.isDirectory ? "Folder" : "File")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
                 if !entry.isDirectory {
                     Divider()
                     DisclosureGroup("Attributes", isExpanded: $inspectorAttributesExpanded) {
-                        VStack(spacing: 8) {
+                        VStack(spacing: 10) {
                             if let size = entry.size {
                                 inspectorRow("Size", value: ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))
                             }
@@ -573,27 +568,62 @@ struct ContentView: View {
                             inspectorRow("Created", value: entry.item.createDate.formatted(date: .abbreviated, time: .shortened))
                             inspectorRow("Modified", value: entry.item.modifyDate.formatted(date: .abbreviated, time: .shortened))
                         }
-                        .padding(.top, 8)
+                        .padding(.top, 10)
                     }
                     .font(.headline)
                 }
                 Spacer()
-                Button {
+                Button(role: .destructive) {
                     deleteConfirmationEntries = [entry]
                 } label: {
-                    Label("Delete This Item", systemImage: "trash")
+                    Label("Delete", systemImage: "trash")
+                        .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .buttonStyle(.bordered)
                 .tint(.red)
                 .disabled(manager.isReadOnly)
             } else {
-                Text("Select a file or folder to see details.")
-                    .foregroundColor(.secondary)
-                Spacer()
+                VStack(spacing: 10) {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 32, weight: .light))
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                    Text("No Selection")
+                        .font(.headline)
+                    Text("Select a file or folder to see its details.")
+                        .font(.callout)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .padding()
+        .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func inspectorHeader(icon: Image, title: String, subtitle: String?) -> some View {
+        HStack(spacing: 14) {
+            icon
+                .interpolation(.none)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 48, height: 48)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.headline)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
     }
 
     private func inspectorRow(_ label: String, value: String) -> some View {
@@ -636,58 +666,90 @@ struct ContentView: View {
     }
 
     private var placeholderView: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 0) {
             classicMacGraphic
-            Text("Open an HFS disk image")
-                .font(.title)
-                .bold()
-            Text(isDropTargetForOpen ? "Drop to open" : "Choose a .dsk, .img, .hda, or .vhd image containing Apple HFS, then browse and manage its contents.")
+                .padding(.bottom, 28)
+            Text(isDropTargetForOpen ? "Drop to Open" : "Open an HFS Disk Image")
+                .font(.title.weight(.semibold))
+                .padding(.bottom, 10)
+            Text("Drag a disk image here, or choose one to browse and edit its files.")
+                .font(.body)
                 .multilineTextAlignment(.center)
                 .foregroundColor(.secondary)
-                .frame(maxWidth: 520)
-            Button("Open Image") {
+                .frame(maxWidth: 420)
+                .padding(.bottom, 24)
+            Button {
                 manager.openImage()
+            } label: {
+                Text("Open Image…")
+                    .padding(.horizontal, 12)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
+            .padding(.bottom, 16)
+            Text(".dsk  ·  .img  ·  .image  ·  .dc42  ·  .hda  ·  .vhd")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
         }
+        .padding(40)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(isDropTargetForOpen ? Color.accentColor.opacity(0.1) : Color.clear)
-                .padding(20)
-        )
+        .background {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(isDropTargetForOpen ? Color.accentColor.opacity(0.08) : Color.clear)
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(isDropTargetForOpen ? Color.accentColor : Color.secondary.opacity(0.28),
+                              style: StrokeStyle(lineWidth: isDropTargetForOpen ? 2 : 1.5, dash: [7, 6]))
+        }
+        .padding(margin)
+        .animation(.easeInOut(duration: 0.15), value: isDropTargetForOpen)
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTargetForOpen) { providers in
             manager.handleDroppedImageToOpen(providers: providers)
         }
     }
 
     private var classicMacGraphic: some View {
-        HStack(alignment: .bottom, spacing: -12) {
-            classicMacIcon(named: "Floppy", size: 76, rotation: -8)
-                .offset(y: 8)
-            classicMacIcon(named: "ClassicMac", size: 128)
+        HStack(alignment: .bottom, spacing: -14) {
+            classicMacIcon(named: "Floppy", size: 84, rotation: -8)
+                .offset(y: -4)
+            classicMacIcon(named: "ClassicMac", size: 136)
                 .zIndex(1)
-            classicMacIcon(named: "HappyMac", size: 76, rotation: 8)
-                .offset(y: 8)
+            classicMacIcon(named: "HappyMac", size: 84, rotation: 8)
+                .offset(y: -4)
         }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 12)
+        .padding(28)
         .background {
-            Capsule(style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.72))
-                .shadow(color: .black.opacity(0.12), radius: 12, y: 5)
+            Circle()
+                .fill(Color.accentColor.opacity(0.08))
+                .frame(width: 230, height: 230)
         }
         .accessibilityHidden(true)
     }
 
+    /// The icons are loose PNGs in the resource bundle; `Image(_:bundle:)` only searches asset
+    /// catalogs and would draw nothing.
     private func classicMacIcon(named name: String, size: CGFloat, rotation: Double = 0) -> some View {
-        Image(name, bundle: .floppyFoxResources)
+        Image(nsImage: Bundle.floppyFoxResources.image(forResource: name) ?? NSImage())
             .interpolation(.high)
             .resizable()
             .scaledToFit()
             .frame(width: size, height: size)
+            .shadow(color: .black.opacity(0.12), radius: 6, y: 3)
             .rotationEffect(.degrees(rotation))
+    }
+}
+
+private extension View {
+    /// A rounded panel with a hairline border and a soft shadow; content is clipped to it.
+    func card(fill: Color) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        return self
+            .background(fill)
+            .clipShape(shape)
+            .overlay(shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
+            .compositingGroup()
+            .shadow(color: .black.opacity(0.08), radius: 10, y: 3)
     }
 }
 
